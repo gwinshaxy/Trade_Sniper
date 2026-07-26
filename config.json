@@ -1,0 +1,13 @@
+{
+    "account_balance": 100.0,
+    "risk_pct": 1.0,
+    "proximity_threshold_pct": 1.5,
+    "scan_interval_minutes": 15,
+    "alert_cooldown_hours": 2,
+    "journal_file": "trade_journal.csv",
+    "watchlist": [
+        "ONDO/USDT",
+        "PENDLE/USDT",
+        "XRP/USDT"
+    ]
+}

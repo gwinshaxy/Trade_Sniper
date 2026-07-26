@@ -1,0 +1,14 @@
+# Python cache & temporary files
+__pycache__/
+*.py[cod]
+
+# Virtual environment (if you ever create one locally)
+venv/
+.venv/
+
+# Environment variables & API keys (prevents leaking secrets)
+.env
+
+# OS-generated files
+.DS_Store
+Thumbs.db
