@@ -9,13 +9,41 @@ import plotly.graph_objects as go
 import streamlit as st
 import streamlit.components.v1 as components
 
-# --- PAGE CONFIGURATION ---
+# --- STREAMLIT PAGE CONFIG (MUST BE FIRST STREAMLIT COMMAND) ---
 st.set_page_config(
     page_title="Trade Sniper Dashboard & Backtester",
     page_icon="🛡️",
     layout="wide"
 )
 
+# --- AUTHENTICATION GUARD ---
+def check_password():
+    """Returns True if the user enters the correct password."""
+    # Reads the password set in Render environment variables
+    target_password = os.getenv("DASHBOARD_PASSWORD", "default_local_password")
+
+    if st.session_state.get("password_correct", False):
+        return True
+
+    st.title("🔒 Trade Sniper Dashboard")
+    st.subheader("Authentication Required")
+    
+    password_input = st.text_input("Enter Access Password", type="password")
+    
+    if st.button("Login"):
+        if password_input == target_password:
+            st.session_state["password_correct"] = True
+            st.rerun()
+        else:
+            st.error("❌ Incorrect password. Access denied.")
+            
+    return False
+
+# Block execution if not authenticated
+if not check_password():
+    st.stop()
+
+# --- CONFIGURATION FILE PATHS ---
 CONFIG_FILE = "config.json"
 JOURNAL_FILE = "trade_journal.csv"
 
