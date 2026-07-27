@@ -37,10 +37,10 @@ DEFAULT_CONFIG = {
     ]
 }
 
-# Memory store for alert cooldowns: { "SYMBOL": datetime_of_last_alert }
+# Cooldown memory store: { "SYMBOL": datetime_of_last_alert }
 alert_cooldowns = {}
 
-# Global exchange instance (MEXC) to avoid geo-blocking and connection overhead
+# Global exchange instance (MEXC)
 exchange = ccxt.mexc({
     'enableRateLimit': True,
     'options': {
@@ -52,7 +52,7 @@ exchange = ccxt.mexc({
 # CONFIGURATION & UTILS
 # =====================================================================
 def load_config() -> dict:
-    """Loads configuration from config.json or returns default settings if missing/invalid."""
+    """Loads settings from config.json or falls back to defaults."""
     if os.path.exists(CONFIG_FILE):
         try:
             with open(CONFIG_FILE, "r") as f:
@@ -60,14 +60,14 @@ def load_config() -> dict:
                 logging.info("Successfully loaded config.json")
                 return {**DEFAULT_CONFIG, **config}
         except Exception as e:
-            logging.error(f"Error reading config.json ({e}). Falling back to defaults.")
+            logging.error(f"Error reading config.json ({e}). Falling back to default settings.")
             return DEFAULT_CONFIG
     else:
         logging.warning("config.json not found. Using default internal settings.")
         return DEFAULT_CONFIG
 
 def send_telegram_alert(message: str) -> bool:
-    """Sends a formatted alert notification to Telegram."""
+    """Sends a formatted notification to Telegram."""
     bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
     chat_id = os.getenv("TELEGRAM_CHAT_ID")
 
@@ -95,7 +95,7 @@ def send_telegram_alert(message: str) -> bool:
         return False
 
 def log_trade_to_journal(journal_file: str, trade_data: dict):
-    """Appends validated trade alert details into a local CSV journal file."""
+    """Appends trade alert details into a local CSV journal file."""
     file_exists = os.path.isfile(journal_file)
     df_new = pd.DataFrame([trade_data])
     
@@ -109,7 +109,7 @@ def log_trade_to_journal(journal_file: str, trade_data: dict):
 # MARKET DATA & INDICATORS
 # =====================================================================
 def fetch_ohlcv(symbol: str, timeframe: str = "1h", limit: int = 300) -> pd.DataFrame:
-    """Fetches candle history from the exchange."""
+    """Fetches candle data from MEXC safely."""
     try:
         ohlcv = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
         if not ohlcv or len(ohlcv) == 0:
@@ -124,7 +124,7 @@ def fetch_ohlcv(symbol: str, timeframe: str = "1h", limit: int = 300) -> pd.Data
         return pd.DataFrame()
 
 def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    """Calculates 200 TEMA, 14 ADX (Trend Filter), and 14 ATR % (Volatility Filter)."""
+    """Calculates 200 TEMA, 14 ADX, and 14 ATR %."""
     if df.empty or len(df) < 200:
         return pd.DataFrame()
 
@@ -138,7 +138,6 @@ def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
     # 3. Trend Filter: 14-period ADX
     adx_df = ta.adx(df["high"], df["low"], df["close"], length=14)
     if adx_df is not None and not adx_df.empty:
-        # Locate the ADX column regardless of specific naming variations
         adx_cols = [c for c in adx_df.columns if c.startswith("ADX_")]
         if adx_cols:
             df["ADX_14"] = adx_df[adx_cols[0]]
@@ -155,32 +154,35 @@ def check_trade_signal(
     min_adx: float = 20.0, 
     min_atr_pct: float = 0.5
 ) -> dict:
-    """Evaluates proximity to 200 TEMA alongside Trend (ADX) and Volatility (ATR %) filters safely."""
-    if df.empty or "TEMA_200" not in df.columns:
-        return {"valid": False, "rejected_reason": "Insufficient OHLCV candle depth (< 200)"}
+    """Evaluates 200 TEMA proximity and regime filters safely."""
+    if df.empty or len(df) < 200 or "TEMA_200" not in df.columns:
+        return {"valid": False, "rejected_reason": "Insufficient candle history (< 200 bars)"}
 
     # Grab latest completed row
     latest = df.iloc[-1]
 
-    # Guard against NaN/None values before executing float casting
-    if pd.isna(latest.get("TEMA_200")) or pd.isna(latest.get("close")):
-        return {"valid": False, "rejected_reason": "TEMA_200 or Close price contains NaN/None"}
+    close_raw = latest.get("close")
+    tema_raw = latest.get("TEMA_200")
 
-    close_price = float(latest["close"])
-    tema_val = float(latest["TEMA_200"])
+    # Strict check for None or NaN values
+    if pd.isna(close_raw) or close_raw is None or pd.isna(tema_raw) or tema_raw is None:
+        return {"valid": False, "rejected_reason": "Close or TEMA_200 contains NaN/None value"}
 
-    # Safely parse numeric values for ADX and ATR
+    close_price = float(close_raw)
+    tema_val = float(tema_raw)
+
+    # Safely parse ADX and ATR %
     adx_raw = latest.get("ADX_14", 0.0)
     adx_val = float(adx_raw) if pd.notna(adx_raw) and adx_raw is not None else 0.0
 
     atr_raw = latest.get("ATR_PCT", 0.0)
     atr_pct_val = float(atr_raw) if pd.notna(atr_raw) and atr_raw is not None else 0.0
 
-    # Distance to 200 TEMA (%)
+    # Proximity calculation
     distance_pct = abs(close_price - tema_val) / tema_val * 100.0
     is_in_proximity = distance_pct <= proximity_threshold
 
-    # Regime Filters
+    # Regime checks
     is_trending = adx_val >= min_adx
     has_volatility = atr_pct_val >= min_atr_pct
 
@@ -233,9 +235,19 @@ def run_scan_cycle():
                 logging.info(f"[{symbol}] In cooldown mode ({remaining_mins} mins remaining). Skipped.")
                 continue
 
-        # Fetch Data & Add Indicators
+        # Fetch Data
         df = fetch_ohlcv(symbol, timeframe="1h", limit=300)
+        
+        # GUARD: Skip pair immediately if fetching failed or returned empty
+        if df.empty or len(df) < 200:
+            logging.warning(f"[{symbol}] Insufficient candle data returned. Skipping evaluation.")
+            continue
+
+        # Calculate Indicators
         df = calculate_indicators(df)
+        if df.empty:
+            logging.warning(f"[{symbol}] Indicator calculation failed. Skipping evaluation.")
+            continue
 
         # Evaluate Signal
         result = check_trade_signal(
@@ -249,17 +261,16 @@ def run_scan_cycle():
             close_price = result["close"]
             tema_val = result["tema"]
             
-            # Position Sizing Calculation
+            # Position Sizing
             risk_amount = account_balance * (risk_pct / 100.0)
             sl_distance_price = close_price * (stop_loss_pct / 100.0)
             
-            # Determine Long or Short structure relative to 200 TEMA
             direction = "LONG" if close_price >= tema_val else "SHORT"
             sl_price = close_price - sl_distance_price if direction == "LONG" else close_price + sl_distance_price
             position_units = risk_amount / sl_distance_price if sl_distance_price > 0 else 0
             position_value_usdt = position_units * close_price
 
-            # Format Telegram Alert Message
+            # Format Alert
             message = (
                 f"🚨 *PROXIMITY ALERT: {symbol}* 🚨\n\n"
                 f"• *Direction:* `{direction}`\n"
@@ -278,7 +289,7 @@ def run_scan_cycle():
             if send_telegram_alert(message):
                 alert_cooldowns[symbol] = now_utc
                 
-                # Log Trade Entry to Journal
+                # Log Trade Entry
                 log_trade_to_journal(journal_file, {
                     "timestamp": now_utc.strftime("%Y-%m-%d %H:%M:%S"),
                     "symbol": symbol,
@@ -295,10 +306,9 @@ def run_scan_cycle():
             logging.info(f"[{symbol}] No Signal -> {result['rejected_reason']}")
 
 def main():
-    """Main process loop with continuous scanning interval."""
+    """Main process loop."""
     logging.info("Initializing Trading Agent...")
     
-    # Startup Heartbeat
     send_telegram_alert("🟢 *Trading Agent Initialized & Active.* Scanning loop starting...")
 
     while True:
@@ -316,7 +326,7 @@ def main():
             break
         except Exception as e:
             logging.error(f"Unexpected error in main loop: {e}", exc_info=True)
-            time.sleep(60) # Pause briefly before attempting next cycle
+            time.sleep(60)
 
 if __name__ == "__main__":
     main()
