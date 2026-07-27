@@ -81,7 +81,7 @@ def load_journal() -> pd.DataFrame:
     return pd.DataFrame()
 
 # =====================================================================
-# REFINED BACKTESTING ENGINE
+# ROBUST BACKTESTING ENGINE
 # =====================================================================
 def fetch_backtest_data(symbol, timeframe='1h', limit=1000):
     try:
@@ -94,10 +94,14 @@ def fetch_backtest_data(symbol, timeframe='1h', limit=1000):
         df['tema_200'] = ta.tema(df['close'], length=200)
         df['atr'] = ta.atr(df['high'], df['low'], df['close'], length=14)
         
-        # ADX Calculation
+        # Explicit ADX Extraction
         adx_df = ta.adx(df['high'], df['low'], df['close'], length=14)
         if adx_df is not None and not adx_df.empty:
-            df['adx'] = adx_df.iloc[:, 0]
+            adx_cols = [c for c in adx_df.columns if c.startswith('ADX_')]
+            if adx_cols:
+                df['adx'] = adx_df[adx_cols[0]]
+            else:
+                df['adx'] = adx_df.iloc[:, 0]
         else:
             df['adx'] = 25.0
             
@@ -106,14 +110,13 @@ def fetch_backtest_data(symbol, timeframe='1h', limit=1000):
         st.error(f"Failed to fetch market data for {symbol}: {e}")
         return None
 
-def run_backtest_simulation(symbol, df, risk_pct=1.0, initial_capital=1000.0, proximity_pct=1.5, min_adx=18.0, min_atr_pct=0.4):
+def run_backtest_simulation(symbol, df, risk_pct=1.0, initial_capital=1000.0, proximity_pct=1.5, min_adx=18.0, min_atr_pct=0.4, use_filters=True):
     if df is None or df.empty or 'tema_200' not in df.columns:
-        return None, None
+        return None, None, {}
 
-    # Drop early warmup rows where indicators are NaN
     clean_df = df.dropna(subset=['tema_200', 'atr']).copy().reset_index(drop=True)
     if clean_df.empty:
-        return None, None
+        return None, None, {}
 
     trades = []
     capital = initial_capital
@@ -124,17 +127,29 @@ def run_backtest_simulation(symbol, df, risk_pct=1.0, initial_capital=1000.0, pr
     tp2 = 0.0
     risk_usd = 0.0
 
+    min_proximities = []
+    adx_values = []
+
     for i in range(len(clean_df)):
         current_row = clean_df.iloc[i]
-        close_p = current_row['close']
-        high_p = current_row['high']
-        low_p = current_row['low']
-        tema_p = current_row['tema_200']
-        atr_p = current_row['atr']
-        adx_p = current_row.get('adx', 20.0)
+        close_p = float(current_row['close'])
+        high_p = float(current_row['high'])
+        low_p = float(current_row['low'])
+        tema_p = float(current_row['tema_200'])
+        atr_p = float(current_row['atr'])
+        adx_p = float(current_row.get('adx', 25.0)) if not pd.isna(current_row.get('adx')) else 25.0
 
         if pd.isna(tema_p) or pd.isna(atr_p):
             continue
+
+        # Track stats for diagnostic feedback
+        dist_close_pct = abs(close_p - tema_p) / tema_p * 100.0
+        dist_low_pct = abs(low_p - tema_p) / tema_p * 100.0
+        dist_high_pct = abs(high_p - tema_p) / tema_p * 100.0
+        min_dist = min(dist_close_pct, dist_low_pct, dist_high_pct)
+        
+        min_proximities.append(min_dist)
+        adx_values.append(adx_p)
 
         if in_trade:
             # Check Stop Loss
@@ -168,14 +183,15 @@ def run_backtest_simulation(symbol, df, risk_pct=1.0, initial_capital=1000.0, pr
                 })
                 in_trade = False
         else:
-            # Check proximity across close or low wick tests
-            dist_close_pct = abs(close_p - tema_p) / tema_p * 100.0
-            dist_low_pct = abs(low_p - tema_p) / tema_p * 100.0
-            min_dist = min(dist_close_pct, dist_low_pct)
-            
             atr_pct = (atr_p / close_p) * 100.0 if close_p > 0 else 0.0
             
-            if min_dist <= proximity_pct and atr_pct >= min_atr_pct and adx_p >= min_adx:
+            # Filter condition
+            filters_passed = True
+            if use_filters:
+                if adx_p < min_adx or atr_pct < min_atr_pct:
+                    filters_passed = False
+
+            if min_dist <= proximity_pct and filters_passed:
                 in_trade = True
                 entry_price = close_p
                 stop_loss = entry_price - (1.5 * atr_p)
@@ -184,7 +200,12 @@ def run_backtest_simulation(symbol, df, risk_pct=1.0, initial_capital=1000.0, pr
                 risk_usd = capital * (risk_pct / 100.0)
 
     trades_df = pd.DataFrame(trades)
-    return trades_df, capital
+    diagnostics = {
+        "min_proximity_found": round(min(min_proximities), 2) if min_proximities else None,
+        "avg_proximity_found": round(sum(min_proximities) / len(min_proximities), 2) if min_proximities else None,
+        "max_adx_found": round(max(adx_values), 2) if adx_values else None,
+    }
+    return trades_df, capital, diagnostics
 
 # =====================================================================
 # MAIN DASHBOARD LAYOUT
@@ -195,46 +216,17 @@ st.title("🎯 Trade Sniper Dashboard & Controls")
 st.sidebar.header("⚙️ Bot Parameters")
 config = load_config()
 
-account_balance = st.sidebar.number_input(
-    "Account Balance ($)", 
-    value=float(config.get("account_balance", 1000.0)), 
-    step=100.0
-)
-risk_pct = st.sidebar.number_input(
-    "Risk Per Trade (%)", 
-    value=float(config.get("risk_pct", 1.0)), 
-    step=0.25
-)
-proximity_threshold = st.sidebar.number_input(
-    "Proximity Threshold (%)", 
-    value=float(config.get("proximity_threshold_pct", 1.5)), 
-    step=0.1
-)
-min_adx = st.sidebar.number_input(
-    "Min ADX Filter", 
-    value=float(config.get("min_adx", 18.0)), 
-    step=1.0
-)
-min_atr_pct = st.sidebar.number_input(
-    "Min ATR % Filter", 
-    value=float(config.get("min_atr_pct", 0.4)), 
-    step=0.1
-)
-scan_interval = st.sidebar.number_input(
-    "Scan Interval (Mins)", 
-    value=int(config.get("scan_interval_minutes", 15)), 
-    step=1
-)
-cooldown_hours = st.sidebar.number_input(
-    "Alert Cooldown (Hours)", 
-    value=int(config.get("alert_cooldown_hours", 4)), 
-    step=1
-)
+account_balance = st.sidebar.number_input("Account Balance ($)", value=float(config.get("account_balance", 1000.0)), step=100.0)
+risk_pct = st.sidebar.number_input("Risk Per Trade (%)", value=float(config.get("risk_pct", 1.0)), step=0.25)
+proximity_threshold = st.sidebar.number_input("Proximity Threshold (%)", value=float(config.get("proximity_threshold_pct", 1.5)), step=0.1)
+min_adx = st.sidebar.number_input("Min ADX Filter", value=float(config.get("min_adx", 18.0)), step=1.0)
+min_atr_pct = st.sidebar.number_input("Min ATR % Filter", value=float(config.get("min_atr_pct", 0.4)), step=0.1)
+scan_interval = st.sidebar.number_input("Scan Interval (Mins)", value=int(config.get("scan_interval_minutes", 15)), step=1)
+cooldown_hours = st.sidebar.number_input("Alert Cooldown (Hours)", value=int(config.get("alert_cooldown_hours", 4)), step=1)
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("📌 Watchlist Manager")
 
-# Single Custom Symbol Adder
 custom_symbol_input = st.sidebar.text_input("Add Single Symbol (e.g., SOL/USDT)", "").strip().upper()
 if st.sidebar.button("➕ Add to Watchlist", use_container_width=True):
     if custom_symbol_input:
@@ -247,11 +239,7 @@ if st.sidebar.button("➕ Add to Watchlist", use_container_width=True):
         else:
             st.sidebar.warning(f"{custom_symbol_input} is already in your watchlist.")
 
-# Editable Text Area for Full Watchlist
-watchlist_str = st.sidebar.text_area(
-    "Active Watchlist (Comma Separated)", 
-    value=", ".join(config.get("watchlist", []))
-)
+watchlist_str = st.sidebar.text_area("Active Watchlist (Comma Separated)", value=", ".join(config.get("watchlist", [])))
 
 if st.sidebar.button("💾 Save All Settings", use_container_width=True):
     updated_watchlist = [symbol.strip().upper() for symbol in watchlist_str.split(",") if symbol.strip()]
@@ -362,21 +350,24 @@ with tab4:
     else:
         bt_symbol = selected_preset
 
-    bt_candles = b_col2.slider("Candle Lookback (1H)", min_value=200, max_value=1000, value=500, step=50)
+    bt_candles = b_col2.slider("Candle Lookback (1H)", min_value=200, max_value=2000, value=1000, step=100)
     bt_capital = b_col3.number_input("Starting Capital ($)", value=1000.0, step=100.0)
+
+    use_regime_filters = st.checkbox("Enforce ADX & ATR Filters in Backtest", value=False, help="Uncheck to test pure structural proximity without indicator restrictions.")
 
     if st.button("🚀 Run Strategy Simulation", use_container_width=True):
         with st.spinner(f"Fetching historical data and backtesting {bt_symbol}..."):
             df_bt = fetch_backtest_data(bt_symbol, timeframe='1h', limit=bt_candles)
             if df_bt is not None and not df_bt.empty:
-                results_df, final_cap = run_backtest_simulation(
+                results_df, final_cap, diag = run_backtest_simulation(
                     symbol=bt_symbol, 
                     df=df_bt, 
                     risk_pct=risk_pct, 
                     initial_capital=bt_capital, 
                     proximity_pct=proximity_threshold,
                     min_adx=min_adx,
-                    min_atr_pct=min_atr_pct
+                    min_atr_pct=min_atr_pct,
+                    use_filters=use_regime_filters
                 )
                 
                 if results_df is not None and not results_df.empty:
@@ -396,3 +387,8 @@ with tab4:
                     st.dataframe(results_df.sort_index(ascending=False), use_container_width=True)
                 else:
                     st.warning(f"No structural triggers matched for {bt_symbol} during the selected historical window.")
+                    if diag:
+                        st.info(f"🔍 **Data Diagnostics ({bt_symbol}):**\n"
+                                f"- Closest Distance to 200 TEMA: **{diag.get('min_proximity_found')}%** (Your Threshold: {proximity_threshold}%)\n"
+                                f"- Max ADX Value Found: **{diag.get('max_adx_found')}** (Your Filter: {min_adx})\n"
+                                f"💡 *Try increasing Candle Lookback to 1000+ or unchecking 'Enforce ADX & ATR Filters' above.*")
