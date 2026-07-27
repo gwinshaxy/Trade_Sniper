@@ -37,7 +37,7 @@ DEFAULT_CONFIG = {
     ]
 }
 
-# Cooldown memory store: { "SYMBOL": datetime_of_last_alert }
+# Memory store for alert cooldowns: { "SYMBOL": datetime_of_last_alert }
 alert_cooldowns = {}
 
 # Global exchange instance (MEXC)
@@ -52,7 +52,7 @@ exchange = ccxt.mexc({
 # CONFIGURATION & UTILS
 # =====================================================================
 def load_config() -> dict:
-    """Loads settings from config.json or falls back to defaults."""
+    """Loads configuration settings from config.json or falls back to defaults."""
     if os.path.exists(CONFIG_FILE):
         try:
             with open(CONFIG_FILE, "r") as f:
@@ -60,14 +60,14 @@ def load_config() -> dict:
                 logging.info("Successfully loaded config.json")
                 return {**DEFAULT_CONFIG, **config}
         except Exception as e:
-            logging.error(f"Error reading config.json ({e}). Falling back to default settings.")
+            logging.error(f"Error reading config.json ({e}). Falling back to defaults.")
             return DEFAULT_CONFIG
     else:
         logging.warning("config.json not found. Using default internal settings.")
         return DEFAULT_CONFIG
 
 def send_telegram_alert(message: str) -> bool:
-    """Sends a formatted notification to Telegram."""
+    """Sends a formatted alert notification to Telegram via Bot API."""
     bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
     chat_id = os.getenv("TELEGRAM_CHAT_ID")
 
@@ -108,8 +108,12 @@ def log_trade_to_journal(journal_file: str, trade_data: dict):
 # =====================================================================
 # MARKET DATA & INDICATORS
 # =====================================================================
-def fetch_ohlcv(symbol: str, timeframe: str = "1h", limit: int = 300) -> pd.DataFrame:
-    """Fetches candle data from MEXC safely."""
+def fetch_ohlcv(symbol: str, timeframe: str = "1h", limit: int = 1000) -> pd.DataFrame:
+    """
+    Fetches candle history from MEXC.
+    FIX A: Fetch limit defaults to 1000 bars because 200 TEMA requires 
+    ~600 bars of historical warm-up data to compute non-NaN values.
+    """
     try:
         ohlcv = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
         if not ohlcv or len(ohlcv) == 0:
@@ -125,7 +129,8 @@ def fetch_ohlcv(symbol: str, timeframe: str = "1h", limit: int = 300) -> pd.Data
 
 def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
     """Calculates 200 TEMA, 14 ADX, and 14 ATR %."""
-    if df.empty or len(df) < 200:
+    if df.empty or len(df) < 600:
+        logging.warning(f"Insufficient candle depth ({len(df)} bars). TEMA 200 needs at least 600 bars.")
         return pd.DataFrame()
 
     # 1. 200-period TEMA
@@ -154,35 +159,39 @@ def check_trade_signal(
     min_adx: float = 20.0, 
     min_atr_pct: float = 0.5
 ) -> dict:
-    """Evaluates 200 TEMA proximity and regime filters safely."""
-    if df.empty or len(df) < 200 or "TEMA_200" not in df.columns:
-        return {"valid": False, "rejected_reason": "Insufficient candle history (< 200 bars)"}
+    """
+    Evaluates 200 TEMA proximity and regime filters safely.
+    FIX B: Inspects ONLY the latest candle (df.iloc[-1]) for NaN values, ignoring 
+    the initial historical rows where TEMA naturally warm-ups.
+    """
+    if df.empty or "TEMA_200" not in df.columns:
+        return {"valid": False, "rejected_reason": "Indicator calculations failed or missing columns"}
 
-    # Grab latest completed row
+    # Extract strictly the latest row
     latest = df.iloc[-1]
 
     close_raw = latest.get("close")
     tema_raw = latest.get("TEMA_200")
 
-    # Strict check for None or NaN values
+    # Strict check on latest row values ONLY
     if pd.isna(close_raw) or close_raw is None or pd.isna(tema_raw) or tema_raw is None:
-        return {"valid": False, "rejected_reason": "Close or TEMA_200 contains NaN/None value"}
+        return {"valid": False, "rejected_reason": "Latest candle Close or TEMA_200 is NaN"}
 
     close_price = float(close_raw)
     tema_val = float(tema_raw)
 
-    # Safely parse ADX and ATR %
+    # Safely parse ADX and ATR % for current candle
     adx_raw = latest.get("ADX_14", 0.0)
     adx_val = float(adx_raw) if pd.notna(adx_raw) and adx_raw is not None else 0.0
 
     atr_raw = latest.get("ATR_PCT", 0.0)
     atr_pct_val = float(atr_raw) if pd.notna(atr_raw) and atr_raw is not None else 0.0
 
-    # Proximity calculation
+    # Distance to 200 TEMA (%)
     distance_pct = abs(close_price - tema_val) / tema_val * 100.0
     is_in_proximity = distance_pct <= proximity_threshold
 
-    # Regime checks
+    # Regime Filter Checks
     is_trending = adx_val >= min_adx
     has_volatility = atr_pct_val >= min_atr_pct
 
@@ -235,11 +244,10 @@ def run_scan_cycle():
                 logging.info(f"[{symbol}] In cooldown mode ({remaining_mins} mins remaining). Skipped.")
                 continue
 
-        # Fetch Data
-        df = fetch_ohlcv(symbol, timeframe="1h", limit=300)
+        # Fetch Data (limit=1000 for full TEMA warmup)
+        df = fetch_ohlcv(symbol, timeframe="1h", limit=1000)
         
-        # GUARD: Skip pair immediately if fetching failed or returned empty
-        if df.empty or len(df) < 200:
+        if df.empty or len(df) < 600:
             logging.warning(f"[{symbol}] Insufficient candle data returned. Skipping evaluation.")
             continue
 
@@ -249,7 +257,7 @@ def run_scan_cycle():
             logging.warning(f"[{symbol}] Indicator calculation failed. Skipping evaluation.")
             continue
 
-        # Evaluate Signal
+        # Evaluate Signal on latest bar
         result = check_trade_signal(
             df=df,
             proximity_threshold=proximity_threshold,
@@ -306,7 +314,7 @@ def run_scan_cycle():
             logging.info(f"[{symbol}] No Signal -> {result['rejected_reason']}")
 
 def main():
-    """Main process loop."""
+    """Main execution loop."""
     logging.info("Initializing Trading Agent...")
     
     send_telegram_alert("🟢 *Trading Agent Initialized & Active.* Scanning loop starting...")
