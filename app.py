@@ -2,6 +2,7 @@ import os
 import json
 import time
 import warnings
+import requests
 import ccxt
 import pandas as pd
 import pandas_ta as ta
@@ -87,7 +88,7 @@ def load_journal() -> pd.DataFrame:
 # DATA FETCHING & TECHNICAL ENGINE
 # =====================================================================
 def sanitize_symbol(raw_symbol: str) -> str:
-    """Formats ticker strings so CCXT can recognize them properly."""
+    """Formats ticker strings so APIs can recognize them properly."""
     clean = raw_symbol.strip().upper()
     if "/" not in clean and clean.endswith("USDT"):
         clean = clean[:-4] + "/USDT"
@@ -95,59 +96,60 @@ def sanitize_symbol(raw_symbol: str) -> str:
 
 def fetch_backtest_data(symbol: str, timeframe='1h', limit=1000):
     """
-    Fetches historical OHLCV data reliably.
-    Tries MEXC first; if blocked or empty (cloud server IP restrictions), 
-    falls back automatically to Binance and KuCoin.
+    Fetches historical OHLCV data using direct public REST endpoints.
+    Bypasses library overhead and cloud proxy restrictions on Render.
     """
-    formatted_symbol = sanitize_symbol(symbol)
+    formatted_symbol = sanitize_symbol(symbol).replace('/', '').upper()
     fetch_limit = min(limit, 1000)
-    ohlcv = None
-    successful_exchange = None
-
-    # Order of exchanges to query
-    exchanges_to_try = [
-        ('MEXC', ccxt.mexc({'enableRateLimit': True, 'timeout': 12000, 'options': {'defaultType': 'spot'}})),
-        ('Binance', ccxt.binance({'enableRateLimit': True, 'timeout': 12000})),
-        ('KuCoin', ccxt.kucoin({'enableRateLimit': True, 'timeout': 12000}))
+    
+    urls = [
+        f"https://api.binance.com/api/v3/klines?symbol={formatted_symbol}&interval={timeframe}&limit={fetch_limit}",
+        f"https://api.bybit.com/v5/market/kline?category=spot&symbol={formatted_symbol}&interval=60&limit={fetch_limit}"
     ]
+    
+    raw_candles = None
+    provider = None
+    
+    # 1. Binance Direct Public REST
+    try:
+        res = requests.get(urls[0], timeout=10)
+        if res.status_code == 200:
+            data = res.json()
+            if isinstance(data, list) and len(data) > 0:
+                raw_candles = [[c[0], c[1], c[2], c[3], c[4], c[5]] for c in data]
+                provider = "Binance REST"
+    except Exception:
+        pass
 
-    for name, exchange in exchanges_to_try:
+    # 2. Bybit Direct Public REST Fallback
+    if not raw_candles:
         try:
-            exchange.load_markets()
-            target_symbol = formatted_symbol
-            
-            # Match pair format across exchange symbol structures
-            if target_symbol not in exchange.markets:
-                alt_symbol = target_symbol.replace("/", "")
-                if alt_symbol in exchange.markets:
-                    target_symbol = alt_symbol
-                else:
-                    continue
-
-            candles = exchange.fetch_ohlcv(target_symbol, timeframe=timeframe, limit=fetch_limit)
-            if candles and len(candles) > 0:
-                ohlcv = candles
-                successful_exchange = name
-                break
+            res = requests.get(urls[1], timeout=10)
+            if res.status_code == 200:
+                data = res.json()
+                if data.get('retCode') == 0 and len(data['result']['list']) > 0:
+                    klist = data['result']['list'][::-1]  # Reverse to chronological order
+                    raw_candles = [[float(c[0]), c[1], c[2], c[3], c[4], c[5]] for c in klist]
+                    provider = "Bybit REST"
         except Exception:
-            continue
+            pass
 
-    if not ohlcv or len(ohlcv) == 0:
-        st.error(f"Could not fetch OHLCV data for {symbol} across available data sources.")
+    if not raw_candles or len(raw_candles) == 0:
+        st.error(f"Unable to fetch history for {symbol} across public endpoints.")
         return None
 
     # Construct DataFrame
-    df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+    df = pd.DataFrame(raw_candles, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+    df['timestamp'] = pd.to_datetime(pd.to_numeric(df['timestamp']), unit='ms')
     df.drop_duplicates(subset=['timestamp'], inplace=True)
-    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
     df.sort_values('timestamp', inplace=True)
     df.reset_index(drop=True, inplace=True)
 
-    # Cast price columns strictly to float64 to ensure smooth pandas_ta math
+    # Cast price columns strictly to float64
     for col in ['open', 'high', 'low', 'close', 'volume']:
         df[col] = pd.to_numeric(df[col], errors='coerce').astype('float64')
 
-    # Calculate Technical Indicators
+    # Calculate Indicators
     df['tema_200'] = ta.tema(df['close'], length=200)
     df['atr'] = ta.atr(df['high'], df['low'], df['close'], length=14)
     
@@ -158,7 +160,7 @@ def fetch_backtest_data(symbol: str, timeframe='1h', limit=1000):
     else:
         df['adx'] = 25.0
 
-    df.attrs['source_exchange'] = successful_exchange
+    df.attrs['source_exchange'] = provider
     return df
 
 def run_backtest_simulation(symbol, df, risk_pct=1.0, initial_capital=1000.0, proximity_pct=1.5, min_adx=18.0, min_atr_pct=0.4, use_filters=True):
@@ -195,7 +197,7 @@ def run_backtest_simulation(symbol, df, risk_pct=1.0, initial_capital=1000.0, pr
         if pd.isna(tema_p) or pd.isna(atr_p) or tema_p == 0:
             continue
 
-        # Structural Proximity Calculations
+        # Proximity Calculations
         dist_close_pct = abs(close_p - tema_p) / tema_p * 100.0
         dist_low_pct = abs(low_p - tema_p) / tema_p * 100.0
         dist_high_pct = abs(high_p - tema_p) / tema_p * 100.0
@@ -207,7 +209,7 @@ def run_backtest_simulation(symbol, df, risk_pct=1.0, initial_capital=1000.0, pr
         atr_pct_values.append(atr_pct)
 
         if in_trade:
-            # Check Stop Loss Trigger
+            # Check Stop Loss
             if low_p <= stop_loss:
                 pnl = -risk_usd
                 capital += pnl
@@ -223,9 +225,9 @@ def run_backtest_simulation(symbol, df, risk_pct=1.0, initial_capital=1000.0, pr
                 })
                 in_trade = False
 
-            # Check Take Profit 2 Trigger
+            # Check Take Profit 2
             elif high_p >= tp2:
-                pnl = risk_usd * 2.0  # 1:2 Risk/Reward Target
+                pnl = risk_usd * 2.0
                 capital += pnl
                 trades.append({
                     "Timestamp": current_row['timestamp'],
@@ -253,7 +255,7 @@ def run_backtest_simulation(symbol, df, risk_pct=1.0, initial_capital=1000.0, pr
                 tp2 = entry_price + (3.0 * atr_p)
                 risk_usd = capital * (risk_pct / 100.0)
 
-    # Force-close any position remaining active at the end of data series
+    # Force-close active trade on last candle
     if in_trade and len(clean_df) > 0:
         last_row = clean_df.iloc[-1]
         exit_p = float(last_row['close'])
