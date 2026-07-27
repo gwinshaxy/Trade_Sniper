@@ -57,23 +57,28 @@ def get_exchange():
 exchange = get_exchange()
 
 def init_journal_file(journal_file="trade_journal.csv"):
-    """Ensures trade_journal.csv exists with valid header columns."""
+    """Ensures trade_journal.csv exists with expanded evaluation columns."""
+    headers = [
+        "Timestamp", "Symbol", "Trigger_Reason", "Entry_Price", 
+        "Stop_Loss", "Take_Profit_1", "Take_Profit_2", "Position_USDT", 
+        "Max_Risk_USD", "Status", "Exit_Price", "Closed_Timestamp", 
+        "Realized_PnL_USD", "Realized_R"
+    ]
+    
     if not os.path.exists(journal_file):
         with open(journal_file, mode='w', newline='', encoding='utf-8') as f:
             writer = csv.writer(f)
-            writer.writerow([
-                "Timestamp", 
-                "Symbol", 
-                "Trigger_Reason", 
-                "Entry_Price", 
-                "Stop_Loss", 
-                "Take_Profit_1", 
-                "Take_Profit_2", 
-                "Position_USDT", 
-                "Max_Risk_USD", 
-                "Status"
-            ])
+            writer.writerow(headers)
         print(f"Initialized new trade journal at '{journal_file}'.")
+    else:
+        # Upgrade existing CSV header if missing new evaluation columns
+        df = pd.read_csv(journal_file)
+        missing_cols = [col for col in headers if col not in df.columns]
+        if missing_cols:
+            for col in missing_cols:
+                df[col] = None
+            df.to_csv(journal_file, index=False)
+            print(f"Upgraded journal columns in '{journal_file}'.")
 
 def log_trade_signal(journal_file, symbol, reasons, entry, sl, tp1, tp2, position_usdt, risk_usd):
     """Appends a new trade signal entry into the CSV journal."""
@@ -83,16 +88,9 @@ def log_trade_signal(journal_file, symbol, reasons, entry, sl, tp1, tp2, positio
     with open(journal_file, mode='a', newline='', encoding='utf-8') as f:
         writer = csv.writer(f)
         writer.writerow([
-            timestamp_str,
-            symbol,
-            reasons_str,
-            f"{entry:.4f}",
-            f"{sl:.4f}",
-            f"{tp1:.4f}",
-            f"{tp2:.4f}",
-            f"{position_usdt:.2f}",
-            f"{risk_usd:.2f}",
-            "OPEN"
+            timestamp_str, symbol, reasons_str, f"{entry:.4f}",
+            f"{sl:.4f}", f"{tp1:.4f}", f"{tp2:.4f}", f"{position_usdt:.2f}",
+            f"{risk_usd:.2f}", "OPEN", "", "", "", ""
         ])
     print(f"💾 Trade signal logged to '{journal_file}' for {symbol}.")
 
@@ -158,6 +156,103 @@ def safe_format(value):
         return "N/A"
     return f"${value:.4f}"
 
+async def evaluate_active_trades(bot, chat_id, config):
+    """Evaluates OPEN signals against live market price action."""
+    journal_file = config.get("journal_file", "trade_journal.csv")
+    if not os.path.exists(journal_file):
+        return
+
+    try:
+        df = pd.read_csv(journal_file)
+    except Exception as e:
+        print(f"Error reading journal for evaluation: {e}")
+        return
+
+    open_mask = df['Status'].isin(['OPEN', 'TP1_HIT'])
+    if not open_mask.any():
+        return
+
+    print(f"\n🔄 Evaluating active signals in trade journal...")
+    updated = False
+
+    for idx, row in df[open_mask].iterrows():
+        symbol = str(row['Symbol'])
+        entry = float(row['Entry_Price'])
+        sl = float(row['Stop_Loss'])
+        tp1 = float(row['Take_Profit_1'])
+        tp2 = float(row['Take_Profit_2'])
+        risk_usd = float(row['Max_Risk_USD'])
+        position_usdt = float(row['Position_USDT'])
+        current_status = str(row['Status'])
+
+        # Fetch recent 15m candle action
+        df_candles = fetch_market_data(symbol, timeframe='15m', limit=10)
+        if df_candles is None or df_candles.empty:
+            continue
+
+        latest_low = df_candles['low'].min()
+        latest_high = df_candles['high'].max()
+        close_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        # 1. Check Stop Loss
+        if latest_low <= sl:
+            pnl_usd = -risk_usd
+            realized_r = -1.0
+            
+            df.at[idx, 'Status'] = 'STOPPED_OUT'
+            df.at[idx, 'Exit_Price'] = f"{sl:.4f}"
+            df.at[idx, 'Closed_Timestamp'] = close_time
+            df.at[idx, 'Realized_PnL_USD'] = f"{pnl_usd:.2f}"
+            df.at[idx, 'Realized_R'] = f"{realized_r:.2f}"
+            updated = True
+
+            msg = (
+                f"🛑 **TRADE STOPPED OUT: {symbol}** 🛑\n\n"
+                f"• Exit Price: `${sl:.4f}`\n"
+                f"• Realized PnL: `${pnl_usd:.2f}` (-1.0R)\n"
+                f"• Timestamp: `{close_time}`"
+            )
+            await bot.send_message(chat_id=chat_id, text=msg)
+
+        # 2. Check Take Profit 2 (Full Target Close)
+        elif latest_high >= tp2:
+            r_multiple = abs(tp2 - entry) / abs(entry - sl) if abs(entry - sl) > 0 else 0
+            pnl_usd = risk_usd * r_multiple
+
+            df.at[idx, 'Status'] = 'CLOSED_TP2'
+            df.at[idx, 'Exit_Price'] = f"{tp2:.4f}"
+            df.at[idx, 'Closed_Timestamp'] = close_time
+            df.at[idx, 'Realized_PnL_USD'] = f"{pnl_usd:.2f}"
+            df.at[idx, 'Realized_R'] = f"{r_multiple:.2f}"
+            updated = True
+
+            msg = (
+                f"🎯 **FULL TARGET HIT (TP2): {symbol}** 🎯\n\n"
+                f"• Target Price: `${tp2:.4f}`\n"
+                f"• Realized PnL: `+${pnl_usd:.2f}` (+{r_multiple:.2f}R)\n"
+                f"• Timestamp: `{close_time}`"
+            )
+            await bot.send_message(chat_id=chat_id, text=msg)
+
+        # 3. Check Take Profit 1 (Partial/Milestone Hit)
+        elif latest_high >= tp1 and current_status == 'OPEN':
+            r_multiple = abs(tp1 - entry) / abs(entry - sl) if abs(entry - sl) > 0 else 0
+            
+            df.at[idx, 'Status'] = 'TP1_HIT'
+            updated = True
+
+            msg = (
+                f"✅ **FIRST TARGET REACHED (TP1): {symbol}** ✅\n\n"
+                f"• Milestone Price: `${tp1:.4f}`\n"
+                f"• Un-realized Gain: `+{r_multiple:.2f}R`\n"
+                f"• Status: Stop Loss moved to Breakeven (${entry:.4f})"
+            )
+            await bot.send_message(chat_id=chat_id, text=msg)
+
+    if updated:
+        df.to_csv(journal_file, index=False)
+        print("💾 Updated active trade statuses in CSV journal.")
+
 async def analyze_symbol(symbol, bot, chat_id, config):
     current_time = time.time()
     
@@ -167,14 +262,12 @@ async def analyze_symbol(symbol, bot, chat_id, config):
     cooldown_hours = config.get("alert_cooldown_hours", 4)
     journal_file = config.get("journal_file", "trade_journal.csv")
     
-    # 1. Check Cooldown
     if symbol in last_alert_time:
         elapsed_hours = (current_time - last_alert_time[symbol]) / 3600
         if elapsed_hours < cooldown_hours:
             print(f"[{symbol}] On cooldown ({elapsed_hours:.1f}h / {cooldown_hours}h elapsed). Skipping scan.")
             return
 
-    # 2. Fetch Data
     df_1h = fetch_market_data(symbol, timeframe='1h', limit=500)
     df_4h = fetch_market_data(symbol, timeframe='4h', limit=500)
     
@@ -186,7 +279,6 @@ async def analyze_symbol(symbol, bot, chat_id, config):
     val_4h = df_4h['tema_200'].dropna().iloc[-1] if not df_4h['tema_200'].dropna().empty else None
     poc_price, hvn_prices = calculate_volume_profile(df_1h, num_bins=30)
     
-    # 3. Check Proximity Triggers
     triggered_reasons = []
     
     if val_1h is not None:
@@ -210,7 +302,6 @@ async def analyze_symbol(symbol, bot, chat_id, config):
 
     print(f"🎯 TRIGGER MATCH for {symbol}: {', '.join(triggered_reasons)}")
 
-    # 4. Calculate Risk & Position
     entry_price = current_price
     stop_loss = entry_price * 0.965  
     tp1 = hvn_prices[0] if hvn_prices[0] > entry_price else entry_price * 1.05
@@ -221,7 +312,6 @@ async def analyze_symbol(symbol, bot, chat_id, config):
         account_balance, entry_price, stop_loss, risk_pct=risk_pct
     )
     
-    # 5. Log & Dispatch
     log_trade_signal(
         journal_file, symbol, triggered_reasons, entry_price, 
         stop_loss, tp1, tp2, position_usdt, risk_usd
@@ -255,7 +345,6 @@ async def run_scanner():
     config = load_config()
     init_journal_file(config.get("journal_file", "trade_journal.csv"))
 
-    # Safely load Telegram credentials from Env or Config
     telegram_bot_token = os.getenv("TELEGRAM_BOT_TOKEN") or config.get("telegram_bot_token")
     telegram_chat_id = os.getenv("TELEGRAM_CHAT_ID") or config.get("telegram_chat_id")
 
@@ -266,11 +355,11 @@ async def run_scanner():
     bot = Bot(token=telegram_bot_token)
     
     startup_msg = (
-        "🔍 Filtered Watchlist Scanner & Journal Active\n\n"
+        "🔍 Filtered Watchlist Scanner & Active Trade Evaluator Live\n\n"
         f"• Assets Monitored: {', '.join(config['watchlist'])}\n"
         f"• Proximity Threshold: Within {config['proximity_threshold_pct']}% of key levels\n"
         f"• Alert Cooldown: {config['alert_cooldown_hours']} Hours\n"
-        f"• Trade Logging: Enabled ({config.get('journal_file', 'trade_journal.csv')})"
+        f"• Automated Performance Tracking: Enabled"
     )
     await bot.send_message(chat_id=telegram_chat_id, text=startup_msg)
     
@@ -279,6 +368,10 @@ async def run_scanner():
         watchlist = current_config.get("watchlist", [])
         scan_interval = current_config.get("scan_interval_minutes", 15)
         
+        # 1. Evaluate open trades in journal
+        await evaluate_active_trades(bot, telegram_chat_id, current_config)
+
+        # 2. Scan watchlist for new proximity setups
         print(f"\n--- Starting Scan Cycle ({len(watchlist)} assets) ---")
         for symbol in watchlist:
             try:
