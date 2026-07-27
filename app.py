@@ -95,63 +95,71 @@ def sanitize_symbol(raw_symbol: str) -> str:
 
 def fetch_backtest_data(symbol: str, timeframe='1h', limit=1000):
     """
-    Fetches historical candles from MEXC with explicit market loading and typing.
+    Fetches historical OHLCV data reliably.
+    Tries MEXC first; if blocked or empty (cloud server IP restrictions), 
+    falls back automatically to Binance and KuCoin.
     """
-    try:
-        formatted_symbol = sanitize_symbol(symbol)
-        exchange = ccxt.mexc({
-            'enableRateLimit': True, 
-            'timeout': 20000,
-            'options': {'defaultType': 'spot'}
-        })
-        
-        # Load exchange market definitions explicitly
-        exchange.load_markets()
-        
-        if formatted_symbol not in exchange.markets:
-            # Fallback check if ticker exists in alternative formatting
-            alt_symbol = formatted_symbol.replace("/", "")
-            if alt_symbol in exchange.markets:
-                formatted_symbol = alt_symbol
-            else:
-                st.error(f"Symbol '{symbol}' not found on MEXC Spot markets.")
-                return None
+    formatted_symbol = sanitize_symbol(symbol)
+    fetch_limit = min(limit, 1000)
+    ohlcv = None
+    successful_exchange = None
 
-        # Fetch up to max allowable candle limit
-        fetch_limit = min(limit, 1000)
-        ohlcv = exchange.fetch_ohlcv(formatted_symbol, timeframe=timeframe, limit=fetch_limit)
-        
-        if not ohlcv or len(ohlcv) == 0:
-            st.error(f"MEXC returned 0 candles for {formatted_symbol}.")
-            return None
+    # Order of exchanges to query
+    exchanges_to_try = [
+        ('MEXC', ccxt.mexc({'enableRateLimit': True, 'timeout': 12000, 'options': {'defaultType': 'spot'}})),
+        ('Binance', ccxt.binance({'enableRateLimit': True, 'timeout': 12000})),
+        ('KuCoin', ccxt.kucoin({'enableRateLimit': True, 'timeout': 12000}))
+    ]
 
-        # Structure DataFrame
-        df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-        df.drop_duplicates(subset=['timestamp'], inplace=True)
-        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-        df.sort_values('timestamp', inplace=True)
-        df.reset_index(drop=True, inplace=True)
-
-        # Cast prices strictly to float to ensure pandas_ta runs smoothly
-        for col in ['open', 'high', 'low', 'close', 'volume']:
-            df[col] = pd.to_numeric(df[col], errors='coerce').astype('float64')
-
-        # Calculate Technical Indicators
-        df['tema_200'] = ta.tema(df['close'], length=200)
-        df['atr'] = ta.atr(df['high'], df['low'], df['close'], length=14)
-        
-        adx_df = ta.adx(df['high'], df['low'], df['close'], length=14)
-        if adx_df is not None and not adx_df.empty:
-            adx_cols = [c for c in adx_df.columns if c.startswith('ADX_')]
-            df['adx'] = adx_df[adx_cols[0]] if adx_cols else adx_df.iloc[:, 0]
-        else:
-            df['adx'] = 25.0
+    for name, exchange in exchanges_to_try:
+        try:
+            exchange.load_markets()
+            target_symbol = formatted_symbol
             
-        return df
+            # Match pair format across exchange symbol structures
+            if target_symbol not in exchange.markets:
+                alt_symbol = target_symbol.replace("/", "")
+                if alt_symbol in exchange.markets:
+                    target_symbol = alt_symbol
+                else:
+                    continue
 
-    except Exception as e:
-        st.error(f"API Error fetching {symbol}: {str(e)}")
+            candles = exchange.fetch_ohlcv(target_symbol, timeframe=timeframe, limit=fetch_limit)
+            if candles and len(candles) > 0:
+                ohlcv = candles
+                successful_exchange = name
+                break
+        except Exception:
+            continue
+
+    if not ohlcv or len(ohlcv) == 0:
+        st.error(f"Could not fetch OHLCV data for {symbol} across available data sources.")
         return None
+
+    # Construct DataFrame
+    df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+    df.drop_duplicates(subset=['timestamp'], inplace=True)
+    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+    df.sort_values('timestamp', inplace=True)
+    df.reset_index(drop=True, inplace=True)
+
+    # Cast price columns strictly to float64 to ensure smooth pandas_ta math
+    for col in ['open', 'high', 'low', 'close', 'volume']:
+        df[col] = pd.to_numeric(df[col], errors='coerce').astype('float64')
+
+    # Calculate Technical Indicators
+    df['tema_200'] = ta.tema(df['close'], length=200)
+    df['atr'] = ta.atr(df['high'], df['low'], df['close'], length=14)
+    
+    adx_df = ta.adx(df['high'], df['low'], df['close'], length=14)
+    if adx_df is not None and not adx_df.empty:
+        adx_cols = [c for c in adx_df.columns if c.startswith('ADX_')]
+        df['adx'] = adx_df[adx_cols[0]] if adx_cols else adx_df.iloc[:, 0]
+    else:
+        df['adx'] = 25.0
+
+    df.attrs['source_exchange'] = successful_exchange
+    return df
 
 def run_backtest_simulation(symbol, df, risk_pct=1.0, initial_capital=1000.0, proximity_pct=1.5, min_adx=18.0, min_atr_pct=0.4, use_filters=True):
     if df is None or df.empty or 'tema_200' not in df.columns:
@@ -160,7 +168,7 @@ def run_backtest_simulation(symbol, df, risk_pct=1.0, initial_capital=1000.0, pr
     # Drop early indicator warmup rows
     clean_df = df.dropna(subset=['tema_200', 'atr']).copy().reset_index(drop=True)
     if clean_df.empty:
-        return None, None, {"error": "All rows were dropped during TEMA 200 warmup window."}
+        return None, None, {"error": "All rows dropped during TEMA 200 warmup window."}
 
     trades = []
     capital = float(initial_capital)
@@ -217,7 +225,7 @@ def run_backtest_simulation(symbol, df, risk_pct=1.0, initial_capital=1000.0, pr
 
             # Check Take Profit 2 Trigger
             elif high_p >= tp2:
-                pnl = risk_usd * 2.0  # 1:2 Risk/Reward target
+                pnl = risk_usd * 2.0  # 1:2 Risk/Reward Target
                 capital += pnl
                 trades.append({
                     "Timestamp": current_row['timestamp'],
@@ -245,7 +253,7 @@ def run_backtest_simulation(symbol, df, risk_pct=1.0, initial_capital=1000.0, pr
                 tp2 = entry_price + (3.0 * atr_p)
                 risk_usd = capital * (risk_pct / 100.0)
 
-    # Automatically force-close any position remaining active on the last candle
+    # Force-close any position remaining active at the end of data series
     if in_trade and len(clean_df) > 0:
         last_row = clean_df.iloc[-1]
         exit_p = float(last_row['close'])
@@ -264,6 +272,7 @@ def run_backtest_simulation(symbol, df, risk_pct=1.0, initial_capital=1000.0, pr
 
     trades_df = pd.DataFrame(trades)
     diagnostics = {
+        "source_exchange": df.attrs.get('source_exchange', 'Unknown'),
         "raw_candles_fetched": len(df),
         "valid_candles_tested": len(clean_df),
         "closest_proximity_found": round(min(min_proximities), 2) if min_proximities else None,
@@ -455,6 +464,7 @@ with tab4:
                 else:
                     st.warning(f"No structural triggers matched for {bt_symbol} during the selected historical window.")
                     st.info(f"🔍 **Data Diagnostics ({bt_symbol}):**\n"
+                            f"- Data Provider Used: **{diag.get('source_exchange')}**\n"
                             f"- Raw Candles Fetched: **{diag.get('raw_candles_fetched')}**\n"
                             f"- Valid Candles Tested (after TEMA 200 warmup): **{diag.get('valid_candles_tested')}**\n"
                             f"- Closest Distance to 200 TEMA: **{diag.get('closest_proximity_found')}%** (Your Threshold: {proximity_threshold}%)\n"
