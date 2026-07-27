@@ -19,7 +19,6 @@ st.set_page_config(
 # --- AUTHENTICATION GUARD ---
 def check_password():
     """Returns True if the user enters the correct password."""
-    # Reads the password set in Render environment variables
     target_password = os.getenv("DASHBOARD_PASSWORD", "default_local_password")
 
     if st.session_state.get("password_correct", False):
@@ -54,7 +53,9 @@ def load_config():
         return {
             "account_balance": 1000.0,
             "risk_pct": 1.0,
-            "proximity_threshold_pct": 0.75,
+            "proximity_threshold_pct": 1.0,
+            "min_adx": 20.0,
+            "min_atr_pct": 0.5,
             "scan_interval_minutes": 15,
             "alert_cooldown_hours": 4,
             "journal_file": "trade_journal.csv",
@@ -137,7 +138,7 @@ def run_backtest_simulation(symbol, df_1h, df_4h, initial_balance, risk_pct, pro
                     'Outcome': 'STOP_LOSS'
                 })
                 active_trade = None
-            # Check Target 1 / Target 2 Exits
+            # Check Target Exits
             elif candle['high'] >= active_trade['tp1']:
                 gain_r = abs(active_trade['tp1'] - active_trade['entry_price']) / abs(active_trade['entry_price'] - active_trade['stop_loss'])
                 pnl = active_trade['risk_usd'] * gain_r
@@ -158,7 +159,7 @@ def run_backtest_simulation(symbol, df_1h, df_4h, initial_balance, risk_pct, pro
         equity_curve.append(current_balance)
         equity_timestamps.append(candle['timestamp'])
 
-        # Skip trigger evaluation if a trade is currently open or on cooldown
+        # Skip trigger evaluation if a trade is open or on cooldown
         if active_trade is not None or (i - last_trigger_index) < cooldown_candles:
             continue
 
@@ -223,18 +224,32 @@ risk_pct = st.sidebar.number_input(
     max_value=5.0
 )
 
+st.sidebar.subheader("Regime Filters")
+min_adx = st.sidebar.slider(
+    "Min ADX (Trend Strength)", 
+    min_value=10, 
+    max_value=40, 
+    value=int(config.get("min_adx", 20)), 
+    step=1
+)
+min_atr_pct = st.sidebar.number_input(
+    "Min ATR % (Volatility)", 
+    value=float(config.get("min_atr_pct", 0.5)), 
+    step=0.1
+)
+
 st.sidebar.header("🎯 Trigger Rules")
 proximity_threshold = st.sidebar.slider(
     "Proximity Threshold (%)", 
     min_value=0.1, 
     max_value=3.0, 
-    value=float(config.get("proximity_threshold_pct", 1.50)),
+    value=float(config.get("proximity_threshold_pct", 1.0)),
     step=0.05
 )
 
 cooldown_hours = st.sidebar.number_input(
     "Alert Cooldown (Hours)", 
-    value=int(config.get("alert_cooldown_hours", 2)), 
+    value=int(config.get("alert_cooldown_hours", 4)), 
     step=1,
     min_value=1
 )
@@ -281,6 +296,8 @@ st.sidebar.markdown("---")
 if st.sidebar.button("💾 Save Settings to Agent", type="primary", use_container_width=True):
     config["account_balance"] = account_balance
     config["risk_pct"] = risk_pct
+    config["min_adx"] = float(min_adx)
+    config["min_atr_pct"] = float(min_atr_pct)
     config["proximity_threshold_pct"] = proximity_threshold
     config["alert_cooldown_hours"] = cooldown_hours
     config["scan_interval_minutes"] = scan_interval
@@ -390,7 +407,7 @@ with tab3:
     with col_bt2:
         candle_limit = st.select_slider("Candle History Size (Hours)", options=[500, 1000, 2000], value=1000)
     with col_bt3:
-        sl_pct_param = st.number_input("Stop Loss Distance (%)", value=3.5, step=0.5, min_value=1.0)
+        sl_pct_param = st.number_input("Stop Loss Distance (%)", value=2.5, step=0.5, min_value=1.0)
     with col_bt4:
         tp_mult_param = st.number_input("Target 1 Risk Multiplier (R)", value=1.5, step=0.5, min_value=1.0)
 
