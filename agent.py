@@ -40,6 +40,14 @@ DEFAULT_CONFIG = {
 # Cooldown memory store: { "SYMBOL": datetime_of_last_alert }
 alert_cooldowns = {}
 
+# Instantiate exchange globally to avoid geo-blocking and prevent connection churn
+exchange = ccxt.mexc({
+    'enableRateLimit': True,
+    'options': {
+        'defaultType': 'spot'
+    }
+})
+
 # =====================================================================
 # CONFIGURATION & UTILS
 # =====================================================================
@@ -101,8 +109,6 @@ def log_trade_to_journal(journal_file: str, trade_data: dict):
 # MARKET DATA & INDICATORS
 # =====================================================================
 def fetch_ohlcv(symbol: str, timeframe: str = "1h", limit: int = 300) -> pd.DataFrame:
-    """Fetches historical candle data from Binance public endpoints via CCXT."""
-    exchange = ccxt.binance({"enableRateLimit": True})
     try:
         ohlcv = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
         df = pd.DataFrame(ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"])
