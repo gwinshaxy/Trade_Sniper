@@ -8,6 +8,7 @@ import pandas_ta as ta
 import streamlit as st
 import streamlit.components.v1 as components
 
+# Suppress minor library warnings for clean UI log outputs
 warnings.filterwarnings("ignore", category=UserWarning)
 
 # =====================================================================
@@ -59,7 +60,7 @@ def save_config(config_data: dict):
     try:
         with open(CONFIG_FILE, "w") as f:
             json.dump(config_data, f, indent=4)
-        st.sidebar.success("Configuration updated successfully!")
+        st.sidebar.success("Configuration saved!")
     except Exception as e:
         st.sidebar.error(f"Failed to save configuration: {e}")
 
@@ -83,44 +84,59 @@ def load_journal() -> pd.DataFrame:
     return pd.DataFrame()
 
 # =====================================================================
-# PAGINATED DATA FETCH & BACKTESTING ENGINE
+# DATA FETCHING & TECHNICAL ENGINE
 # =====================================================================
-def fetch_backtest_data(symbol, timeframe='1h', limit=1000):
+def sanitize_symbol(raw_symbol: str) -> str:
+    """Formats ticker strings so CCXT can recognize them properly."""
+    clean = raw_symbol.strip().upper()
+    if "/" not in clean and clean.endswith("USDT"):
+        clean = clean[:-4] + "/USDT"
+    return clean
+
+def fetch_backtest_data(symbol: str, timeframe='1h', limit=1000):
+    """
+    Fetches historical candles from MEXC with explicit market loading and typing.
+    """
     try:
-        exchange = ccxt.mexc({'enableRateLimit': True, 'timeout': 20000})
+        formatted_symbol = sanitize_symbol(symbol)
+        exchange = ccxt.mexc({
+            'enableRateLimit': True, 
+            'timeout': 20000,
+            'options': {'defaultType': 'spot'}
+        })
         
-        # Paginated fetch to bypass MEXC 1000-candle hard limit
-        all_ohlcv = []
+        # Load exchange market definitions explicitly
+        exchange.load_markets()
+        
+        if formatted_symbol not in exchange.markets:
+            # Fallback check if ticker exists in alternative formatting
+            alt_symbol = formatted_symbol.replace("/", "")
+            if alt_symbol in exchange.markets:
+                formatted_symbol = alt_symbol
+            else:
+                st.error(f"Symbol '{symbol}' not found on MEXC Spot markets.")
+                return None
+
+        # Fetch up to max allowable candle limit
         fetch_limit = min(limit, 1000)
-        since = None
+        ohlcv = exchange.fetch_ohlcv(formatted_symbol, timeframe=timeframe, limit=fetch_limit)
         
-        # Determine starting timestamp if limit > 1000
-        if limit > 1000:
-            now_ms = exchange.milliseconds()
-            tf_ms = 3600 * 1000  # 1h in ms
-            since = now_ms - (limit * tf_ms)
+        if not ohlcv or len(ohlcv) == 0:
+            st.error(f"MEXC returned 0 candles for {formatted_symbol}.")
+            return None
 
-        while len(all_ohlcv) < limit:
-            ohlcv = exchange.fetch_ohlcv(symbol, timeframe=timeframe, since=since, limit=fetch_limit)
-            if not ohlcv:
-                break
-            all_ohlcv.extend(ohlcv)
-            since = ohlcv[-1][0] + 1
-            if len(ohlcv) < fetch_limit:
-                break
-            time.sleep(0.1)
-
-        df = pd.DataFrame(all_ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+        # Structure DataFrame
+        df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
         df.drop_duplicates(subset=['timestamp'], inplace=True)
         df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
         df.sort_values('timestamp', inplace=True)
         df.reset_index(drop=True, inplace=True)
 
-        # Force numerical types
+        # Cast prices strictly to float to ensure pandas_ta runs smoothly
         for col in ['open', 'high', 'low', 'close', 'volume']:
-            df[col] = pd.to_numeric(df[col], errors='coerce')
+            df[col] = pd.to_numeric(df[col], errors='coerce').astype('float64')
 
-        # Compute Technical Indicators
+        # Calculate Technical Indicators
         df['tema_200'] = ta.tema(df['close'], length=200)
         df['atr'] = ta.atr(df['high'], df['low'], df['close'], length=14)
         
@@ -132,20 +148,22 @@ def fetch_backtest_data(symbol, timeframe='1h', limit=1000):
             df['adx'] = 25.0
             
         return df
+
     except Exception as e:
-        st.error(f"Failed to fetch market data for {symbol}: {e}")
+        st.error(f"API Error fetching {symbol}: {str(e)}")
         return None
 
 def run_backtest_simulation(symbol, df, risk_pct=1.0, initial_capital=1000.0, proximity_pct=1.5, min_adx=18.0, min_atr_pct=0.4, use_filters=True):
     if df is None or df.empty or 'tema_200' not in df.columns:
-        return None, None, {}
+        return None, None, {"error": "DataFrame is uninitialized or missing TEMA."}
 
+    # Drop early indicator warmup rows
     clean_df = df.dropna(subset=['tema_200', 'atr']).copy().reset_index(drop=True)
     if clean_df.empty:
-        return None, None, {"error": "All rows dropped during TEMA 200 warmup."}
+        return None, None, {"error": "All rows were dropped during TEMA 200 warmup window."}
 
     trades = []
-    capital = initial_capital
+    capital = float(initial_capital)
     in_trade = False
     entry_price = 0.0
     stop_loss = 0.0
@@ -166,10 +184,10 @@ def run_backtest_simulation(symbol, df, risk_pct=1.0, initial_capital=1000.0, pr
         atr_p = float(current_row['atr'])
         adx_p = float(current_row.get('adx', 25.0)) if not pd.isna(current_row.get('adx')) else 25.0
 
-        if pd.isna(tema_p) or pd.isna(atr_p):
+        if pd.isna(tema_p) or pd.isna(atr_p) or tema_p == 0:
             continue
 
-        # Proximity Checks
+        # Structural Proximity Calculations
         dist_close_pct = abs(close_p - tema_p) / tema_p * 100.0
         dist_low_pct = abs(low_p - tema_p) / tema_p * 100.0
         dist_high_pct = abs(high_p - tema_p) / tema_p * 100.0
@@ -181,7 +199,7 @@ def run_backtest_simulation(symbol, df, risk_pct=1.0, initial_capital=1000.0, pr
         atr_pct_values.append(atr_pct)
 
         if in_trade:
-            # Stop Loss Check
+            # Check Stop Loss Trigger
             if low_p <= stop_loss:
                 pnl = -risk_usd
                 capital += pnl
@@ -196,9 +214,10 @@ def run_backtest_simulation(symbol, df, risk_pct=1.0, initial_capital=1000.0, pr
                     "Capital ($)": round(capital, 2)
                 })
                 in_trade = False
-            # Take Profit 2 Check
+
+            # Check Take Profit 2 Trigger
             elif high_p >= tp2:
-                pnl = risk_usd * 2.0
+                pnl = risk_usd * 2.0  # 1:2 Risk/Reward target
                 capital += pnl
                 trades.append({
                     "Timestamp": current_row['timestamp'],
@@ -217,6 +236,7 @@ def run_backtest_simulation(symbol, df, risk_pct=1.0, initial_capital=1000.0, pr
                 if adx_p < min_adx or atr_pct < min_atr_pct:
                     filters_passed = False
 
+            # Check Entry Condition
             if min_dist <= proximity_pct and filters_passed:
                 in_trade = True
                 entry_price = close_p
@@ -225,11 +245,11 @@ def run_backtest_simulation(symbol, df, risk_pct=1.0, initial_capital=1000.0, pr
                 tp2 = entry_price + (3.0 * atr_p)
                 risk_usd = capital * (risk_pct / 100.0)
 
-    # Force close open position at the final candle
+    # Automatically force-close any position remaining active on the last candle
     if in_trade and len(clean_df) > 0:
         last_row = clean_df.iloc[-1]
         exit_p = float(last_row['close'])
-        pnl = ((exit_p - entry_price) / entry_price) * risk_usd
+        pnl = ((exit_p - entry_price) / entry_price) * risk_usd if entry_price > 0 else 0.0
         capital += pnl
         trades.append({
             "Timestamp": last_row['timestamp'],
@@ -253,7 +273,7 @@ def run_backtest_simulation(symbol, df, risk_pct=1.0, initial_capital=1000.0, pr
     return trades_df, capital, diagnostics
 
 # =====================================================================
-# MAIN DASHBOARD LAYOUT
+# DASHBOARD LAYOUT
 # =====================================================================
 st.title("🎯 Trade Sniper Dashboard & Controls")
 
@@ -275,19 +295,20 @@ st.sidebar.subheader("📌 Watchlist Manager")
 custom_symbol_input = st.sidebar.text_input("Add Single Symbol (e.g., SOL/USDT)", "").strip().upper()
 if st.sidebar.button("➕ Add to Watchlist", use_container_width=True):
     if custom_symbol_input:
+        formatted = sanitize_symbol(custom_symbol_input)
         current_list = config.get("watchlist", [])
-        if custom_symbol_input not in current_list:
-            current_list.append(custom_symbol_input)
+        if formatted not in current_list:
+            current_list.append(formatted)
             config["watchlist"] = current_list
             save_config(config)
             st.rerun()
         else:
-            st.sidebar.warning(f"{custom_symbol_input} is already in your watchlist.")
+            st.sidebar.warning(f"{formatted} is already in your watchlist.")
 
 watchlist_str = st.sidebar.text_area("Active Watchlist (Comma Separated)", value=", ".join(config.get("watchlist", [])))
 
 if st.sidebar.button("💾 Save All Settings", use_container_width=True):
-    updated_watchlist = [symbol.strip().upper() for symbol in watchlist_str.split(",") if symbol.strip()]
+    updated_watchlist = [sanitize_symbol(symbol) for symbol in watchlist_str.split(",") if symbol.strip()]
     updated_config = {
         "account_balance": account_balance,
         "risk_pct": risk_pct,
@@ -302,7 +323,7 @@ if st.sidebar.button("💾 Save All Settings", use_container_width=True):
     save_config(updated_config)
 
 # =====================================================================
-# TABS SYSTEM
+# MAIN DASHBOARD TABS
 # =====================================================================
 tab1, tab2, tab3, tab4 = st.tabs([
     "📊 Live Journal & Evaluator", 
@@ -333,7 +354,7 @@ with tab1:
         display_df = journal_df.fillna("—").sort_index(ascending=False)
         st.dataframe(display_df, use_container_width=True)
     else:
-        st.info("No trades logged in `trade_journal.csv` yet. Waiting for structural proximity signals.")
+        st.info("No trades logged in `trade_journal.csv` yet. Signals will display here as they trigger.")
 
 # --- TAB 2: CHARTING ---
 with tab2:
@@ -395,7 +416,7 @@ with tab4:
     else:
         bt_symbol = selected_preset
 
-    bt_candles = b_col2.slider("Candle Lookback (1H)", min_value=200, max_value=2000, value=2000, step=100)
+    bt_candles = b_col2.slider("Candle Lookback (1H)", min_value=200, max_value=1000, value=1000, step=100)
     bt_capital = b_col3.number_input("Starting Capital ($)", value=1000.0, step=100.0)
 
     use_regime_filters = st.checkbox("Enforce ADX & ATR Filters in Backtest", value=False, help="Uncheck to test pure structural proximity without indicator restrictions.")
@@ -403,6 +424,7 @@ with tab4:
     if st.button("🚀 Run Strategy Simulation", use_container_width=True):
         with st.spinner(f"Fetching historical data and backtesting {bt_symbol}..."):
             df_bt = fetch_backtest_data(bt_symbol, timeframe='1h', limit=bt_candles)
+            
             if df_bt is not None and not df_bt.empty:
                 results_df, final_cap, diag = run_backtest_simulation(
                     symbol=bt_symbol, 
