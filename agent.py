@@ -37,10 +37,10 @@ DEFAULT_CONFIG = {
     ]
 }
 
-# Cooldown memory store: { "SYMBOL": datetime_of_last_alert }
+# Memory store for alert cooldowns: { "SYMBOL": datetime_of_last_alert }
 alert_cooldowns = {}
 
-# Instantiate exchange globally to avoid geo-blocking and prevent connection churn
+# Global exchange instance (MEXC) to avoid geo-blocking and connection overhead
 exchange = ccxt.mexc({
     'enableRateLimit': True,
     'options': {
@@ -52,7 +52,7 @@ exchange = ccxt.mexc({
 # CONFIGURATION & UTILS
 # =====================================================================
 def load_config() -> dict:
-    """Loads configuration from config.json or returns default if not found."""
+    """Loads configuration from config.json or returns default settings if missing/invalid."""
     if os.path.exists(CONFIG_FILE):
         try:
             with open(CONFIG_FILE, "r") as f:
@@ -67,7 +67,7 @@ def load_config() -> dict:
         return DEFAULT_CONFIG
 
 def send_telegram_alert(message: str) -> bool:
-    """Sends a formatted notification to Telegram using environment variables."""
+    """Sends a formatted alert notification to Telegram."""
     bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
     chat_id = os.getenv("TELEGRAM_CHAT_ID")
 
@@ -95,7 +95,7 @@ def send_telegram_alert(message: str) -> bool:
         return False
 
 def log_trade_to_journal(journal_file: str, trade_data: dict):
-    """Appends validated trade alert details into a local CSV journal."""
+    """Appends validated trade alert details into a local CSV journal file."""
     file_exists = os.path.isfile(journal_file)
     df_new = pd.DataFrame([trade_data])
     
@@ -109,8 +109,13 @@ def log_trade_to_journal(journal_file: str, trade_data: dict):
 # MARKET DATA & INDICATORS
 # =====================================================================
 def fetch_ohlcv(symbol: str, timeframe: str = "1h", limit: int = 300) -> pd.DataFrame:
+    """Fetches candle history from the exchange."""
     try:
         ohlcv = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+        if not ohlcv or len(ohlcv) == 0:
+            logging.warning(f"[{symbol}] Exchange returned empty OHLCV payload.")
+            return pd.DataFrame()
+
         df = pd.DataFrame(ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"])
         df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
         return df
@@ -119,21 +124,26 @@ def fetch_ohlcv(symbol: str, timeframe: str = "1h", limit: int = 300) -> pd.Data
         return pd.DataFrame()
 
 def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    """Calculates 200 TEMA along with ADX (Trend Filter) and ATR % (Volatility Filter)."""
+    """Calculates 200 TEMA, 14 ADX (Trend Filter), and 14 ATR % (Volatility Filter)."""
     if df.empty or len(df) < 200:
-        return df
+        return pd.DataFrame()
 
-    # 1. Standard 200 TEMA calculation
+    # 1. 200-period TEMA
     df["TEMA_200"] = ta.tema(df["close"], length=200)
 
-    # 2. Volatility Filter: 14-period ATR relative to current price (%)
+    # 2. Volatility Filter: 14-period ATR relative to current close (%)
     df["ATR_14"] = ta.atr(df["high"], df["low"], df["close"], length=14)
     df["ATR_PCT"] = (df["ATR_14"] / df["close"]) * 100.0
 
     # 3. Trend Filter: 14-period ADX
     adx_df = ta.adx(df["high"], df["low"], df["close"], length=14)
-    if adx_df is not None and not adx_df.empty and "ADX_14" in adx_df.columns:
-        df["ADX_14"] = adx_df["ADX_14"]
+    if adx_df is not None and not adx_df.empty:
+        # Locate the ADX column regardless of specific naming variations
+        adx_cols = [c for c in adx_df.columns if c.startswith("ADX_")]
+        if adx_cols:
+            df["ADX_14"] = adx_df[adx_cols[0]]
+        else:
+            df["ADX_14"] = 0.0
     else:
         df["ADX_14"] = 0.0
 
@@ -145,17 +155,26 @@ def check_trade_signal(
     min_adx: float = 20.0, 
     min_atr_pct: float = 0.5
 ) -> dict:
-    """Evaluates proximity to 200 TEMA alongside Trend (ADX) and Volatility (ATR %) filters."""
+    """Evaluates proximity to 200 TEMA alongside Trend (ADX) and Volatility (ATR %) filters safely."""
     if df.empty or "TEMA_200" not in df.columns:
-        return {"valid": False, "rejected_reason": "Insufficient Indicator Data"}
+        return {"valid": False, "rejected_reason": "Insufficient OHLCV candle depth (< 200)"}
 
+    # Grab latest completed row
     latest = df.iloc[-1]
+
+    # Guard against NaN/None values before executing float casting
+    if pd.isna(latest.get("TEMA_200")) or pd.isna(latest.get("close")):
+        return {"valid": False, "rejected_reason": "TEMA_200 or Close price contains NaN/None"}
+
     close_price = float(latest["close"])
     tema_val = float(latest["TEMA_200"])
 
-    # Safely parse numeric values even if initial candles yield NaN
-    adx_val = float(latest.get("ADX_14", 0.0)) if pd.notna(latest.get("ADX_14")) else 0.0
-    atr_pct_val = float(latest.get("ATR_PCT", 0.0)) if pd.notna(latest.get("ATR_PCT")) else 0.0
+    # Safely parse numeric values for ADX and ATR
+    adx_raw = latest.get("ADX_14", 0.0)
+    adx_val = float(adx_raw) if pd.notna(adx_raw) and adx_raw is not None else 0.0
+
+    atr_raw = latest.get("ATR_PCT", 0.0)
+    atr_pct_val = float(atr_raw) if pd.notna(atr_raw) and atr_raw is not None else 0.0
 
     # Distance to 200 TEMA (%)
     distance_pct = abs(close_price - tema_val) / tema_val * 100.0
@@ -165,12 +184,11 @@ def check_trade_signal(
     is_trending = adx_val >= min_adx
     has_volatility = atr_pct_val >= min_atr_pct
 
-    # Valid signal ONLY if all 3 parameters pass
     valid_signal = is_in_proximity and is_trending and has_volatility
 
     rejected_reason = None
     if not is_in_proximity:
-        rejected_reason = "Out of Proximity"
+        rejected_reason = f"Out of Proximity ({distance_pct:.2f}% vs {proximity_threshold}%)"
     elif not is_trending:
         rejected_reason = f"Choppy Market (ADX: {adx_val:.1f} < {min_adx})"
     elif not has_volatility:
@@ -212,7 +230,7 @@ def run_scan_cycle():
             time_since_last = now_utc - alert_cooldowns[symbol]
             if time_since_last < timedelta(hours=cooldown_hours):
                 remaining_mins = int((timedelta(hours=cooldown_hours) - time_since_last).total_seconds() / 60)
-                logging.info(f"[{symbol}] In cooldown mode. ({remaining_mins} mins remaining)")
+                logging.info(f"[{symbol}] In cooldown mode ({remaining_mins} mins remaining). Skipped.")
                 continue
 
         # Fetch Data & Add Indicators
@@ -235,7 +253,7 @@ def run_scan_cycle():
             risk_amount = account_balance * (risk_pct / 100.0)
             sl_distance_price = close_price * (stop_loss_pct / 100.0)
             
-            # Determine Long or Short structure based on TEMA
+            # Determine Long or Short structure relative to 200 TEMA
             direction = "LONG" if close_price >= tema_val else "SHORT"
             sl_price = close_price - sl_distance_price if direction == "LONG" else close_price + sl_distance_price
             position_units = risk_amount / sl_distance_price if sl_distance_price > 0 else 0
@@ -290,15 +308,15 @@ def main():
             
             run_scan_cycle()
             
-            logging.info(f"Sleeping for {interval_mins} minutes until next scan...")
+            logging.info(f"Scan complete. Sleeping for {interval_mins} minutes...")
             time.sleep(interval_mins * 60)
             
         except KeyboardInterrupt:
             logging.info("Agent stopped manually.")
             break
         except Exception as e:
-            logging.error(f"Unexpected error in main loop: {e}")
-            time.sleep(60) # Short delay before restarting loop on error
+            logging.error(f"Unexpected error in main loop: {e}", exc_info=True)
+            time.sleep(60) # Pause briefly before attempting next cycle
 
 if __name__ == "__main__":
     main()
