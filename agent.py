@@ -13,9 +13,6 @@ from telegram import Bot
 
 load_dotenv()
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-
 CONFIG_FILE = "config.json"
 last_alert_time = {}
 
@@ -161,7 +158,7 @@ def safe_format(value):
         return "N/A"
     return f"${value:.4f}"
 
-async def analyze_symbol(symbol, bot, config):
+async def analyze_symbol(symbol, bot, chat_id, config):
     current_time = time.time()
     
     account_balance = config.get("account_balance", 1000.0)
@@ -232,42 +229,50 @@ async def analyze_symbol(symbol, bot, config):
 
     last_alert_time[symbol] = current_time
 
-    reasons_text = "\n".join([f"• `{r}`" for r in triggered_reasons])
+    reasons_text = "\n".join([f"• {r}" for r in triggered_reasons])
     message = (
-        f"🎯 **PROXIMITY ALERT: {symbol}** 🎯\n\n"
-        f"**Trigger Conditions Met:**\n{reasons_text}\n\n"
-        f"**Current Price:** `${current_price:.4f}`\n\n"
-        f"📈 **Technical Confluence:**\n"
-        f"• 1H 200 TEMA: `{safe_format(val_1h)}`\n"
-        f"• 4H 200 TEMA: `{safe_format(val_4h)}`\n"
-        f"• Point of Control (POC): `${poc_price:.4f}`\n\n"
-        f"🎯 **Trade Parameters ({risk_pct}% Risk Model):**\n"
-        f"• **Entry Zone:** `${entry_price:.4f}`\n"
-        f"• **Stop Loss:** `${stop_loss:.4f}` (Risk: ${risk_usd:.2f})\n"
-        f"• **Target 1 (HVN):** `${tp1:.4f}`\n"
-        f"• **Target 2 (Macro):** `${tp2:.4f}`\n\n"
-        f"💰 **Position Sizing:**\n"
-        f"• Position Value: `{position_usdt:.2f} USDT` ({units:.2f} units)\n"
-        f"• Risk/Reward Ratio: `{abs(tp1 - entry_price) / abs(entry_price - stop_loss):.2f}R`\n\n"
-        f"📁 *Signal logged to {journal_file}*"
+        f"🎯 PROXIMITY ALERT: {symbol} 🎯\n\n"
+        f"Trigger Conditions Met:\n{reasons_text}\n\n"
+        f"Current Price: ${current_price:.4f}\n\n"
+        f"📈 Technical Confluence:\n"
+        f"• 1H 200 TEMA: {safe_format(val_1h)}\n"
+        f"• 4H 200 TEMA: {safe_format(val_4h)}\n"
+        f"• Point of Control (POC): ${poc_price:.4f}\n\n"
+        f"🎯 Trade Parameters ({risk_pct}% Risk Model):\n"
+        f"• Entry Zone: ${entry_price:.4f}\n"
+        f"• Stop Loss: ${stop_loss:.4f} (Risk: ${risk_usd:.2f})\n"
+        f"• Target 1 (HVN): ${tp1:.4f}\n"
+        f"• Target 2 (Macro): ${tp2:.4f}\n\n"
+        f"💰 Position Sizing:\n"
+        f"• Position Value: {position_usdt:.2f} USDT ({units:.2f} units)\n"
+        f"• Risk/Reward Ratio: {abs(tp1 - entry_price) / abs(entry_price - stop_loss):.2f}R\n\n"
+        f"📁 Signal logged to {journal_file}"
     )
     
-    await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message, parse_mode="Markdown")
+    await bot.send_message(chat_id=chat_id, text=message)
 
 async def run_scanner():
-    bot = Bot(token=TELEGRAM_BOT_TOKEN)
-    
     config = load_config()
     init_journal_file(config.get("journal_file", "trade_journal.csv"))
+
+    # Safely load Telegram credentials from Env or Config
+    telegram_bot_token = os.getenv("TELEGRAM_BOT_TOKEN") or config.get("telegram_bot_token")
+    telegram_chat_id = os.getenv("TELEGRAM_CHAT_ID") or config.get("telegram_chat_id")
+
+    if not telegram_bot_token or not telegram_chat_id:
+        print("❌ Error: TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID is missing!")
+        return
+
+    bot = Bot(token=telegram_bot_token)
     
     startup_msg = (
-        "🔍 **Filtered Watchlist Scanner & Journal Active**\n\n"
-        f"• Assets Monitored: `{', '.join(config['watchlist'])}`\n"
-        f"• Proximity Threshold: `Within {config['proximity_threshold_pct']}% of key levels`\n"
-        f"• Alert Cooldown: `{config['alert_cooldown_hours']} Hours`\n"
-        f"• Trade Logging: Enabled (`{config.get('journal_file', 'trade_journal.csv')}`)"
+        "🔍 Filtered Watchlist Scanner & Journal Active\n\n"
+        f"• Assets Monitored: {', '.join(config['watchlist'])}\n"
+        f"• Proximity Threshold: Within {config['proximity_threshold_pct']}% of key levels\n"
+        f"• Alert Cooldown: {config['alert_cooldown_hours']} Hours\n"
+        f"• Trade Logging: Enabled ({config.get('journal_file', 'trade_journal.csv')})"
     )
-    await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=startup_msg, parse_mode="Markdown")
+    await bot.send_message(chat_id=telegram_chat_id, text=startup_msg)
     
     while True:
         current_config = load_config()
@@ -277,7 +282,7 @@ async def run_scanner():
         print(f"\n--- Starting Scan Cycle ({len(watchlist)} assets) ---")
         for symbol in watchlist:
             try:
-                await analyze_symbol(symbol, bot, current_config)
+                await analyze_symbol(symbol, bot, telegram_chat_id, current_config)
                 await asyncio.sleep(2)
             except Exception as e:
                 print(f"Error scanning {symbol}: {e}")
