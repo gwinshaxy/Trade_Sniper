@@ -1,312 +1,395 @@
 import os
+import csv
 import time
 import json
-import logging
-from datetime import datetime, timedelta, timezone
-import requests
+import asyncio
+import ccxt
 import pandas as pd
 import pandas_ta as ta
 import numpy as np
-import ccxt
+from datetime import datetime
+from dotenv import load_dotenv
+from telegram import Bot
 
-# =====================================================================
-# LOGGING CONFIGURATION
-# =====================================================================
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[logging.StreamHandler()]
-)
+load_dotenv()
 
 CONFIG_FILE = "config.json"
-DEFAULT_CONFIG = {
-    "account_balance": 1000.0,
-    "risk_pct": 1.0,
-    "proximity_threshold_pct": 1.5,
-    "min_adx": 18.0,
-    "min_atr_pct": 0.4,
-    "scan_interval_minutes": 15,
-    "alert_cooldown_hours": 4,
-    "journal_file": "trade_journal.csv",
-    "watchlist": ["ONDO/USDT", "PENDLE/USDT", "LINK/USDT", "TIA/USDT", "NEAR/USDT"]
-}
+last_alert_time = {}
 
-alert_cooldowns = {}
-exchange = ccxt.mexc({'enableRateLimit': True, 'options': {'defaultType': 'spot'}})
+def load_config():
+    if not os.path.exists(CONFIG_FILE):
+        default_config = {
+            "account_balance": 1000.0,
+            "risk_pct": 1.0,
+            "proximity_threshold_pct": 1.5,
+            "min_adx": 18.0,
+            "min_atr_pct": 0.4,
+            "scan_interval_minutes": 15,
+            "alert_cooldown_hours": 4,
+            "journal_file": "trade_journal.csv",
+            "watchlist": [
+                "ONDO/USDT",
+                "PENDLE/USDT",
+                "LINK/USDT",
+                "TIA/USDT",
+                "NEAR/USDT"
+            ]
+        }
+        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(default_config, f, indent=4)
+        return default_config
 
-# =====================================================================
-# HELPER & UTILITY FUNCTIONS
-# =====================================================================
-def load_config() -> dict:
-    if os.path.exists(CONFIG_FILE):
-        try:
-            with open(CONFIG_FILE, "r") as f:
-                config = json.load(f)
-                return {**DEFAULT_CONFIG, **config}
-        except Exception:
-            return DEFAULT_CONFIG
-    return DEFAULT_CONFIG
+    with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+        return json.load(f)
 
-def send_telegram_alert(message: str) -> bool:
-    bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
-    chat_id = os.getenv("TELEGRAM_CHAT_ID")
-    if not bot_token or not chat_id:
-        return False
-    
-    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+def get_exchange():
     try:
-        res = requests.post(url, json={"chat_id": chat_id, "text": message, "parse_mode": "Markdown"}, timeout=10)
-        return res.status_code == 200
+        print("Connecting to MEXC...")
+        exchange = ccxt.mexc({'enableRateLimit': True, 'timeout': 20000})
+        exchange.load_markets()
+        print("Connected to MEXC successfully.")
+        return exchange
     except Exception as e:
-        logging.error(f"Telegram error: {e}")
-        return False
+        print(f"MEXC failed ({e}), falling back to Gate.io...")
+        exchange = ccxt.gateio({'enableRateLimit': True, 'timeout': 20000})
+        return exchange
 
-def fetch_paginated_ohlcv(symbol: str, timeframe: str = "1h", total_candles: int = 1000) -> pd.DataFrame:
-    """Fetches enough historical data via pagination to warm up TEMA 200 and Volume Profile."""
-    try:
-        all_ohlcv = []
-        limit_per_call = 500
-        
-        # Calculate start time
-        tf_ms = exchange.parse_timeframe(timeframe) * 1000
-        since = exchange.milliseconds() - (total_candles * tf_ms)
-        
-        while len(all_ohlcv) < total_candles:
-            fetch_limit = min(limit_per_call, total_candles - len(all_ohlcv))
-            ohlcv = exchange.fetch_ohlcv(symbol, timeframe=timeframe, since=since, limit=fetch_limit)
-            if not ohlcv:
-                break
-            all_ohlcv.extend(ohlcv)
-            since = ohlcv[-1][0] + 1
-            time.sleep(0.1) # Rate limit protection
+exchange = get_exchange()
 
-        if not all_ohlcv:
-            return pd.DataFrame()
-
-        df = pd.DataFrame(all_ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"])
-        df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
-        df.drop_duplicates(subset=["timestamp"], inplace=True)
-        df.sort_values("timestamp", inplace=True)
-        return df.reset_index(drop=True)
-    except Exception as e:
-        logging.error(f"[{symbol}] Failed fetching {timeframe} candles: {e}")
-        return pd.DataFrame()
-
-def calculate_volume_profile(df: pd.DataFrame, bins: int = 30):
-    """Calculates Point of Control (POC) and High Volume Nodes (HVN)."""
-    if df.empty or len(df) < 50:
-        return None, None, None
-
-    price_min = df["low"].min()
-    price_max = df["high"].max()
-    counts, bin_edges = np.histogram(df["close"], bins=bins, weights=df["volume"], range=(price_min, price_max))
+def init_journal_file(journal_file="trade_journal.csv"):
+    headers = [
+        "Timestamp", "Symbol", "Trigger_Reason", "Entry_Price", 
+        "Stop_Loss", "Take_Profit_1", "Take_Profit_2", "Position_USDT", 
+        "Max_Risk_USD", "Status", "Exit_Price", "Closed_Timestamp", 
+        "Realized_PnL_USD", "Realized_R"
+    ]
     
-    poc_idx = np.argmax(counts)
-    poc_price = (bin_edges[poc_idx] + bin_edges[poc_idx + 1]) / 2.0
-    
-    # Sort bins by volume to find HVNs
-    sorted_indices = np.argsort(counts)[::-1]
-    hvn_prices = [(bin_edges[i] + bin_edges[i + 1]) / 2.0 for i in sorted_indices[:3]]
-    
-    return poc_price, hvn_prices, counts
-
-# =====================================================================
-# TECHNICAL ANALYSIS ENGINE
-# =====================================================================
-def process_market_data(symbol: str):
-    # Fetch 1H & 4H Data with sufficient warmup depth
-    df_1h = fetch_paginated_ohlcv(symbol, timeframe="1h", total_candles=1000)
-    df_4h = fetch_paginated_ohlcv(symbol, timeframe="4h", total_candles=600)
-
-    if df_1h.empty or len(df_1h) < 400 or df_4h.empty or len(df_4h) < 250:
-        return None
-
-    # Calculate 1H Indicators
-    df_1h["TEMA_200"] = ta.tema(df_1h["close"], length=200)
-    df_1h["ATR_14"] = ta.atr(df_1h["high"], df_1h["low"], df_1h["close"], length=14)
-    df_1h["ATR_PCT"] = (df_1h["ATR_14"] / df_1h["close"]) * 100.0
-    
-    adx_df = ta.adx(df_1h["high"], df_1h["low"], df_1h["close"], length=14)
-    df_1h["ADX_14"] = adx_df[[c for c in adx_df.columns if c.startswith("ADX_")][0]] if adx_df is not None else 0.0
-
-    # Calculate 4H TEMA 200
-    df_4h["TEMA_200_4H"] = ta.tema(df_4h["close"], length=200)
-
-    latest_1h = df_1h.iloc[-1]
-    latest_4h = df_4h.iloc[-1]
-
-    # Validate Non-NaN
-    if pd.isna(latest_1h["TEMA_200"]) or pd.isna(latest_4h["TEMA_200_4H"]):
-        return None
-
-    # Compute Volume Profile on 1H lookback
-    poc_price, hvn_prices, _ = calculate_volume_profile(df_1h.tail(300))
-
-    return {
-        "df_1h": df_1h,
-        "close": float(latest_1h["close"]),
-        "tema_1h": float(latest_1h["TEMA_200"]),
-        "tema_4h": float(latest_4h["TEMA_200_4H"]),
-        "atr_14": float(latest_1h["ATR_14"]),
-        "atr_pct": float(latest_1h["ATR_PCT"]),
-        "adx_14": float(latest_1h["ADX_14"]),
-        "poc": poc_price,
-        "hvns": hvn_prices
-    }
-
-def evaluate_signal(symbol: str, data: dict, config: dict):
-    close = data["close"]
-    tema_1h = data["tema_1h"]
-    tema_4h = data["tema_4h"]
-    poc = data["poc"]
-    hvns = data["hvns"]
-    
-    dist_1h = abs(close - tema_1h) / tema_1h * 100.0
-    dist_4h = abs(close - tema_4h) / tema_4h * 100.0
-    
-    is_near_1h = dist_1h <= config["proximity_threshold_pct"]
-    is_near_4h = dist_4h <= config["proximity_threshold_pct"]
-    
-    if not (is_near_1h or is_near_4h):
-        return {"valid": False, "reason": f"Out of proximity (1H: {dist_1h:.2f}%, 4H: {dist_4h:.2f}%)"}
-
-    if data["adx_14"] < config["min_adx"]:
-        return {"valid": False, "reason": f"Choppy Market (ADX: {data['adx_14']:.1f} < {config['min_adx']})"}
-
-    # Determine Direction based on TEMA baseline
-    direction = "LONG" if close >= tema_1h else "SHORT"
-
-    # Volume Profile Structural Stop Loss & Targets
-    if direction == "LONG":
-        # SL dynamic: 1.5x ATR below entry or lowest recent swing low
-        sl_price = close - max(1.5 * data["atr_14"], close * 0.015)
-        # Target 1: Nearest HVN above entry; Target 2: Macro POC or 2x R:R
-        t1_candidates = [h for h in hvns if h > close] if hvns else []
-        tp1 = min(t1_candidates) if t1_candidates else close + (close - sl_price) * 1.5
-        tp2 = poc if (poc and poc > tp1) else close + (close - sl_price) * 2.5
+    if not os.path.exists(journal_file):
+        with open(journal_file, mode='w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            writer.writerow(headers)
+        print(f"Initialized new trade journal at '{journal_file}'.")
     else:
-        sl_price = close + max(1.5 * data["atr_14"], close * 0.015)
-        t1_candidates = [h for h in hvns if h < close] if hvns else []
-        tp1 = max(t1_candidates) if t1_candidates else close - (sl_price - close) * 1.5
-        tp2 = poc if (poc and poc < tp1) else close - (sl_price - close) * 2.5
+        df = pd.read_csv(journal_file)
+        missing_cols = [col for col in headers if col not in df.columns]
+        if missing_cols:
+            for col in missing_cols:
+                df[col] = None
+            df.to_csv(journal_file, index=False)
+            print(f"Upgraded journal columns in '{journal_file}'.")
 
-    risk_per_unit = abs(close - sl_price)
-    reward_per_unit = abs(tp1 - close)
-    rr_ratio = reward_per_unit / risk_per_unit if risk_per_unit > 0 else 0.0
-
-    return {
-        "valid": True,
-        "direction": direction,
-        "close": close,
-        "dist_1h": dist_1h,
-        "tema_1h": tema_1h,
-        "tema_4h": tema_4h,
-        "poc": poc,
-        "sl_price": sl_price,
-        "tp1": tp1,
-        "tp2": tp2,
-        "rr_ratio": rr_ratio,
-        "adx": data["adx_14"],
-        "atr_pct": data["atr_pct"]
-    }
-
-# =====================================================================
-# JOURNALING & TELEGRAM ALERTS
-# =====================================================================
-def log_to_journal(journal_file: str, trade_data: dict):
-    """Logs clean structured trade entries matching dashboard UI columns."""
-    columns = ["Timestamp", "Symbol", "Trigger_Reason", "Entry_Price", "Stop_Loss", "Take_Profit_1", "Take_Profit_2", "Position_USDT", "Max_Risk_USD", "Status"]
+def log_trade_signal(journal_file, symbol, reasons, entry, sl, tp1, tp2, position_usdt, risk_usd):
+    timestamp_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    reasons_str = " | ".join(reasons)
     
-    file_exists = os.path.isfile(journal_file)
-    df_row = pd.DataFrame([trade_data])
+    with open(journal_file, mode='a', newline='', encoding='utf-8') as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            timestamp_str, symbol, reasons_str, f"{entry:.4f}",
+            f"{sl:.4f}", f"{tp1:.4f}", f"{tp2:.4f}", f"{position_usdt:.2f}",
+            f"{risk_usd:.2f}", "OPEN", "", "", "", ""
+        ])
+    print(f"💾 Trade signal logged to '{journal_file}' for {symbol}.")
+
+def calculate_native_tema(df, length=200):
+    ema1 = df['close'].ewm(span=length, adjust=False).mean()
+    ema2 = ema1.ewm(span=length, adjust=False).mean()
+    ema3 = ema2.ewm(span=length, adjust=False).mean()
+    return 3 * (ema1 - ema2) + ema3
+
+def fetch_market_data(symbol, timeframe='1h', limit=500):
+    try:
+        ohlcv = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+    except Exception as e:
+        print(f"Error fetching data for {symbol}: {e}")
+        return None
+
+    if not ohlcv or len(ohlcv) < 200:
+        print(f"Insufficient candle history for {symbol}.")
+        return None
+
+    df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
     
     try:
-        df_row.to_csv(journal_file, mode='a', header=not file_exists, index=False)
-        logging.info(f"Successfully logged structural trade to {journal_file}")
-    except Exception as e:
-        logging.error(f"Journal writing error: {e}")
+        df['tema_200'] = ta.tema(df['close'], length=200)
+        if df['tema_200'].dropna().empty:
+            df['tema_200'] = calculate_native_tema(df, length=200)
+    except Exception:
+        df['tema_200'] = calculate_native_tema(df, length=200)
+        
+    return df
 
-def run_scan_cycle():
-    config = load_config()
-    watchlist = config.get("watchlist", [])
+def calculate_volume_profile(df, num_bins=30):
+    price_min = df['low'].min()
+    price_max = df['high'].max()
+    
+    bins = np.linspace(price_min, price_max, num_bins)
+    df['bin'] = pd.cut(df['close'], bins=bins)
+    
+    volume_profile = df.groupby('bin', observed=False)['volume'].sum().reset_index()
+    volume_profile['price_mid'] = volume_profile['bin'].apply(lambda x: x.mid)
+    
+    poc_row = volume_profile.loc[volume_profile['volume'].idxmax()]
+    poc_price = poc_row['price_mid']
+    
+    hvn_nodes = volume_profile.sort_values(by='volume', ascending=False).head(3)
+    return poc_price, hvn_nodes['price_mid'].tolist()
+
+def calculate_fixed_risk_position(account_balance, entry_price, stop_loss_price, risk_pct=1.0):
+    risk_amount = account_balance * (risk_pct / 100.0)
+    price_risk_per_unit = abs(entry_price - stop_loss_price)
+    
+    if price_risk_per_unit == 0:
+        return 0, 0, 0
+    
+    units = risk_amount / price_risk_per_unit
+    position_size_usdt = units * entry_price
+    return units, position_size_usdt, risk_amount
+
+def safe_format(value):
+    if value is None or pd.isna(value):
+        return "N/A"
+    return f"${value:.4f}"
+
+# =====================================================================
+# ACTIVE TRADE EVALUATOR ENGINE
+# =====================================================================
+async def evaluate_active_trades(bot, chat_id, config):
     journal_file = config.get("journal_file", "trade_journal.csv")
-    cooldown_hours = config.get("alert_cooldown_hours", 4)
-    now_utc = datetime.now(timezone.utc)
+    if not os.path.exists(journal_file):
+        return
 
-    logging.info(f"--- Starting Structural Scan Cycle across {len(watchlist)} pairs ---")
+    try:
+        df = pd.read_csv(journal_file)
+    except Exception as e:
+        print(f"Error reading journal for evaluation: {e}")
+        return
 
-    for symbol in watchlist:
-        if symbol in alert_cooldowns:
-            if now_utc - alert_cooldowns[symbol] < timedelta(hours=cooldown_hours):
-                continue
+    if 'Status' not in df.columns:
+        return
 
-        market_data = process_market_data(symbol)
-        if not market_data:
-            logging.warning(f"[{symbol}] Incomplete market data or warming up indicators.")
+    open_mask = df['Status'].isin(['OPEN', 'TP1_HIT'])
+    if not open_mask.any():
+        return
+
+    print(f"\n🔄 Evaluating active signals in trade journal...")
+    updated = False
+
+    for idx, row in df[open_mask].iterrows():
+        symbol = str(row['Symbol'])
+        entry = float(row['Entry_Price'])
+        sl = float(row['Stop_Loss'])
+        tp1 = float(row['Take_Profit_1'])
+        tp2 = float(row['Take_Profit_2'])
+        risk_usd = float(row['Max_Risk_USD'])
+        current_status = str(row['Status'])
+
+        df_candles = fetch_market_data(symbol, timeframe='15m', limit=10)
+        if df_candles is None or df_candles.empty:
             continue
 
-        sig = evaluate_signal(symbol, market_data, config)
-        if sig["valid"]:
-            acc_bal = config.get("account_balance", 1000.0)
-            risk_pct = config.get("risk_pct", 1.0)
-            risk_usd = acc_bal * (risk_pct / 100.0)
+        latest_low = df_candles['low'].min()
+        latest_high = df_candles['high'].max()
+        close_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        # 1. Check Stop Loss
+        if latest_low <= sl:
+            pnl_usd = -risk_usd
+            realized_r = -1.0
             
-            sl_dist = abs(sig["close"] - sig["sl_price"])
-            units = risk_usd / sl_dist if sl_dist > 0 else 0
-            position_usdt = units * sig["close"]
+            df.at[idx, 'Status'] = 'STOPPED_OUT'
+            df.at[idx, 'Exit_Price'] = f"{sl:.4f}"
+            df.at[idx, 'Closed_Timestamp'] = close_time
+            df.at[idx, 'Realized_PnL_USD'] = f"{pnl_usd:.2f}"
+            df.at[idx, 'Realized_R'] = f"{realized_r:.2f}"
+            updated = True
 
-            # Telegram Alert Body (Matching Structural Format)
-            message = (
-                f"🎯 *PROXIMITY ALERT: {symbol}* 🎯\n\n"
-                f"*Trigger Conditions Met:*\n"
-                f"• Near 1H 200 TEMA ({sig['dist_1h']:.2f}% away)\n\n"
-                f"*Current Price:* `${sig['close']:,.4f}`\n\n"
-                f"📈 *Technical Confluence:*\n"
-                f"• *1H 200 TEMA:* `${sig['tema_1h']:,.4f}`\n"
-                f"• *4H 200 TEMA:* `${sig['tema_4h']:,.4f}`\n"
-                f"• *Point of Control (POC):* `${sig['poc']:,.4f}`\n\n"
-                f"🎯 *Trade Parameters ({risk_pct}% Risk Model):*\n"
-                f"• *Direction:* `{sig['direction']}`\n"
-                f"• *Entry Zone:* `${sig['close']:,.4f}`\n"
-                f"• *Stop Loss:* `${sig['sl_price']:,.4f}` (Risk: `${risk_usd:,.2f}`)\n"
-                f"• *Target 1 (HVN):* `${sig['tp1']:,.4f}`\n"
-                f"• *Target 2 (Macro):* `${sig['tp2']:,.4f}`\n\n"
-                f"💰 *Position Sizing:*\n"
-                f"• *Position Value:* `${position_usdt:,.2f}` (`{units:.2f}` units)\n"
-                f"• *Risk/Reward Ratio:* `{sig['rr_ratio']:.2f}R`\n\n"
-                f"📄 *Signal logged to trade_journal.csv*"
-            )
+            if bot and chat_id:
+                msg = (
+                    f"🛑 **TRADE STOPPED OUT: {symbol}** 🛑\n\n"
+                    f"• Exit Price: `${sl:.4f}`\n"
+                    f"• Realized PnL: `${pnl_usd:.2f}` (-1.0R)\n"
+                    f"• Timestamp: `{close_time}`"
+                )
+                await bot.send_message(chat_id=chat_id, text=msg, parse_mode="Markdown")
 
-            if send_telegram_alert(message):
-                alert_cooldowns[symbol] = now_utc
-                log_to_journal(journal_file, {
-                    "Timestamp": now_utc.strftime("%Y-%m-%d %H:%M:%S"),
-                    "Symbol": symbol,
-                    "Trigger_Reason": f"Near 1H 200 TEMA ({sig['dist_1h']:.2f}% away)",
-                    "Entry_Price": sig["close"],
-                    "Stop_Loss": sig["sl_price"],
-                    "Take_Profit_1": sig["tp1"],
-                    "Take_Profit_2": sig["tp2"],
-                    "Position_USDT": round(position_usdt, 2),
-                    "Max_Risk_USD": round(risk_usd, 2),
-                    "Status": "OPEN"
-                })
-        else:
-            logging.info(f"[{symbol}] No Signal -> {sig['reason']}")
+        # 2. Check Take Profit 2
+        elif latest_high >= tp2:
+            r_multiple = abs(tp2 - entry) / abs(entry - sl) if abs(entry - sl) > 0 else 0
+            pnl_usd = risk_usd * r_multiple
 
-def main():
-    logging.info("Initializing Structural Trading Agent...")
-    send_telegram_alert("🟢 *Structural Trading Agent Initialized & Active.* Scanning loop starting...")
+            df.at[idx, 'Status'] = 'CLOSED_TP2'
+            df.at[idx, 'Exit_Price'] = f"{tp2:.4f}"
+            df.at[idx, 'Closed_Timestamp'] = close_time
+            df.at[idx, 'Realized_PnL_USD'] = f"{pnl_usd:.2f}"
+            df.at[idx, 'Realized_R'] = f"{r_multiple:.2f}"
+            updated = True
+
+            if bot and chat_id:
+                msg = (
+                    f"🎯 **FULL TARGET HIT (TP2): {symbol}** 🎯\n\n"
+                    f"• Target Price: `${tp2:.4f}`\n"
+                    f"• Realized PnL: `+${pnl_usd:.2f}` (+{r_multiple:.2f}R)\n"
+                    f"• Timestamp: `{close_time}`"
+                )
+                await bot.send_message(chat_id=chat_id, text=msg, parse_mode="Markdown")
+
+        # 3. Check Take Profit 1
+        elif latest_high >= tp1 and current_status == 'OPEN':
+            r_multiple = abs(tp1 - entry) / abs(entry - sl) if abs(entry - sl) > 0 else 0
+            
+            df.at[idx, 'Status'] = 'TP1_HIT'
+            updated = True
+
+            if bot and chat_id:
+                msg = (
+                    f"✅ **FIRST TARGET REACHED (TP1): {symbol}** ✅\n\n"
+                    f"• Milestone Price: `${tp1:.4f}`\n"
+                    f"• Un-realized Gain: `+{r_multiple:.2f}R`\n"
+                    f"• Status: Stop Loss moved to Breakeven (${entry:.4f})"
+                )
+                await bot.send_message(chat_id=chat_id, text=msg, parse_mode="Markdown")
+
+    if updated:
+        df.to_csv(journal_file, index=False)
+        print("💾 Updated active trade statuses in CSV journal.")
+
+# =====================================================================
+# ANALYSIS & SCANNER LOOP
+# =====================================================================
+async def analyze_symbol(symbol, bot, chat_id, config):
+    current_time = time.time()
+    
+    account_balance = config.get("account_balance", 1000.0)
+    risk_pct = config.get("risk_pct", 1.0)
+    proximity_threshold = config.get("proximity_threshold_pct", 1.5)
+    cooldown_hours = config.get("alert_cooldown_hours", 4)
+    journal_file = config.get("journal_file", "trade_journal.csv")
+    
+    if symbol in last_alert_time:
+        elapsed_hours = (current_time - last_alert_time[symbol]) / 3600
+        if elapsed_hours < cooldown_hours:
+            print(f"[{symbol}] On cooldown ({elapsed_hours:.1f}h / {cooldown_hours}h elapsed). Skipping scan.")
+            return
+
+    df_1h = fetch_market_data(symbol, timeframe='1h', limit=500)
+    df_4h = fetch_market_data(symbol, timeframe='4h', limit=500)
+    
+    if df_1h is None or df_4h is None:
+        return
+
+    current_price = df_1h['close'].iloc[-1]
+    val_1h = df_1h['tema_200'].dropna().iloc[-1] if not df_1h['tema_200'].dropna().empty else None
+    val_4h = df_4h['tema_200'].dropna().iloc[-1] if not df_4h['tema_200'].dropna().empty else None
+    poc_price, hvn_prices = calculate_volume_profile(df_1h, num_bins=30)
+    
+    triggered_reasons = []
+    
+    if val_1h is not None:
+        dist_1h = abs(current_price - val_1h) / val_1h * 100
+        if dist_1h <= proximity_threshold:
+            triggered_reasons.append(f"Near 1H 200 TEMA ({dist_1h:.2f}% away)")
+            
+    if val_4h is not None:
+        dist_4h = abs(current_price - val_4h) / val_4h * 100
+        if dist_4h <= proximity_threshold:
+            triggered_reasons.append(f"Near 4H 200 TEMA ({dist_4h:.2f}% away)")
+            
+    if poc_price is not None:
+        dist_poc = abs(current_price - poc_price) / poc_price * 100
+        if dist_poc <= proximity_threshold:
+            triggered_reasons.append(f"Near Volume POC ({dist_poc:.2f}% away)")
+            
+    if not triggered_reasons:
+        print(f"[{symbol}] Price (${current_price:.4f}) outside threshold. No trigger.")
+        return
+
+    print(f"🎯 TRIGGER MATCH for {symbol}: {', '.join(triggered_reasons)}")
+
+    # Core Structural Calculations (LONG Bias Alignment)
+    direction = "LONG"
+    entry_price = current_price
+    
+    # ATR/Structure Stop Loss
+    atr_val = ta.atr(df_1h['high'], df_1h['low'], df_1h['close'], length=14).iloc[-1]
+    stop_loss = entry_price - (1.5 * atr_val) if not pd.isna(atr_val) else entry_price * 0.985
+    
+    # Structural Targets
+    tp1 = hvn_prices[0] if hvn_prices and hvn_prices[0] > entry_price else entry_price * 1.03
+    tp2 = poc_price if poc_price > entry_price else entry_price * 1.05
+
+    units, position_usdt, risk_usd = calculate_fixed_risk_position(
+        account_balance, entry_price, stop_loss, risk_pct=risk_pct
+    )
+    
+    rr_ratio = abs(tp1 - entry_price) / abs(entry_price - stop_loss) if abs(entry_price - stop_loss) > 0 else 0
+
+    # Log to CSV
+    log_trade_signal(
+        journal_file, symbol, triggered_reasons, entry_price, 
+        stop_loss, tp1, tp2, position_usdt, risk_usd
+    )
+
+    last_alert_time[symbol] = current_time
+
+    # Telegram Alert Formatting (Matches your screenshot exactly)
+    reasons_text = "\n".join([f"• {r}" for r in triggered_reasons])
+    message = (
+        f"🎯 **PROXIMITY ALERT: {symbol}** 🎯\n\n"
+        f"**Trigger Conditions Met:**\n{reasons_text}\n\n"
+        f"**Current Price:** `${current_price:.4f}`\n\n"
+        f"📈 **Technical Confluence:**\n"
+        f"• 1H 200 TEMA: {safe_format(val_1h)}\n"
+        f"• 4H 200 TEMA: {safe_format(val_4h)}\n"
+        f"• Point of Control (POC): {safe_format(poc_price)}\n\n"
+        f"🎯 **Trade Parameters ({risk_pct}% Risk Model):**\n"
+        f"• Direction: `{direction}`\n"
+        f"• Entry Zone: `${entry_price:.4f}`\n"
+        f"• Stop Loss: `${stop_loss:.4f}` (Risk: `${risk_usd:.2f}`)\n"
+        f"• Target 1 (HVN): `${tp1:.4f}`\n"
+        f"• Target 2 (Macro): `${tp2:.4f}`\n\n"
+        f"💰 **Position Sizing:**\n"
+        f"• Position Value: `${position_usdt:.2f}` ({units:.2f} units)\n"
+        f"• Risk/Reward Ratio: `{rr_ratio:.2f}R`\n\n"
+        f"📄 Signal logged to `trade_journal.csv`"
+    )
+    
+    if bot and chat_id:
+        await bot.send_message(chat_id=chat_id, text=message, parse_mode="Markdown")
+
+async def run_scanner():
+    config = load_config()
+    init_journal_file(config.get("journal_file", "trade_journal.csv"))
+
+    telegram_bot_token = os.getenv("TELEGRAM_BOT_TOKEN") or config.get("telegram_bot_token")
+    telegram_chat_id = os.getenv("TELEGRAM_CHAT_ID") or config.get("telegram_chat_id")
+
+    bot = Bot(token=telegram_bot_token) if telegram_bot_token else None
+    
+    if bot and telegram_chat_id:
+        startup_msg = "🟢 **Structural Trading Agent Initialized & Active.** Scanning loop starting..."
+        await bot.send_message(chat_id=telegram_chat_id, text=startup_msg, parse_mode="Markdown")
+    
     while True:
-        try:
-            config = load_config()
-            run_scan_cycle()
-            time.sleep(config.get("scan_interval_minutes", 15) * 60)
-        except KeyboardInterrupt:
-            break
-        except Exception as e:
-            logging.error(f"Unexpected loop error: {e}", exc_info=True)
-            time.sleep(60)
+        current_config = load_config()
+        watchlist = current_config.get("watchlist", [])
+        scan_interval = current_config.get("scan_interval_minutes", 15)
+        
+        # 1. Run Active Trade Evaluator
+        await evaluate_active_trades(bot, telegram_chat_id, current_config)
+
+        # 2. Run Watchlist Proximity Scanner
+        print(f"\n--- Starting Scan Cycle ({len(watchlist)} assets) ---")
+        for symbol in watchlist:
+            try:
+                await analyze_symbol(symbol, bot, telegram_chat_id, current_config)
+                await asyncio.sleep(2)
+            except Exception as e:
+                print(f"Error scanning {symbol}: {e}")
+                
+        print(f"Cycle completed. Sleeping for {scan_interval} minutes...")
+        await asyncio.sleep(scan_interval * 60)
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(run_scanner())

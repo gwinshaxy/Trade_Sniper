@@ -5,7 +5,6 @@ import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
 
-# Suppress non-critical component warnings
 warnings.filterwarnings("ignore", category=UserWarning)
 
 # =====================================================================
@@ -64,6 +63,18 @@ def load_journal() -> pd.DataFrame:
     if os.path.exists(JOURNAL_FILE):
         try:
             df = pd.read_csv(JOURNAL_FILE)
+            
+            # Expanded expected columns matching agent.py Evaluator schema
+            expected_cols = [
+                "Timestamp", "Symbol", "Trigger_Reason", "Entry_Price", 
+                "Stop_Loss", "Take_Profit_1", "Take_Profit_2", "Position_USDT", 
+                "Max_Risk_USD", "Status", "Exit_Price", "Closed_Timestamp", 
+                "Realized_PnL_USD", "Realized_R"
+            ]
+            
+            for col in expected_cols:
+                if col not in df.columns:
+                    df[col] = None
             return df
         except Exception as e:
             st.error(f"Error loading trade journal: {e}")
@@ -138,27 +149,34 @@ if st.sidebar.button("💾 Save Settings", use_container_width=True):
 # =====================================================================
 # METRICS & LIVE TRADE JOURNAL VIEW
 # =====================================================================
-tab1, tab2, tab3 = st.tabs(["📊 Live Journal & Signals", "📈 Charting", "🧪 Backtest Summary"])
+tab1, tab2, tab3 = st.tabs(["📊 Live Journal & Evaluator", "📈 Charting", "🧪 Closed Trades Analytics"])
 
 with tab1:
-    st.subheader("📋 Structural Trade Journal")
+    st.subheader("📋 Structural Trade Journal & Evaluator")
     journal_df = load_journal()
 
     if not journal_df.empty:
-        # Key metrics row
+        # Calculate evaluation summary metrics
+        total_signals = len(journal_df)
+        
+        # Count open positions cleanly
+        open_signals = len(journal_df[journal_df["Status"].isin(["OPEN", "TP1_HIT"])])
+        
+        # Calculate Realized PnL safely (strips out non-numeric characters if any exist)
+        pnl_series = pd.to_numeric(journal_df["Realized_PnL_USD"], errors="coerce").fillna(0.0)
+        total_realized_pnl = pnl_series.sum()
+        
         col1, col2, col3, col4 = st.columns(4)
-        col1.metric("Total Signals", len(journal_df))
-        col2.metric("Open Signals", len(journal_df[journal_df["Status"] == "OPEN"]) if "Status" in journal_df.columns else 0)
-        col3.metric("Last Active Pair", journal_df.iloc[-1]["Symbol"] if "Symbol" in journal_df.columns else "N/A")
-        col4.metric("Risk Model", f"{risk_pct}% / Trade")
+        col1.metric("Total Signals Logged", total_signals)
+        col2.metric("Active / Open Positions", open_signals)
+        col3.metric("Net Realized PnL ($)", f"${total_realized_pnl:+.2f}")
+        col4.metric("Risk Setting", f"{risk_pct}% / Trade")
 
         st.markdown("---")
         
         # Clean wide table view
-        st.dataframe(
-            journal_df.sort_index(ascending=False), 
-            use_container_width=True
-        )
+        display_df = journal_df.fillna("—").sort_index(ascending=False)
+        st.dataframe(display_df, use_container_width=True)
     else:
         st.info("No trades logged in `trade_journal.csv` yet. Waiting for structural proximity signals.")
 
@@ -166,7 +184,6 @@ with tab2:
     st.subheader("📈 TradingView Live Charting")
     selected_symbol = st.selectbox("Select Pair to Chart", config.get("watchlist", ["NEAR/USDT"]))
     
-    # Format symbol for TradingView Widget (e.g. NEAR/USDT -> MEXC:NEARUSDT)
     tv_symbol = f"MEXC:{selected_symbol.replace('/', '')}"
     
     tradingview_html = f"""
@@ -198,11 +215,14 @@ with tab2:
     components.html(tradingview_html, height=560, scrolling=False)
 
 with tab3:
-    st.subheader("🧪 Backtest Performance Analytics")
-    st.write("Current Regime Filters: **TEMA 200 + ADX (>=18) + ATR% (>=0.4%)**")
-    
-    if not journal_df.empty and "Status" in journal_df.columns:
-        st.write("### Recorded Execution History")
-        st.dataframe(journal_df, use_container_width=True)
+    st.subheader("🧪 Closed Trades & Realized Execution")
+    journal_df = load_journal()
+    if not journal_df.empty:
+        closed_df = journal_df[journal_df["Status"].isin(["STOPPED_OUT", "CLOSED_TP2"])].dropna(subset=["Status"])
+        if not closed_df.empty:
+            st.write("### Realized Execution History")
+            st.dataframe(closed_df.fillna("—").sort_index(ascending=False), use_container_width=True)
+        else:
+            st.info("No trades have hit Stop Loss or TP2 yet.")
     else:
-        st.info("Historical backtest data will populate here as trade states close.")
+        st.info("Historical execution performance will populate here.")
