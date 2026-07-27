@@ -81,7 +81,7 @@ def load_journal() -> pd.DataFrame:
     return pd.DataFrame()
 
 # =====================================================================
-# BACKTESTING ENGINE
+# REFINED BACKTESTING ENGINE
 # =====================================================================
 def fetch_backtest_data(symbol, timeframe='1h', limit=1000):
     try:
@@ -89,15 +89,30 @@ def fetch_backtest_data(symbol, timeframe='1h', limit=1000):
         ohlcv = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
         df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
         df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+        
+        # Core Indicators
         df['tema_200'] = ta.tema(df['close'], length=200)
         df['atr'] = ta.atr(df['high'], df['low'], df['close'], length=14)
+        
+        # ADX Calculation
+        adx_df = ta.adx(df['high'], df['low'], df['close'], length=14)
+        if adx_df is not None and not adx_df.empty:
+            df['adx'] = adx_df.iloc[:, 0]
+        else:
+            df['adx'] = 25.0
+            
         return df
     except Exception as e:
         st.error(f"Failed to fetch market data for {symbol}: {e}")
         return None
 
-def run_backtest_simulation(symbol, df, risk_pct=1.0, initial_capital=1000.0, proximity_pct=1.5):
+def run_backtest_simulation(symbol, df, risk_pct=1.0, initial_capital=1000.0, proximity_pct=1.5, min_adx=18.0, min_atr_pct=0.4):
     if df is None or df.empty or 'tema_200' not in df.columns:
+        return None, None
+
+    # Drop early warmup rows where indicators are NaN
+    clean_df = df.dropna(subset=['tema_200', 'atr']).copy().reset_index(drop=True)
+    if clean_df.empty:
         return None, None
 
     trades = []
@@ -109,13 +124,14 @@ def run_backtest_simulation(symbol, df, risk_pct=1.0, initial_capital=1000.0, pr
     tp2 = 0.0
     risk_usd = 0.0
 
-    for i in range(200, len(df)):
-        current_row = df.iloc[i]
+    for i in range(len(clean_df)):
+        current_row = clean_df.iloc[i]
         close_p = current_row['close']
         high_p = current_row['high']
         low_p = current_row['low']
         tema_p = current_row['tema_200']
         atr_p = current_row['atr']
+        adx_p = current_row.get('adx', 20.0)
 
         if pd.isna(tema_p) or pd.isna(atr_p):
             continue
@@ -129,14 +145,14 @@ def run_backtest_simulation(symbol, df, risk_pct=1.0, initial_capital=1000.0, pr
                     "Timestamp": current_row['timestamp'],
                     "Symbol": symbol,
                     "Type": "LONG",
-                    "Entry": entry_price,
-                    "Exit": stop_loss,
+                    "Entry": round(entry_price, 4),
+                    "Exit": round(stop_loss, 4),
                     "Result": "STOPPED_OUT",
-                    "PnL ($)": pnl,
-                    "Capital ($)": capital
+                    "PnL ($)": round(pnl, 2),
+                    "Capital ($)": round(capital, 2)
                 })
                 in_trade = False
-            # Check TP2
+            # Check Take Profit 2
             elif high_p >= tp2:
                 pnl = risk_usd * 2.0
                 capital += pnl
@@ -144,17 +160,22 @@ def run_backtest_simulation(symbol, df, risk_pct=1.0, initial_capital=1000.0, pr
                     "Timestamp": current_row['timestamp'],
                     "Symbol": symbol,
                     "Type": "LONG",
-                    "Entry": entry_price,
-                    "Exit": tp2,
+                    "Entry": round(entry_price, 4),
+                    "Exit": round(tp2, 4),
                     "Result": "TP2_HIT",
-                    "PnL ($)": pnl,
-                    "Capital ($)": capital
+                    "PnL ($)": round(pnl, 2),
+                    "Capital ($)": round(capital, 2)
                 })
                 in_trade = False
         else:
-            # Check Proximity Trigger
-            dist_pct = abs(close_p - tema_p) / tema_p * 100.0
-            if dist_pct <= proximity_pct:
+            # Check proximity across close or low wick tests
+            dist_close_pct = abs(close_p - tema_p) / tema_p * 100.0
+            dist_low_pct = abs(low_p - tema_p) / tema_p * 100.0
+            min_dist = min(dist_close_pct, dist_low_pct)
+            
+            atr_pct = (atr_p / close_p) * 100.0 if close_p > 0 else 0.0
+            
+            if min_dist <= proximity_pct and atr_pct >= min_atr_pct and adx_p >= min_adx:
                 in_trade = True
                 entry_price = close_p
                 stop_loss = entry_price - (1.5 * atr_p)
@@ -213,7 +234,7 @@ cooldown_hours = st.sidebar.number_input(
 st.sidebar.markdown("---")
 st.sidebar.subheader("📌 Watchlist Manager")
 
-# Quick Input to add single custom asset directly
+# Single Custom Symbol Adder
 custom_symbol_input = st.sidebar.text_input("Add Single Symbol (e.g., SOL/USDT)", "").strip().upper()
 if st.sidebar.button("➕ Add to Watchlist", use_container_width=True):
     if custom_symbol_input:
@@ -349,7 +370,13 @@ with tab4:
             df_bt = fetch_backtest_data(bt_symbol, timeframe='1h', limit=bt_candles)
             if df_bt is not None and not df_bt.empty:
                 results_df, final_cap = run_backtest_simulation(
-                    bt_symbol, df_bt, risk_pct=risk_pct, initial_capital=bt_capital, proximity_pct=proximity_threshold
+                    symbol=bt_symbol, 
+                    df=df_bt, 
+                    risk_pct=risk_pct, 
+                    initial_capital=bt_capital, 
+                    proximity_pct=proximity_threshold,
+                    min_adx=min_adx,
+                    min_atr_pct=min_atr_pct
                 )
                 
                 if results_df is not None and not results_df.empty:
