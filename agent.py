@@ -109,10 +109,7 @@ def log_trade_to_journal(journal_file: str, trade_data: dict):
 # MARKET DATA & INDICATORS
 # =====================================================================
 def fetch_ohlcv(symbol: str, timeframe: str = "1h", limit: int = 500) -> pd.DataFrame:
-    """
-    Fetches candle history from MEXC.
-    Limit is set to 500 to align with MEXC REST API single-request caps.
-    """
+    """Fetches candle history from MEXC."""
     try:
         ohlcv = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
         if not ohlcv or len(ohlcv) == 0:
@@ -127,13 +124,13 @@ def fetch_ohlcv(symbol: str, timeframe: str = "1h", limit: int = 500) -> pd.Data
         return pd.DataFrame()
 
 def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    """Calculates 200 TEMA, 14 ADX, and 14 ATR % with a 300-bar warmup depth."""
-    if df.empty or len(df) < 300:
-        logging.warning(f"Insufficient candle depth ({len(df)} bars). Need at least 300 bars.")
+    """Calculates 200 EMA, 14 ADX, and 14 ATR %."""
+    if df.empty or len(df) < 200:
+        logging.warning(f"Insufficient candle depth ({len(df)} bars). Need at least 200 bars.")
         return pd.DataFrame()
 
-    # 1. 200-period TEMA
-    df["TEMA_200"] = ta.tema(df["close"], length=200)
+    # 1. 200-period EMA (calculates cleanly within 500 candles)
+    df["EMA_200"] = ta.ema(df["close"], length=200)
 
     # 2. Volatility Filter: 14-period ATR relative to current close (%)
     df["ATR_14"] = ta.atr(df["high"], df["low"], df["close"], length=14)
@@ -158,22 +155,22 @@ def check_trade_signal(
     min_adx: float = 20.0, 
     min_atr_pct: float = 0.5
 ) -> dict:
-    """Evaluates 200 TEMA proximity and regime filters safely on the latest completed bar."""
-    if df.empty or "TEMA_200" not in df.columns:
+    """Evaluates 200 EMA proximity and regime filters safely on the latest completed bar."""
+    if df.empty or "EMA_200" not in df.columns:
         return {"valid": False, "rejected_reason": "Indicator calculations failed or missing columns"}
 
     # Extract strictly the latest row
     latest = df.iloc[-1]
 
     close_raw = latest.get("close")
-    tema_raw = latest.get("TEMA_200")
+    ema_raw = latest.get("EMA_200")
 
     # Strict check on latest row values ONLY
-    if pd.isna(close_raw) or close_raw is None or pd.isna(tema_raw) or tema_raw is None:
-        return {"valid": False, "rejected_reason": "Latest candle Close or TEMA_200 is NaN"}
+    if pd.isna(close_raw) or close_raw is None or pd.isna(ema_raw) or ema_raw is None:
+        return {"valid": False, "rejected_reason": "Latest candle Close or EMA_200 is NaN"}
 
     close_price = float(close_raw)
-    tema_val = float(tema_raw)
+    ema_val = float(ema_raw)
 
     # Safely parse ADX and ATR % for current candle
     adx_raw = latest.get("ADX_14", 0.0)
@@ -182,8 +179,8 @@ def check_trade_signal(
     atr_raw = latest.get("ATR_PCT", 0.0)
     atr_pct_val = float(atr_raw) if pd.notna(atr_raw) and atr_raw is not None else 0.0
 
-    # Distance to 200 TEMA (%)
-    distance_pct = abs(close_price - tema_val) / tema_val * 100.0
+    # Distance to 200 EMA (%)
+    distance_pct = abs(close_price - ema_val) / ema_val * 100.0
     is_in_proximity = distance_pct <= proximity_threshold
 
     # Regime Filter Checks
@@ -198,12 +195,12 @@ def check_trade_signal(
     elif not is_trending:
         rejected_reason = f"Choppy Market (ADX: {adx_val:.1f} < {min_adx})"
     elif not has_volatility:
-        rejected_reason = f"Low Volatility (ATR%: {atr_pct_val:.2f}% < {min_atr_pct}% )"
+        rejected_reason = f"Low Volatility (ATR%: {atr_pct_val:.2f}% < {min_atr_pct}%)"
 
     return {
         "valid": valid_signal,
         "close": close_price,
-        "tema": tema_val,
+        "ema": ema_val,
         "distance_pct": distance_pct,
         "adx": adx_val,
         "atr_pct": atr_pct_val,
@@ -239,10 +236,10 @@ def run_scan_cycle():
                 logging.info(f"[{symbol}] In cooldown mode ({remaining_mins} mins remaining). Skipped.")
                 continue
 
-        # Fetch Data (limit=500 for MEXC API alignment)
+        # Fetch Data (limit=500 matches MEXC single call cap)
         df = fetch_ohlcv(symbol, timeframe="1h", limit=500)
         
-        if df.empty or len(df) < 300:
+        if df.empty or len(df) < 200:
             logging.warning(f"[{symbol}] Insufficient candle data returned ({len(df)} bars). Skipping evaluation.")
             continue
 
@@ -262,13 +259,13 @@ def run_scan_cycle():
 
         if result["valid"]:
             close_price = result["close"]
-            tema_val = result["tema"]
+            ema_val = result["ema"]
             
             # Position Sizing
             risk_amount = account_balance * (risk_pct / 100.0)
             sl_distance_price = close_price * (stop_loss_pct / 100.0)
             
-            direction = "LONG" if close_price >= tema_val else "SHORT"
+            direction = "LONG" if close_price >= ema_val else "SHORT"
             sl_price = close_price - sl_distance_price if direction == "LONG" else close_price + sl_distance_price
             position_units = risk_amount / sl_distance_price if sl_distance_price > 0 else 0
             position_value_usdt = position_units * close_price
@@ -278,7 +275,7 @@ def run_scan_cycle():
                 f"🚨 *PROXIMITY ALERT: {symbol}* 🚨\n\n"
                 f"• *Direction:* `{direction}`\n"
                 f"• *Current Price:* `${close_price:,.4f}`\n"
-                f"• *200 TEMA:* `${tema_val:,.4f}` (Dist: `{result['distance_pct']:.2f}%`)\n"
+                f"• *200 EMA:* `${ema_val:,.4f}` (Dist: `{result['distance_pct']:.2f}%`)\n"
                 f"• *Calculated SL ({stop_loss_pct}%):* `${sl_price:,.4f}`\n"
                 f"• *Risk Amount ({risk_pct}%):* `${risk_amount:,.2f}`\n"
                 f"• *Suggested Position Size:* `${position_value_usdt:,.2f}` (`{position_units:.2f}` units)\n\n"
@@ -298,7 +295,7 @@ def run_scan_cycle():
                     "symbol": symbol,
                     "direction": direction,
                     "entry_price": close_price,
-                    "tema_200": tema_val,
+                    "ema_200": ema_val,
                     "stop_loss_price": sl_price,
                     "risk_usd": risk_amount,
                     "position_value_usd": position_value_usdt,
