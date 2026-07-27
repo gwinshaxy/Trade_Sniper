@@ -108,11 +108,10 @@ def log_trade_to_journal(journal_file: str, trade_data: dict):
 # =====================================================================
 # MARKET DATA & INDICATORS
 # =====================================================================
-def fetch_ohlcv(symbol: str, timeframe: str = "1h", limit: int = 1000) -> pd.DataFrame:
+def fetch_ohlcv(symbol: str, timeframe: str = "1h", limit: int = 500) -> pd.DataFrame:
     """
     Fetches candle history from MEXC.
-    FIX A: Fetch limit defaults to 1000 bars because 200 TEMA requires 
-    ~600 bars of historical warm-up data to compute non-NaN values.
+    Limit is set to 500 to align with MEXC REST API single-request caps.
     """
     try:
         ohlcv = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
@@ -128,9 +127,9 @@ def fetch_ohlcv(symbol: str, timeframe: str = "1h", limit: int = 1000) -> pd.Dat
         return pd.DataFrame()
 
 def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    """Calculates 200 TEMA, 14 ADX, and 14 ATR %."""
-    if df.empty or len(df) < 600:
-        logging.warning(f"Insufficient candle depth ({len(df)} bars). TEMA 200 needs at least 600 bars.")
+    """Calculates 200 TEMA, 14 ADX, and 14 ATR % with a 300-bar warmup depth."""
+    if df.empty or len(df) < 300:
+        logging.warning(f"Insufficient candle depth ({len(df)} bars). Need at least 300 bars.")
         return pd.DataFrame()
 
     # 1. 200-period TEMA
@@ -159,11 +158,7 @@ def check_trade_signal(
     min_adx: float = 20.0, 
     min_atr_pct: float = 0.5
 ) -> dict:
-    """
-    Evaluates 200 TEMA proximity and regime filters safely.
-    FIX B: Inspects ONLY the latest candle (df.iloc[-1]) for NaN values, ignoring 
-    the initial historical rows where TEMA naturally warm-ups.
-    """
+    """Evaluates 200 TEMA proximity and regime filters safely on the latest completed bar."""
     if df.empty or "TEMA_200" not in df.columns:
         return {"valid": False, "rejected_reason": "Indicator calculations failed or missing columns"}
 
@@ -203,7 +198,7 @@ def check_trade_signal(
     elif not is_trending:
         rejected_reason = f"Choppy Market (ADX: {adx_val:.1f} < {min_adx})"
     elif not has_volatility:
-        rejected_reason = f"Low Volatility (ATR%: {atr_pct_val:.2f}% < {min_atr_pct}%)"
+        rejected_reason = f"Low Volatility (ATR%: {atr_pct_val:.2f}% < {min_atr_pct}% )"
 
     return {
         "valid": valid_signal,
@@ -244,11 +239,11 @@ def run_scan_cycle():
                 logging.info(f"[{symbol}] In cooldown mode ({remaining_mins} mins remaining). Skipped.")
                 continue
 
-        # Fetch Data (limit=1000 for full TEMA warmup)
-        df = fetch_ohlcv(symbol, timeframe="1h", limit=1000)
+        # Fetch Data (limit=500 for MEXC API alignment)
+        df = fetch_ohlcv(symbol, timeframe="1h", limit=500)
         
-        if df.empty or len(df) < 600:
-            logging.warning(f"[{symbol}] Insufficient candle data returned. Skipping evaluation.")
+        if df.empty or len(df) < 300:
+            logging.warning(f"[{symbol}] Insufficient candle data returned ({len(df)} bars). Skipping evaluation.")
             continue
 
         # Calculate Indicators
