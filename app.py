@@ -1,11 +1,9 @@
 import os
 import json
 import warnings
-import asyncio
 import ccxt
 import pandas as pd
 import pandas_ta as ta
-import numpy as np
 import streamlit as st
 import streamlit.components.v1 as components
 
@@ -109,7 +107,6 @@ def run_backtest_simulation(symbol, df, risk_pct=1.0, initial_capital=1000.0, pr
     stop_loss = 0.0
     tp1 = 0.0
     tp2 = 0.0
-    units = 0.0
     risk_usd = 0.0
 
     for i in range(200, len(df)):
@@ -141,7 +138,7 @@ def run_backtest_simulation(symbol, df, risk_pct=1.0, initial_capital=1000.0, pr
                 in_trade = False
             # Check TP2
             elif high_p >= tp2:
-                pnl = risk_usd * 2.0  # ~2R Target
+                pnl = risk_usd * 2.0
                 capital += pnl
                 trades.append({
                     "Timestamp": current_row['timestamp'],
@@ -163,10 +160,7 @@ def run_backtest_simulation(symbol, df, risk_pct=1.0, initial_capital=1000.0, pr
                 stop_loss = entry_price - (1.5 * atr_p)
                 tp1 = entry_price + (1.5 * atr_p)
                 tp2 = entry_price + (3.0 * atr_p)
-
                 risk_usd = capital * (risk_pct / 100.0)
-                price_risk = abs(entry_price - stop_loss)
-                units = risk_usd / price_risk if price_risk > 0 else 0
 
     trades_df = pd.DataFrame(trades)
     return trades_df, capital
@@ -216,12 +210,29 @@ cooldown_hours = st.sidebar.number_input(
     step=1
 )
 
+st.sidebar.markdown("---")
+st.sidebar.subheader("📌 Watchlist Manager")
+
+# Quick Input to add single custom asset directly
+custom_symbol_input = st.sidebar.text_input("Add Single Symbol (e.g., SOL/USDT)", "").strip().upper()
+if st.sidebar.button("➕ Add to Watchlist", use_container_width=True):
+    if custom_symbol_input:
+        current_list = config.get("watchlist", [])
+        if custom_symbol_input not in current_list:
+            current_list.append(custom_symbol_input)
+            config["watchlist"] = current_list
+            save_config(config)
+            st.rerun()
+        else:
+            st.sidebar.warning(f"{custom_symbol_input} is already in your watchlist.")
+
+# Editable Text Area for Full Watchlist
 watchlist_str = st.sidebar.text_area(
-    "Watchlist (Comma Separated)", 
+    "Active Watchlist (Comma Separated)", 
     value=", ".join(config.get("watchlist", []))
 )
 
-if st.sidebar.button("💾 Save Settings", width="stretch"):
+if st.sidebar.button("💾 Save All Settings", use_container_width=True):
     updated_watchlist = [symbol.strip().upper() for symbol in watchlist_str.split(",") if symbol.strip()]
     updated_config = {
         "account_balance": account_balance,
@@ -266,7 +277,7 @@ with tab1:
 
         st.markdown("---")
         display_df = journal_df.fillna("—").sort_index(ascending=False)
-        st.dataframe(display_df, width="stretch")
+        st.dataframe(display_df, use_container_width=True)
     else:
         st.info("No trades logged in `trade_journal.csv` yet. Waiting for structural proximity signals.")
 
@@ -309,7 +320,7 @@ with tab3:
         closed_df = journal_df[journal_df["Status"].isin(["STOPPED_OUT", "CLOSED_TP2"])].dropna(subset=["Status"])
         if not closed_df.empty:
             st.write("### Realized Execution History")
-            st.dataframe(closed_df.fillna("—").sort_index(ascending=False), width="stretch")
+            st.dataframe(closed_df.fillna("—").sort_index(ascending=False), use_container_width=True)
         else:
             st.info("No trades have hit Stop Loss or TP2 yet.")
     else:
@@ -321,14 +332,22 @@ with tab4:
     st.markdown("Simulate structural TEMA proximity strategies against historical OHLCV candles.")
 
     b_col1, b_col2, b_col3 = st.columns(3)
-    bt_symbol = b_col1.selectbox("Backtest Pair", config.get("watchlist", ["NEAR/USDT"]), key="bt_sym")
+    
+    active_watchlist = config.get("watchlist", ["NEAR/USDT"])
+    selected_preset = b_col1.selectbox("Select Target Pair", ["Custom Symbol..."] + active_watchlist)
+    
+    if selected_preset == "Custom Symbol...":
+        bt_symbol = st.text_input("Enter Symbol Pair (e.g., SOL/USDT)", value="SOL/USDT").strip().upper()
+    else:
+        bt_symbol = selected_preset
+
     bt_candles = b_col2.slider("Candle Lookback (1H)", min_value=200, max_value=1000, value=500, step=50)
     bt_capital = b_col3.number_input("Starting Capital ($)", value=1000.0, step=100.0)
 
-    if st.button("🚀 Run Strategy Simulation", width="stretch"):
+    if st.button("🚀 Run Strategy Simulation", use_container_width=True):
         with st.spinner(f"Fetching historical data and backtesting {bt_symbol}..."):
             df_bt = fetch_backtest_data(bt_symbol, timeframe='1h', limit=bt_candles)
-            if df_bt is not None:
+            if df_bt is not None and not df_bt.empty:
                 results_df, final_cap = run_backtest_simulation(
                     bt_symbol, df_bt, risk_pct=risk_pct, initial_capital=bt_capital, proximity_pct=proximity_threshold
                 )
@@ -347,6 +366,6 @@ with tab4:
 
                     st.markdown("---")
                     st.write("### Simulated Trade History")
-                    st.dataframe(results_df.sort_index(ascending=False), width="stretch")
+                    st.dataframe(results_df.sort_index(ascending=False), use_container_width=True)
                 else:
-                    st.warning("No structural triggers matched during the selected historical window.")
+                    st.warning(f"No structural triggers matched for {bt_symbol} during the selected historical window.")
