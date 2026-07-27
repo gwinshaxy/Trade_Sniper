@@ -1,8 +1,12 @@
 import os
 import json
+import warnings
 import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
+
+# Suppress non-critical component warnings
+warnings.filterwarnings("ignore", category=UserWarning)
 
 # =====================================================================
 # PAGE CONFIGURATION
@@ -116,7 +120,7 @@ watchlist_str = st.sidebar.text_area(
     value=", ".join(config.get("watchlist", []))
 )
 
-if st.sidebar.button("💾 Save Settings", width="stretch"):
+if st.sidebar.button("💾 Save Settings", use_container_width=True):
     updated_watchlist = [symbol.strip().upper() for symbol in watchlist_str.split(",") if symbol.strip()]
     updated_config = {
         "account_balance": account_balance,
@@ -141,7 +145,7 @@ with tab1:
     journal_df = load_journal()
 
     if not journal_df.empty:
-        # Display key summary metrics
+        # Key metrics row
         col1, col2, col3, col4 = st.columns(4)
         col1.metric("Total Signals", len(journal_df))
         col2.metric("Open Signals", len(journal_df[journal_df["Status"] == "OPEN"]) if "Status" in journal_df.columns else 0)
@@ -150,10 +154,10 @@ with tab1:
 
         st.markdown("---")
         
-        # Updated dataframe render without deprecated container width
+        # Clean wide table view
         st.dataframe(
             journal_df.sort_index(ascending=False), 
-            width="stretch"
+            use_container_width=True
         )
     else:
         st.info("No trades logged in `trade_journal.csv` yet. Waiting for structural proximity signals.")
@@ -191,7 +195,6 @@ with tab2:
     <!-- TradingView Widget END -->
     """
     
-    # Safe modern iframe container render
     components.html(tradingview_html, height=560, scrolling=False)
 
 with tab3:
@@ -200,6 +203,6 @@ with tab3:
     
     if not journal_df.empty and "Status" in journal_df.columns:
         st.write("### Recorded Execution History")
-        st.dataframe(journal_df, width="stretch")
+        st.dataframe(journal_df, use_container_width=True)
     else:
         st.info("Historical backtest data will populate here as trade states close.")
