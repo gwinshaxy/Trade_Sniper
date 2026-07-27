@@ -3,7 +3,6 @@ import json
 import time
 import warnings
 import requests
-import ccxt
 import pandas as pd
 import pandas_ta as ta
 import streamlit as st
@@ -102,35 +101,65 @@ def fetch_backtest_data(symbol: str, timeframe='1h', limit=1000):
     formatted_symbol = sanitize_symbol(symbol).replace('/', '').upper()
     fetch_limit = min(limit, 1000)
     
-    urls = [
-        f"https://api.binance.com/api/v3/klines?symbol={formatted_symbol}&interval={timeframe}&limit={fetch_limit}",
-        f"https://api.bybit.com/v5/market/kline?category=spot&symbol={formatted_symbol}&interval=60&limit={fetch_limit}"
-    ]
-    
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "Accept": "application/json"
+    }
+
     raw_candles = None
     provider = None
-    
-    # 1. Binance Direct Public REST
+
+    # Endpoint 1: Binance Global
     try:
-        res = requests.get(urls[0], timeout=10)
+        url = f"https://api.binance.com/api/v3/klines?symbol={formatted_symbol}&interval={timeframe}&limit={fetch_limit}"
+        res = requests.get(url, headers=headers, timeout=8)
         if res.status_code == 200:
             data = res.json()
             if isinstance(data, list) and len(data) > 0:
                 raw_candles = [[c[0], c[1], c[2], c[3], c[4], c[5]] for c in data]
-                provider = "Binance REST"
+                provider = "Binance Global"
     except Exception:
         pass
 
-    # 2. Bybit Direct Public REST Fallback
+    # Endpoint 2: Binance US (Bypasses global cloud IP blocks)
     if not raw_candles:
         try:
-            res = requests.get(urls[1], timeout=10)
+            url = f"https://api.binance.us/api/v3/klines?symbol={formatted_symbol}&interval={timeframe}&limit={fetch_limit}"
+            res = requests.get(url, headers=headers, timeout=8)
+            if res.status_code == 200:
+                data = res.json()
+                if isinstance(data, list) and len(data) > 0:
+                    raw_candles = [[c[0], c[1], c[2], c[3], c[4], c[5]] for c in data]
+                    provider = "Binance US"
+        except Exception:
+            pass
+
+    # Endpoint 3: Bybit Public REST
+    if not raw_candles:
+        try:
+            url = f"https://api.bybit.com/v5/market/kline?category=spot&symbol={formatted_symbol}&interval=60&limit={fetch_limit}"
+            res = requests.get(url, headers=headers, timeout=8)
             if res.status_code == 200:
                 data = res.json()
                 if data.get('retCode') == 0 and len(data['result']['list']) > 0:
                     klist = data['result']['list'][::-1]  # Reverse to chronological order
                     raw_candles = [[float(c[0]), c[1], c[2], c[3], c[4], c[5]] for c in klist]
                     provider = "Bybit REST"
+        except Exception:
+            pass
+
+    # Endpoint 4: Gate.io Fallback
+    if not raw_candles:
+        try:
+            gate_symbol = formatted_symbol.replace("USDT", "_USDT")
+            url = f"https://api.gateio.ws/api/v4/spot/candlesticks?currency_pair={gate_symbol}&interval=1h&limit={fetch_limit}"
+            res = requests.get(url, headers=headers, timeout=8)
+            if res.status_code == 200:
+                data = res.json()
+                if isinstance(data, list) and len(data) > 0:
+                    # Gate returns [timestamp, volume, close, high, low, open]
+                    raw_candles = [[int(c[0]) * 1000, c[5], c[3], c[4], c[2], c[1]] for c in data]
+                    provider = "Gate.io REST"
         except Exception:
             pass
 
