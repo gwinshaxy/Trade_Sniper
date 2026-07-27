@@ -1,7 +1,11 @@
 import os
 import json
 import warnings
+import asyncio
+import ccxt
 import pandas as pd
+import pandas_ta as ta
+import numpy as np
 import streamlit as st
 import streamlit.components.v1 as components
 
@@ -63,15 +67,12 @@ def load_journal() -> pd.DataFrame:
     if os.path.exists(JOURNAL_FILE):
         try:
             df = pd.read_csv(JOURNAL_FILE)
-            
-            # Expanded expected columns matching agent.py Evaluator schema
             expected_cols = [
                 "Timestamp", "Symbol", "Trigger_Reason", "Entry_Price", 
                 "Stop_Loss", "Take_Profit_1", "Take_Profit_2", "Position_USDT", 
                 "Max_Risk_USD", "Status", "Exit_Price", "Closed_Timestamp", 
                 "Realized_PnL_USD", "Realized_R"
             ]
-            
             for col in expected_cols:
                 if col not in df.columns:
                     df[col] = None
@@ -80,6 +81,95 @@ def load_journal() -> pd.DataFrame:
             st.error(f"Error loading trade journal: {e}")
             return pd.DataFrame()
     return pd.DataFrame()
+
+# =====================================================================
+# BACKTESTING ENGINE
+# =====================================================================
+def fetch_backtest_data(symbol, timeframe='1h', limit=1000):
+    try:
+        exchange = ccxt.mexc({'enableRateLimit': True, 'timeout': 20000})
+        ohlcv = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+        df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+        df['tema_200'] = ta.tema(df['close'], length=200)
+        df['atr'] = ta.atr(df['high'], df['low'], df['close'], length=14)
+        return df
+    except Exception as e:
+        st.error(f"Failed to fetch market data for {symbol}: {e}")
+        return None
+
+def run_backtest_simulation(symbol, df, risk_pct=1.0, initial_capital=1000.0, proximity_pct=1.5):
+    if df is None or df.empty or 'tema_200' not in df.columns:
+        return None, None
+
+    trades = []
+    capital = initial_capital
+    in_trade = False
+    entry_price = 0.0
+    stop_loss = 0.0
+    tp1 = 0.0
+    tp2 = 0.0
+    units = 0.0
+    risk_usd = 0.0
+
+    for i in range(200, len(df)):
+        current_row = df.iloc[i]
+        close_p = current_row['close']
+        high_p = current_row['high']
+        low_p = current_row['low']
+        tema_p = current_row['tema_200']
+        atr_p = current_row['atr']
+
+        if pd.isna(tema_p) or pd.isna(atr_p):
+            continue
+
+        if in_trade:
+            # Check Stop Loss
+            if low_p <= stop_loss:
+                pnl = -risk_usd
+                capital += pnl
+                trades.append({
+                    "Timestamp": current_row['timestamp'],
+                    "Symbol": symbol,
+                    "Type": "LONG",
+                    "Entry": entry_price,
+                    "Exit": stop_loss,
+                    "Result": "STOPPED_OUT",
+                    "PnL ($)": pnl,
+                    "Capital ($)": capital
+                })
+                in_trade = False
+            # Check TP2
+            elif high_p >= tp2:
+                pnl = risk_usd * 2.0  # ~2R Target
+                capital += pnl
+                trades.append({
+                    "Timestamp": current_row['timestamp'],
+                    "Symbol": symbol,
+                    "Type": "LONG",
+                    "Entry": entry_price,
+                    "Exit": tp2,
+                    "Result": "TP2_HIT",
+                    "PnL ($)": pnl,
+                    "Capital ($)": capital
+                })
+                in_trade = False
+        else:
+            # Check Proximity Trigger
+            dist_pct = abs(close_p - tema_p) / tema_p * 100.0
+            if dist_pct <= proximity_pct:
+                in_trade = True
+                entry_price = close_p
+                stop_loss = entry_price - (1.5 * atr_p)
+                tp1 = entry_price + (1.5 * atr_p)
+                tp2 = entry_price + (3.0 * atr_p)
+
+                risk_usd = capital * (risk_pct / 100.0)
+                price_risk = abs(entry_price - stop_loss)
+                units = risk_usd / price_risk if price_risk > 0 else 0
+
+    trades_df = pd.DataFrame(trades)
+    return trades_df, capital
 
 # =====================================================================
 # MAIN DASHBOARD LAYOUT
@@ -131,7 +221,7 @@ watchlist_str = st.sidebar.text_area(
     value=", ".join(config.get("watchlist", []))
 )
 
-if st.sidebar.button("💾 Save Settings", use_container_width=True):
+if st.sidebar.button("💾 Save Settings", width="stretch"):
     updated_watchlist = [symbol.strip().upper() for symbol in watchlist_str.split(",") if symbol.strip()]
     updated_config = {
         "account_balance": account_balance,
@@ -147,22 +237,24 @@ if st.sidebar.button("💾 Save Settings", use_container_width=True):
     save_config(updated_config)
 
 # =====================================================================
-# METRICS & LIVE TRADE JOURNAL VIEW
+# TABS SYSTEM
 # =====================================================================
-tab1, tab2, tab3 = st.tabs(["📊 Live Journal & Evaluator", "📈 Charting", "🧪 Closed Trades Analytics"])
+tab1, tab2, tab3, tab4 = st.tabs([
+    "📊 Live Journal & Evaluator", 
+    "📈 Charting", 
+    "📋 Closed Trades Analytics", 
+    "🧪 Historical Backtester"
+])
 
+# --- TAB 1: LIVE JOURNAL ---
 with tab1:
     st.subheader("📋 Structural Trade Journal & Evaluator")
     journal_df = load_journal()
 
     if not journal_df.empty:
-        # Calculate evaluation summary metrics
         total_signals = len(journal_df)
-        
-        # Count open positions cleanly
         open_signals = len(journal_df[journal_df["Status"].isin(["OPEN", "TP1_HIT"])])
         
-        # Calculate Realized PnL safely (strips out non-numeric characters if any exist)
         pnl_series = pd.to_numeric(journal_df["Realized_PnL_USD"], errors="coerce").fillna(0.0)
         total_realized_pnl = pnl_series.sum()
         
@@ -173,21 +265,18 @@ with tab1:
         col4.metric("Risk Setting", f"{risk_pct}% / Trade")
 
         st.markdown("---")
-        
-        # Clean wide table view
         display_df = journal_df.fillna("—").sort_index(ascending=False)
-        st.dataframe(display_df, use_container_width=True)
+        st.dataframe(display_df, width="stretch")
     else:
         st.info("No trades logged in `trade_journal.csv` yet. Waiting for structural proximity signals.")
 
+# --- TAB 2: CHARTING ---
 with tab2:
     st.subheader("📈 TradingView Live Charting")
     selected_symbol = st.selectbox("Select Pair to Chart", config.get("watchlist", ["NEAR/USDT"]))
-    
     tv_symbol = f"MEXC:{selected_symbol.replace('/', '')}"
     
     tradingview_html = f"""
-    <!-- TradingView Widget BEGIN -->
     <div class="tradingview-widget-container" style="height:100%;width:100%">
       <div id="tradingview_chart" style="height:550px;width:100%"></div>
       <script type="text/javascript" src="https://s3.tradingview.com/tv.js"></script>
@@ -209,20 +298,55 @@ with tab2:
       );
       </script>
     </div>
-    <!-- TradingView Widget END -->
     """
-    
     components.html(tradingview_html, height=560, scrolling=False)
 
+# --- TAB 3: CLOSED TRADES ANALYTICS ---
 with tab3:
-    st.subheader("🧪 Closed Trades & Realized Execution")
+    st.subheader("📋 Closed Trades & Realized Execution")
     journal_df = load_journal()
     if not journal_df.empty:
         closed_df = journal_df[journal_df["Status"].isin(["STOPPED_OUT", "CLOSED_TP2"])].dropna(subset=["Status"])
         if not closed_df.empty:
             st.write("### Realized Execution History")
-            st.dataframe(closed_df.fillna("—").sort_index(ascending=False), use_container_width=True)
+            st.dataframe(closed_df.fillna("—").sort_index(ascending=False), width="stretch")
         else:
             st.info("No trades have hit Stop Loss or TP2 yet.")
     else:
         st.info("Historical execution performance will populate here.")
+
+# --- TAB 4: HISTORICAL BACKTESTER ---
+with tab4:
+    st.subheader("🧪 Quantitative Strategy Backtester")
+    st.markdown("Simulate structural TEMA proximity strategies against historical OHLCV candles.")
+
+    b_col1, b_col2, b_col3 = st.columns(3)
+    bt_symbol = b_col1.selectbox("Backtest Pair", config.get("watchlist", ["NEAR/USDT"]), key="bt_sym")
+    bt_candles = b_col2.slider("Candle Lookback (1H)", min_value=200, max_value=1000, value=500, step=50)
+    bt_capital = b_col3.number_input("Starting Capital ($)", value=1000.0, step=100.0)
+
+    if st.button("🚀 Run Strategy Simulation", width="stretch"):
+        with st.spinner(f"Fetching historical data and backtesting {bt_symbol}..."):
+            df_bt = fetch_backtest_data(bt_symbol, timeframe='1h', limit=bt_candles)
+            if df_bt is not None:
+                results_df, final_cap = run_backtest_simulation(
+                    bt_symbol, df_bt, risk_pct=risk_pct, initial_capital=bt_capital, proximity_pct=proximity_threshold
+                )
+                
+                if results_df is not None and not results_df.empty:
+                    net_profit = final_cap - bt_capital
+                    win_trades = len(results_df[results_df["Result"] == "TP2_HIT"])
+                    loss_trades = len(results_df[results_df["Result"] == "STOPPED_OUT"])
+                    win_rate = (win_trades / len(results_df)) * 100.0 if len(results_df) > 0 else 0.0
+
+                    m1, m2, m3, m4 = st.columns(4)
+                    m1.metric("Final Capital ($)", f"${final_cap:.2f}")
+                    m2.metric("Net Profit ($)", f"${net_profit:+.2f}")
+                    m3.metric("Total Trades", len(results_df))
+                    m4.metric("Win Rate (%)", f"{win_rate:.1f}%")
+
+                    st.markdown("---")
+                    st.write("### Simulated Trade History")
+                    st.dataframe(results_df.sort_index(ascending=False), width="stretch")
+                else:
+                    st.warning("No structural triggers matched during the selected historical window.")
