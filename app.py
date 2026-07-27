@@ -1,5 +1,6 @@
 import os
 import json
+import time
 import warnings
 import ccxt
 import pandas as pd
@@ -36,7 +37,8 @@ DEFAULT_CONFIG = {
         "PENDLE/USDT",
         "LINK/USDT",
         "TIA/USDT",
-        "NEAR/USDT"
+        "NEAR/USDT",
+        "XRP/USDT"
     ]
 }
 
@@ -81,27 +83,51 @@ def load_journal() -> pd.DataFrame:
     return pd.DataFrame()
 
 # =====================================================================
-# ROBUST BACKTESTING ENGINE
+# PAGINATED DATA FETCH & BACKTESTING ENGINE
 # =====================================================================
 def fetch_backtest_data(symbol, timeframe='1h', limit=1000):
     try:
         exchange = ccxt.mexc({'enableRateLimit': True, 'timeout': 20000})
-        ohlcv = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
-        df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
         
-        # Core Indicators
+        # Paginated fetch to bypass MEXC 1000-candle hard limit
+        all_ohlcv = []
+        fetch_limit = min(limit, 1000)
+        since = None
+        
+        # Determine starting timestamp if limit > 1000
+        if limit > 1000:
+            now_ms = exchange.milliseconds()
+            tf_ms = 3600 * 1000  # 1h in ms
+            since = now_ms - (limit * tf_ms)
+
+        while len(all_ohlcv) < limit:
+            ohlcv = exchange.fetch_ohlcv(symbol, timeframe=timeframe, since=since, limit=fetch_limit)
+            if not ohlcv:
+                break
+            all_ohlcv.extend(ohlcv)
+            since = ohlcv[-1][0] + 1
+            if len(ohlcv) < fetch_limit:
+                break
+            time.sleep(0.1)
+
+        df = pd.DataFrame(all_ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+        df.drop_duplicates(subset=['timestamp'], inplace=True)
+        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+        df.sort_values('timestamp', inplace=True)
+        df.reset_index(drop=True, inplace=True)
+
+        # Force numerical types
+        for col in ['open', 'high', 'low', 'close', 'volume']:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+
+        # Compute Technical Indicators
         df['tema_200'] = ta.tema(df['close'], length=200)
         df['atr'] = ta.atr(df['high'], df['low'], df['close'], length=14)
         
-        # Explicit ADX Extraction
         adx_df = ta.adx(df['high'], df['low'], df['close'], length=14)
         if adx_df is not None and not adx_df.empty:
             adx_cols = [c for c in adx_df.columns if c.startswith('ADX_')]
-            if adx_cols:
-                df['adx'] = adx_df[adx_cols[0]]
-            else:
-                df['adx'] = adx_df.iloc[:, 0]
+            df['adx'] = adx_df[adx_cols[0]] if adx_cols else adx_df.iloc[:, 0]
         else:
             df['adx'] = 25.0
             
@@ -116,7 +142,7 @@ def run_backtest_simulation(symbol, df, risk_pct=1.0, initial_capital=1000.0, pr
 
     clean_df = df.dropna(subset=['tema_200', 'atr']).copy().reset_index(drop=True)
     if clean_df.empty:
-        return None, None, {}
+        return None, None, {"error": "All rows dropped during TEMA 200 warmup."}
 
     trades = []
     capital = initial_capital
@@ -129,6 +155,7 @@ def run_backtest_simulation(symbol, df, risk_pct=1.0, initial_capital=1000.0, pr
 
     min_proximities = []
     adx_values = []
+    atr_pct_values = []
 
     for i in range(len(clean_df)):
         current_row = clean_df.iloc[i]
@@ -142,17 +169,19 @@ def run_backtest_simulation(symbol, df, risk_pct=1.0, initial_capital=1000.0, pr
         if pd.isna(tema_p) or pd.isna(atr_p):
             continue
 
-        # Track stats for diagnostic feedback
+        # Proximity Checks
         dist_close_pct = abs(close_p - tema_p) / tema_p * 100.0
         dist_low_pct = abs(low_p - tema_p) / tema_p * 100.0
         dist_high_pct = abs(high_p - tema_p) / tema_p * 100.0
         min_dist = min(dist_close_pct, dist_low_pct, dist_high_pct)
-        
+        atr_pct = (atr_p / close_p) * 100.0 if close_p > 0 else 0.0
+
         min_proximities.append(min_dist)
         adx_values.append(adx_p)
+        atr_pct_values.append(atr_pct)
 
         if in_trade:
-            # Check Stop Loss
+            # Stop Loss Check
             if low_p <= stop_loss:
                 pnl = -risk_usd
                 capital += pnl
@@ -167,7 +196,7 @@ def run_backtest_simulation(symbol, df, risk_pct=1.0, initial_capital=1000.0, pr
                     "Capital ($)": round(capital, 2)
                 })
                 in_trade = False
-            # Check Take Profit 2
+            # Take Profit 2 Check
             elif high_p >= tp2:
                 pnl = risk_usd * 2.0
                 capital += pnl
@@ -183,9 +212,6 @@ def run_backtest_simulation(symbol, df, risk_pct=1.0, initial_capital=1000.0, pr
                 })
                 in_trade = False
         else:
-            atr_pct = (atr_p / close_p) * 100.0 if close_p > 0 else 0.0
-            
-            # Filter condition
             filters_passed = True
             if use_filters:
                 if adx_p < min_adx or atr_pct < min_atr_pct:
@@ -199,11 +225,30 @@ def run_backtest_simulation(symbol, df, risk_pct=1.0, initial_capital=1000.0, pr
                 tp2 = entry_price + (3.0 * atr_p)
                 risk_usd = capital * (risk_pct / 100.0)
 
+    # Force close open position at the final candle
+    if in_trade and len(clean_df) > 0:
+        last_row = clean_df.iloc[-1]
+        exit_p = float(last_row['close'])
+        pnl = ((exit_p - entry_price) / entry_price) * risk_usd
+        capital += pnl
+        trades.append({
+            "Timestamp": last_row['timestamp'],
+            "Symbol": symbol,
+            "Type": "LONG",
+            "Entry": round(entry_price, 4),
+            "Exit": round(exit_p, 4),
+            "Result": "ACTIVE_AT_END",
+            "PnL ($)": round(pnl, 2),
+            "Capital ($)": round(capital, 2)
+        })
+
     trades_df = pd.DataFrame(trades)
     diagnostics = {
-        "min_proximity_found": round(min(min_proximities), 2) if min_proximities else None,
-        "avg_proximity_found": round(sum(min_proximities) / len(min_proximities), 2) if min_proximities else None,
+        "raw_candles_fetched": len(df),
+        "valid_candles_tested": len(clean_df),
+        "closest_proximity_found": round(min(min_proximities), 2) if min_proximities else None,
         "max_adx_found": round(max(adx_values), 2) if adx_values else None,
+        "max_atr_pct_found": round(max(atr_pct_values), 2) if atr_pct_values else None,
     }
     return trades_df, capital, diagnostics
 
@@ -218,7 +263,7 @@ config = load_config()
 
 account_balance = st.sidebar.number_input("Account Balance ($)", value=float(config.get("account_balance", 1000.0)), step=100.0)
 risk_pct = st.sidebar.number_input("Risk Per Trade (%)", value=float(config.get("risk_pct", 1.0)), step=0.25)
-proximity_threshold = st.sidebar.number_input("Proximity Threshold (%)", value=float(config.get("proximity_threshold_pct", 1.5)), step=0.1)
+proximity_threshold = st.sidebar.number_input("Proximity Threshold (%)", value=float(config.get("proximity_threshold_pct", 3.0)), step=0.1)
 min_adx = st.sidebar.number_input("Min ADX Filter", value=float(config.get("min_adx", 18.0)), step=1.0)
 min_atr_pct = st.sidebar.number_input("Min ATR % Filter", value=float(config.get("min_atr_pct", 0.4)), step=0.1)
 scan_interval = st.sidebar.number_input("Scan Interval (Mins)", value=int(config.get("scan_interval_minutes", 15)), step=1)
@@ -342,7 +387,7 @@ with tab4:
 
     b_col1, b_col2, b_col3 = st.columns(3)
     
-    active_watchlist = config.get("watchlist", ["NEAR/USDT"])
+    active_watchlist = config.get("watchlist", ["XRP/USDT", "NEAR/USDT"])
     selected_preset = b_col1.selectbox("Select Target Pair", ["Custom Symbol..."] + active_watchlist)
     
     if selected_preset == "Custom Symbol...":
@@ -350,7 +395,7 @@ with tab4:
     else:
         bt_symbol = selected_preset
 
-    bt_candles = b_col2.slider("Candle Lookback (1H)", min_value=200, max_value=2000, value=1000, step=100)
+    bt_candles = b_col2.slider("Candle Lookback (1H)", min_value=200, max_value=2000, value=2000, step=100)
     bt_capital = b_col3.number_input("Starting Capital ($)", value=1000.0, step=100.0)
 
     use_regime_filters = st.checkbox("Enforce ADX & ATR Filters in Backtest", value=False, help="Uncheck to test pure structural proximity without indicator restrictions.")
@@ -387,8 +432,9 @@ with tab4:
                     st.dataframe(results_df.sort_index(ascending=False), use_container_width=True)
                 else:
                     st.warning(f"No structural triggers matched for {bt_symbol} during the selected historical window.")
-                    if diag:
-                        st.info(f"🔍 **Data Diagnostics ({bt_symbol}):**\n"
-                                f"- Closest Distance to 200 TEMA: **{diag.get('min_proximity_found')}%** (Your Threshold: {proximity_threshold}%)\n"
-                                f"- Max ADX Value Found: **{diag.get('max_adx_found')}** (Your Filter: {min_adx})\n"
-                                f"💡 *Try increasing Candle Lookback to 1000+ or unchecking 'Enforce ADX & ATR Filters' above.*")
+                    st.info(f"🔍 **Data Diagnostics ({bt_symbol}):**\n"
+                            f"- Raw Candles Fetched: **{diag.get('raw_candles_fetched')}**\n"
+                            f"- Valid Candles Tested (after TEMA 200 warmup): **{diag.get('valid_candles_tested')}**\n"
+                            f"- Closest Distance to 200 TEMA: **{diag.get('closest_proximity_found')}%** (Your Threshold: {proximity_threshold}%)\n"
+                            f"- Max ADX Value: **{diag.get('max_adx_found')}** (Filter: {min_adx})\n"
+                            f"- Max ATR %: **{diag.get('max_atr_pct_found')}%** (Filter: {min_atr_pct}%)\n")
