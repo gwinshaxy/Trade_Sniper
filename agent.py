@@ -21,8 +21,8 @@ def load_config():
         default_config = {
             "account_balance": 1000.0,
             "risk_pct": 1.0,
-            "proximity_threshold_pct": 1.5,
-            "min_adx": 18.0,
+            "proximity_threshold_pct": 2.0,
+            "min_adx": 20.0,
             "min_atr_pct": 0.4,
             "scan_interval_minutes": 15,
             "alert_cooldown_hours": 4,
@@ -32,7 +32,8 @@ def load_config():
                 "PENDLE/USDT",
                 "LINK/USDT",
                 "TIA/USDT",
-                "NEAR/USDT"
+                "NEAR/USDT",
+                "SYRUP/USDT"
             ]
         }
         with open(CONFIG_FILE, "w", encoding="utf-8") as f:
@@ -104,19 +105,19 @@ def fetch_market_data(symbol, timeframe='1h', limit=500):
         print(f"Error fetching data for {symbol}: {e}")
         return None
 
-    if not ohlcv or len(ohlcv) < 200:
-        print(f"Insufficient candle history for {symbol}.")
+    if not ohlcv or len(ohlcv) < 10:
         return None
 
     df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
     df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
     
-    try:
-        df['tema_200'] = ta.tema(df['close'], length=200)
-        if df['tema_200'].dropna().empty:
+    if len(df) >= 200:
+        try:
+            df['tema_200'] = ta.tema(df['close'], length=200)
+            if df['tema_200'].dropna().empty:
+                df['tema_200'] = calculate_native_tema(df, length=200)
+        except Exception:
             df['tema_200'] = calculate_native_tema(df, length=200)
-    except Exception:
-        df['tema_200'] = calculate_native_tema(df, length=200)
         
     return df
 
@@ -153,7 +154,7 @@ def safe_format(value):
     return f"${value:.4f}"
 
 # =====================================================================
-# ACTIVE TRADE EVALUATOR ENGINE
+# ACTIVE TRADE EVALUATOR ENGINE (TYPE-SAFE & DYNAMIC LOOKBACK)
 # =====================================================================
 async def evaluate_active_trades(bot, chat_id, config):
     journal_file = config.get("journal_file", "trade_journal.csv")
@@ -166,8 +167,14 @@ async def evaluate_active_trades(bot, chat_id, config):
         print(f"Error reading journal for evaluation: {e}")
         return
 
-    if 'Status' not in df.columns:
+    if 'Status' not in df.columns or df.empty:
         return
+
+    # Force string/mixed columns to 'object' dtype to prevent assignment crashes
+    string_cols = ['Status', 'Exit_Price', 'Closed_Timestamp', 'Realized_PnL_USD', 'Realized_R']
+    for col in string_cols:
+        if col in df.columns:
+            df[col] = df[col].astype('object')
 
     open_mask = df['Status'].isin(['OPEN', 'TP1_HIT'])
     if not open_mask.any():
@@ -177,79 +184,97 @@ async def evaluate_active_trades(bot, chat_id, config):
     updated = False
 
     for idx, row in df[open_mask].iterrows():
-        symbol = str(row['Symbol'])
-        entry = float(row['Entry_Price'])
-        sl = float(row['Stop_Loss'])
-        tp1 = float(row['Take_Profit_1'])
-        tp2 = float(row['Take_Profit_2'])
-        risk_usd = float(row['Max_Risk_USD'])
-        current_status = str(row['Status'])
-
-        df_candles = fetch_market_data(symbol, timeframe='15m', limit=10)
-        if df_candles is None or df_candles.empty:
-            continue
-
-        latest_low = df_candles['low'].min()
-        latest_high = df_candles['high'].max()
-        close_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-        # 1. Check Stop Loss
-        if latest_low <= sl:
-            pnl_usd = -risk_usd
-            realized_r = -1.0
+        try:
+            symbol = str(row['Symbol'])
+            entry = float(row['Entry_Price'])
+            sl = float(row['Stop_Loss'])
+            tp1 = float(row['Take_Profit_1'])
+            tp2 = float(row['Take_Profit_2'])
+            risk_usd = float(row['Max_Risk_USD'])
+            current_status = str(row['Status'])
+            trade_time_str = str(row['Timestamp'])
             
-            df.at[idx, 'Status'] = 'STOPPED_OUT'
-            df.at[idx, 'Exit_Price'] = f"{sl:.4f}"
-            df.at[idx, 'Closed_Timestamp'] = close_time
-            df.at[idx, 'Realized_PnL_USD'] = f"{pnl_usd:.2f}"
-            df.at[idx, 'Realized_R'] = f"{realized_r:.2f}"
-            updated = True
-
-            if bot and chat_id:
-                msg = (
-                    f"🛑 **TRADE STOPPED OUT: {symbol}** 🛑\n\n"
-                    f"• Exit Price: `${sl:.4f}`\n"
-                    f"• Realized PnL: `${pnl_usd:.2f}` (-1.0R)\n"
-                    f"• Timestamp: `{close_time}`"
-                )
-                await bot.send_message(chat_id=chat_id, text=msg, parse_mode="Markdown")
-
-        # 2. Check Take Profit 2
-        elif latest_high >= tp2:
-            r_multiple = abs(tp2 - entry) / abs(entry - sl) if abs(entry - sl) > 0 else 0
-            pnl_usd = risk_usd * r_multiple
-
-            df.at[idx, 'Status'] = 'CLOSED_TP2'
-            df.at[idx, 'Exit_Price'] = f"{tp2:.4f}"
-            df.at[idx, 'Closed_Timestamp'] = close_time
-            df.at[idx, 'Realized_PnL_USD'] = f"{pnl_usd:.2f}"
-            df.at[idx, 'Realized_R'] = f"{r_multiple:.2f}"
-            updated = True
-
-            if bot and chat_id:
-                msg = (
-                    f"🎯 **FULL TARGET HIT (TP2): {symbol}** 🎯\n\n"
-                    f"• Target Price: `${tp2:.4f}`\n"
-                    f"• Realized PnL: `+${pnl_usd:.2f}` (+{r_multiple:.2f}R)\n"
-                    f"• Timestamp: `{close_time}`"
-                )
-                await bot.send_message(chat_id=chat_id, text=msg, parse_mode="Markdown")
-
-        # 3. Check Take Profit 1
-        elif latest_high >= tp1 and current_status == 'OPEN':
-            r_multiple = abs(tp1 - entry) / abs(entry - sl) if abs(entry - sl) > 0 else 0
+            # Calculate elapsed time to fetch sufficient 15m candles
+            trade_dt = datetime.strptime(trade_time_str, "%Y-%m-%d %H:%M:%S")
+            hours_elapsed = (datetime.now() - trade_dt).total_seconds() / 3600
             
-            df.at[idx, 'Status'] = 'TP1_HIT'
-            updated = True
+            # Dynamically calculate required 15m candles
+            candles_needed = max(50, int(hours_elapsed * 4) + 10)
+            candles_needed = min(candles_needed, 1000)
 
-            if bot and chat_id:
-                msg = (
-                    f"✅ **FIRST TARGET REACHED (TP1): {symbol}** ✅\n\n"
-                    f"• Milestone Price: `${tp1:.4f}`\n"
-                    f"• Un-realized Gain: `+{r_multiple:.2f}R`\n"
-                    f"• Status: Stop Loss moved to Breakeven (${entry:.4f})"
-                )
-                await bot.send_message(chat_id=chat_id, text=msg, parse_mode="Markdown")
+            df_candles = fetch_market_data(symbol, timeframe='15m', limit=candles_needed)
+            if df_candles is None or df_candles.empty:
+                continue
+
+            # Filter candles occurring AFTER trade entry timestamp
+            df_candles = df_candles[df_candles['timestamp'] >= trade_dt]
+            if df_candles.empty:
+                continue
+
+            latest_low = df_candles['low'].min()
+            latest_high = df_candles['high'].max()
+            close_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+            # 1. Check Stop Loss
+            if latest_low <= sl:
+                pnl_usd = -risk_usd
+                realized_r = -1.0
+                
+                df.at[idx, 'Status'] = 'STOPPED_OUT'
+                df.at[idx, 'Exit_Price'] = f"{sl:.4f}"
+                df.at[idx, 'Closed_Timestamp'] = str(close_time)
+                df.at[idx, 'Realized_PnL_USD'] = f"{pnl_usd:.2f}"
+                df.at[idx, 'Realized_R'] = f"{realized_r:.2f}"
+                updated = True
+
+                if bot and chat_id:
+                    msg = (
+                        f"🛑 **TRADE STOPPED OUT: {symbol}** 🛑\n\n"
+                        f"• Exit Price: `${sl:.4f}`\n"
+                        f"• Realized PnL: `${pnl_usd:.2f}` (-1.0R)\n"
+                        f"• Timestamp: `{close_time}`"
+                    )
+                    await bot.send_message(chat_id=chat_id, text=msg, parse_mode="Markdown")
+
+            # 2. Check Take Profit 2
+            elif latest_high >= tp2:
+                r_multiple = abs(tp2 - entry) / abs(entry - sl) if abs(entry - sl) > 0 else 0
+                pnl_usd = risk_usd * r_multiple
+
+                df.at[idx, 'Status'] = 'CLOSED_TP2'
+                df.at[idx, 'Exit_Price'] = f"{tp2:.4f}"
+                df.at[idx, 'Closed_Timestamp'] = str(close_time)
+                df.at[idx, 'Realized_PnL_USD'] = f"{pnl_usd:.2f}"
+                df.at[idx, 'Realized_R'] = f"{r_multiple:.2f}"
+                updated = True
+
+                if bot and chat_id:
+                    msg = (
+                        f"🎯 **FULL TARGET HIT (TP2): {symbol}** 🎯\n\n"
+                        f"• Target Price: `${tp2:.4f}`\n"
+                        f"• Realized PnL: `+${pnl_usd:.2f}` (+{r_multiple:.2f}R)\n"
+                        f"• Timestamp: `{close_time}`"
+                    )
+                    await bot.send_message(chat_id=chat_id, text=msg, parse_mode="Markdown")
+
+            # 3. Check Take Profit 1
+            elif latest_high >= tp1 and current_status == 'OPEN':
+                r_multiple = abs(tp1 - entry) / abs(entry - sl) if abs(entry - sl) > 0 else 0
+                
+                df.at[idx, 'Status'] = 'TP1_HIT'
+                updated = True
+
+                if bot and chat_id:
+                    msg = (
+                        f"✅ **FIRST TARGET REACHED (TP1): {symbol}** ✅\n\n"
+                        f"• Milestone Price: `${tp1:.4f}`\n"
+                        f"• Un-realized Gain: `+{r_multiple:.2f}R`\n"
+                        f"• Status: Stop Loss moved to Breakeven (${entry:.4f})"
+                    )
+                    await bot.send_message(chat_id=chat_id, text=msg, parse_mode="Markdown")
+
+        except Exception as e:
+            print(f"Error evaluating row {idx} for {symbol}: {e}")
 
     if updated:
         df.to_csv(journal_file, index=False)
@@ -263,7 +288,7 @@ async def analyze_symbol(symbol, bot, chat_id, config):
     
     account_balance = config.get("account_balance", 1000.0)
     risk_pct = config.get("risk_pct", 1.0)
-    proximity_threshold = config.get("proximity_threshold_pct", 1.5)
+    proximity_threshold = config.get("proximity_threshold_pct", 2.0)
     cooldown_hours = config.get("alert_cooldown_hours", 4)
     journal_file = config.get("journal_file", "trade_journal.csv")
     
@@ -307,15 +332,13 @@ async def analyze_symbol(symbol, bot, chat_id, config):
 
     print(f"🎯 TRIGGER MATCH for {symbol}: {', '.join(triggered_reasons)}")
 
-    # Core Structural Calculations (LONG Bias Alignment)
+    # Structural Calculations
     direction = "LONG"
     entry_price = current_price
     
-    # ATR/Structure Stop Loss
     atr_val = ta.atr(df_1h['high'], df_1h['low'], df_1h['close'], length=14).iloc[-1]
     stop_loss = entry_price - (1.5 * atr_val) if not pd.isna(atr_val) else entry_price * 0.985
     
-    # Structural Targets
     tp1 = hvn_prices[0] if hvn_prices and hvn_prices[0] > entry_price else entry_price * 1.03
     tp2 = poc_price if poc_price > entry_price else entry_price * 1.05
 
@@ -333,7 +356,7 @@ async def analyze_symbol(symbol, bot, chat_id, config):
 
     last_alert_time[symbol] = current_time
 
-    # Telegram Alert Formatting (Matches your screenshot exactly)
+    # Telegram Alert Formatting
     reasons_text = "\n".join([f"• {r}" for r in triggered_reasons])
     message = (
         f"🎯 **PROXIMITY ALERT: {symbol}** 🎯\n\n"

@@ -4,9 +4,12 @@ import time
 import warnings
 import requests
 import pandas as pd
+import numpy as np
 import pandas_ta as ta
 import streamlit as st
 import streamlit.components.v1 as components
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 
 # Suppress minor library warnings for clean UI log outputs
 warnings.filterwarnings("ignore", category=UserWarning)
@@ -64,10 +67,12 @@ def save_config(config_data: dict):
     except Exception as e:
         st.sidebar.error(f"Failed to save configuration: {e}")
 
+@st.cache_data(ttl=5)
 def load_journal() -> pd.DataFrame:
     if os.path.exists(JOURNAL_FILE):
         try:
-            df = pd.read_csv(JOURNAL_FILE)
+            df = pd.read_csv(JOURNAL_FILE, na_values=["—", "-", "N/A", "nan", "None", ""])
+            
             expected_cols = [
                 "Timestamp", "Symbol", "Trigger_Reason", "Entry_Price", 
                 "Stop_Loss", "Take_Profit_1", "Take_Profit_2", "Position_USDT", 
@@ -76,7 +81,21 @@ def load_journal() -> pd.DataFrame:
             ]
             for col in expected_cols:
                 if col not in df.columns:
-                    df[col] = None
+                    df[col] = np.nan
+
+            numeric_cols = [
+                "Entry_Price", "Stop_Loss", "Take_Profit_1", "Take_Profit_2", 
+                "Position_USDT", "Max_Risk_USD", "Exit_Price", "Realized_PnL_USD", "Realized_R"
+            ]
+            for col in numeric_cols:
+                if col in df.columns:
+                    df[col] = pd.to_numeric(df[col], errors='coerce')
+
+            string_cols = ["Timestamp", "Symbol", "Trigger_Reason", "Status", "Closed_Timestamp"]
+            for col in string_cols:
+                if col in df.columns:
+                    df[col] = df[col].astype(str).replace({'nan': '', 'None': ''})
+
             return df
         except Exception as e:
             st.error(f"Error loading trade journal: {e}")
@@ -87,19 +106,14 @@ def load_journal() -> pd.DataFrame:
 # DATA FETCHING & TECHNICAL ENGINE
 # =====================================================================
 def sanitize_symbol(raw_symbol: str) -> str:
-    """Formats ticker strings so APIs can recognize them properly."""
     clean = raw_symbol.strip().upper()
     if "/" not in clean and clean.endswith("USDT"):
         clean = clean[:-4] + "/USDT"
     return clean
 
 def fetch_backtest_data(symbol: str, timeframe='1h', limit=1000):
-    """
-    Fetches historical OHLCV data using direct public REST endpoints.
-    Bypasses library overhead and cloud proxy restrictions on Render.
-    """
     formatted_symbol = sanitize_symbol(symbol).replace('/', '').upper()
-    fetch_limit = min(limit, 1000)
+    fetch_limit = max(limit, 1000)
     
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
@@ -109,7 +123,6 @@ def fetch_backtest_data(symbol: str, timeframe='1h', limit=1000):
     raw_candles = None
     provider = None
 
-    # Endpoint 1: Binance Global
     try:
         url = f"https://api.binance.com/api/v3/klines?symbol={formatted_symbol}&interval={timeframe}&limit={fetch_limit}"
         res = requests.get(url, headers=headers, timeout=8)
@@ -121,7 +134,6 @@ def fetch_backtest_data(symbol: str, timeframe='1h', limit=1000):
     except Exception:
         pass
 
-    # Endpoint 2: Binance US (Bypasses global cloud IP blocks)
     if not raw_candles:
         try:
             url = f"https://api.binance.us/api/v3/klines?symbol={formatted_symbol}&interval={timeframe}&limit={fetch_limit}"
@@ -134,7 +146,6 @@ def fetch_backtest_data(symbol: str, timeframe='1h', limit=1000):
         except Exception:
             pass
 
-    # Endpoint 3: Bybit Public REST
     if not raw_candles:
         try:
             url = f"https://api.bybit.com/v5/market/kline?category=spot&symbol={formatted_symbol}&interval=60&limit={fetch_limit}"
@@ -142,24 +153,9 @@ def fetch_backtest_data(symbol: str, timeframe='1h', limit=1000):
             if res.status_code == 200:
                 data = res.json()
                 if data.get('retCode') == 0 and len(data['result']['list']) > 0:
-                    klist = data['result']['list'][::-1]  # Reverse to chronological order
+                    klist = data['result']['list'][::-1]
                     raw_candles = [[float(c[0]), c[1], c[2], c[3], c[4], c[5]] for c in klist]
                     provider = "Bybit REST"
-        except Exception:
-            pass
-
-    # Endpoint 4: Gate.io Fallback
-    if not raw_candles:
-        try:
-            gate_symbol = formatted_symbol.replace("USDT", "_USDT")
-            url = f"https://api.gateio.ws/api/v4/spot/candlesticks?currency_pair={gate_symbol}&interval=1h&limit={fetch_limit}"
-            res = requests.get(url, headers=headers, timeout=8)
-            if res.status_code == 200:
-                data = res.json()
-                if isinstance(data, list) and len(data) > 0:
-                    # Gate returns [timestamp, volume, close, high, low, open]
-                    raw_candles = [[int(c[0]) * 1000, c[5], c[3], c[4], c[2], c[1]] for c in data]
-                    provider = "Gate.io REST"
         except Exception:
             pass
 
@@ -167,18 +163,15 @@ def fetch_backtest_data(symbol: str, timeframe='1h', limit=1000):
         st.error(f"Unable to fetch history for {symbol} across public endpoints.")
         return None
 
-    # Construct DataFrame
     df = pd.DataFrame(raw_candles, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
     df['timestamp'] = pd.to_datetime(pd.to_numeric(df['timestamp']), unit='ms')
     df.drop_duplicates(subset=['timestamp'], inplace=True)
     df.sort_values('timestamp', inplace=True)
     df.reset_index(drop=True, inplace=True)
 
-    # Cast price columns strictly to float64
     for col in ['open', 'high', 'low', 'close', 'volume']:
         df[col] = pd.to_numeric(df[col], errors='coerce').astype('float64')
 
-    # Calculate Indicators
     df['tema_200'] = ta.tema(df['close'], length=200)
     df['atr'] = ta.atr(df['high'], df['low'], df['close'], length=14)
     
@@ -196,7 +189,6 @@ def run_backtest_simulation(symbol, df, risk_pct=1.0, initial_capital=1000.0, pr
     if df is None or df.empty or 'tema_200' not in df.columns:
         return None, None, {"error": "DataFrame is uninitialized or missing TEMA."}
 
-    # Drop early indicator warmup rows
     clean_df = df.dropna(subset=['tema_200', 'atr']).copy().reset_index(drop=True)
     if clean_df.empty:
         return None, None, {"error": "All rows dropped during TEMA 200 warmup window."}
@@ -226,7 +218,6 @@ def run_backtest_simulation(symbol, df, risk_pct=1.0, initial_capital=1000.0, pr
         if pd.isna(tema_p) or pd.isna(atr_p) or tema_p == 0:
             continue
 
-        # Proximity Calculations
         dist_close_pct = abs(close_p - tema_p) / tema_p * 100.0
         dist_low_pct = abs(low_p - tema_p) / tema_p * 100.0
         dist_high_pct = abs(high_p - tema_p) / tema_p * 100.0
@@ -238,7 +229,6 @@ def run_backtest_simulation(symbol, df, risk_pct=1.0, initial_capital=1000.0, pr
         atr_pct_values.append(atr_pct)
 
         if in_trade:
-            # Check Stop Loss
             if low_p <= stop_loss:
                 pnl = -risk_usd
                 capital += pnl
@@ -254,7 +244,6 @@ def run_backtest_simulation(symbol, df, risk_pct=1.0, initial_capital=1000.0, pr
                 })
                 in_trade = False
 
-            # Check Take Profit 2
             elif high_p >= tp2:
                 pnl = risk_usd * 2.0
                 capital += pnl
@@ -275,7 +264,6 @@ def run_backtest_simulation(symbol, df, risk_pct=1.0, initial_capital=1000.0, pr
                 if adx_p < min_adx or atr_pct < min_atr_pct:
                     filters_passed = False
 
-            # Check Entry Condition
             if min_dist <= proximity_pct and filters_passed:
                 in_trade = True
                 entry_price = close_p
@@ -284,7 +272,6 @@ def run_backtest_simulation(symbol, df, risk_pct=1.0, initial_capital=1000.0, pr
                 tp2 = entry_price + (3.0 * atr_p)
                 risk_usd = capital * (risk_pct / 100.0)
 
-    # Force-close active trade on last candle
     if in_trade and len(clean_df) > 0:
         last_row = clean_df.iloc[-1]
         exit_p = float(last_row['close'])
@@ -333,7 +320,7 @@ st.sidebar.markdown("---")
 st.sidebar.subheader("📌 Watchlist Manager")
 
 custom_symbol_input = st.sidebar.text_input("Add Single Symbol (e.g., SOL/USDT)", "").strip().upper()
-if st.sidebar.button("➕ Add to Watchlist", use_container_width=True):
+if st.sidebar.button("➕ Add to Watchlist"):
     if custom_symbol_input:
         formatted = sanitize_symbol(custom_symbol_input)
         current_list = config.get("watchlist", [])
@@ -347,7 +334,7 @@ if st.sidebar.button("➕ Add to Watchlist", use_container_width=True):
 
 watchlist_str = st.sidebar.text_area("Active Watchlist (Comma Separated)", value=", ".join(config.get("watchlist", [])))
 
-if st.sidebar.button("💾 Save All Settings", use_container_width=True):
+if st.sidebar.button("💾 Save All Settings"):
     updated_watchlist = [sanitize_symbol(symbol) for symbol in watchlist_str.split(",") if symbol.strip()]
     updated_config = {
         "account_balance": account_balance,
@@ -391,41 +378,241 @@ with tab1:
         col4.metric("Risk Setting", f"{risk_pct}% / Trade")
 
         st.markdown("---")
-        display_df = journal_df.fillna("—").sort_index(ascending=False)
-        st.dataframe(display_df, use_container_width=True)
+        display_df = journal_df.sort_index(ascending=False)
+        st.dataframe(display_df, hide_index=True)
     else:
         st.info("No trades logged in `trade_journal.csv` yet. Signals will display here as they trigger.")
 
 # --- TAB 2: CHARTING ---
 with tab2:
-    st.subheader("📈 TradingView Live Charting")
+    st.subheader("📈 Interactive Strategy Charting")
     selected_symbol = st.selectbox("Select Pair to Chart", config.get("watchlist", ["NEAR/USDT"]))
-    tv_symbol = f"MEXC:{selected_symbol.replace('/', '')}"
     
-    tradingview_html = f"""
-    <div class="tradingview-widget-container" style="height:100%;width:100%">
-      <div id="tradingview_chart" style="height:550px;width:100%"></div>
-      <script type="text/javascript" src="https://s3.tradingview.com/tv.js"></script>
-      <script type="text/javascript">
-      new TradingView.widget(
-      {{
-        "autosize": true,
-        "symbol": "{tv_symbol}",
-        "interval": "60",
-        "timezone": "Etc/UTC",
-        "theme": "dark",
-        "style": "1",
-        "locale": "en",
-        "enable_publishing": false,
-        "hide_legend": false,
-        "save_image": false,
-        "container_id": "tradingview_chart"
-      }}
-      );
-      </script>
-    </div>
-    """
-    components.html(tradingview_html, height=560, scrolling=False)
+    col_tf, col_candles = st.columns(2)
+    chart_tf = col_tf.selectbox("Timeframe", ["15m", "1h", "4h", "1d"], index=1)
+    chart_limit = col_candles.slider("Candle Limit", min_value=50, max_value=500, value=150, step=25)
+
+    if st.button("🔄 Refresh Chart Data", key="refresh_chart"):
+        st.rerun()
+
+    with st.spinner(f"Loading live chart for {selected_symbol}..."):
+        df_full = fetch_backtest_data(selected_symbol, timeframe=chart_tf, limit=1000)
+
+    if df_full is not None and not df_full.empty:
+        df_full['tema_200'] = ta.tema(df_full['close'], length=200)
+
+        df_chart = df_full.tail(chart_limit).copy().reset_index(drop=True)
+
+        # Get latest values for metrics display
+        latest_row = df_chart.iloc[-1]
+        prev_row = df_chart.iloc[-2] if len(df_chart) > 1 else latest_row
+        
+        curr_price = float(latest_row['close'])
+        prev_price = float(prev_row['close'])
+        price_change_pct = ((curr_price - prev_price) / prev_price) * 100.0 if prev_price > 0 else 0.0
+        
+        curr_tema = float(latest_row['tema_200']) if not pd.isna(latest_row['tema_200']) else 0.0
+        curr_adx = float(latest_row.get('adx', 0.0)) if not pd.isna(latest_row.get('adx')) else 0.0
+        curr_atr = float(latest_row.get('atr', 0.0)) if not pd.isna(latest_row.get('atr')) else 0.0
+        curr_atr_pct = (curr_atr / curr_price) * 100.0 if curr_price > 0 else 0.0
+        
+        proximity_pct = (abs(curr_price - curr_tema) / curr_tema) * 100.0 if curr_tema > 0 else 0.0
+
+        # Live Metric Cards Above Chart
+        m_col1, m_col2, m_col3, m_col4, m_col5 = st.columns(5)
+        m_col1.metric("Current Price", f"${curr_price:.4f}", f"{price_change_pct:+.2f}%")
+        m_col2.metric("200 TEMA", f"${curr_tema:.4f}")
+        m_col3.metric("TEMA Proximity", f"{proximity_pct:.2f}%")
+        m_col4.metric("ADX (14)", f"{curr_adx:.2f}")
+        m_col5.metric("ATR %", f"{curr_atr_pct:.2f}%")
+
+        fig = make_subplots(
+            rows=2, cols=1, 
+            shared_xaxes=True, 
+            vertical_spacing=0.08, 
+            subplot_titles=(f"{selected_symbol} ({chart_tf.upper()}) Price, Volume & 200 TEMA", "ADX Trend Strength Indicator"),
+            row_heights=[0.7, 0.3],
+            specs=[[{"secondary_y": True}], [{"secondary_y": False}]]
+        )
+
+        # 1. Candlesticks
+        fig.add_trace(
+            go.Candlestick(
+                x=df_chart['timestamp'],
+                open=df_chart['open'],
+                high=df_chart['high'],
+                low=df_chart['low'],
+                close=df_chart['close'],
+                name="OHLC",
+                increasing_line_color='#26a69a', increasing_fillcolor='#26a69a',
+                decreasing_line_color='#ef5350', decreasing_fillcolor='#ef5350'
+            ),
+            row=1, col=1, secondary_y=False
+        )
+
+        # 2. Volume Bars
+        volume_colors = [
+            'rgba(38, 166, 154, 0.35)' if close >= open_p else 'rgba(239, 83, 80, 0.35)'
+            for close, open_p in zip(df_chart['close'], df_chart['open'])
+        ]
+        fig.add_trace(
+            go.Bar(
+                x=df_chart['timestamp'],
+                y=df_chart['volume'],
+                name="Volume",
+                marker_color=volume_colors,
+                showlegend=False
+            ),
+            row=1, col=1, secondary_y=True
+        )
+
+        # 3. 200 TEMA Line
+        if 'tema_200' in df_chart.columns:
+            fig.add_trace(
+                go.Scatter(
+                    x=df_chart['timestamp'],
+                    y=df_chart['tema_200'],
+                    mode='lines',
+                    name='200 TEMA',
+                    line=dict(color='#ff9800', width=2.5),
+                    connectgaps=True
+                ),
+                row=1, col=1, secondary_y=False
+            )
+
+        # 4. ADX Line
+        if 'adx' in df_chart.columns:
+            fig.add_trace(
+                go.Scatter(
+                    x=df_chart['timestamp'],
+                    y=df_chart['adx'],
+                    mode='lines',
+                    name='ADX (14)',
+                    line=dict(color='#29b6f6', width=2.0),
+                    connectgaps=True
+                ),
+                row=2, col=1
+            )
+            fig.add_hline(
+                y=min_adx, 
+                line_dash="dash", 
+                line_color="rgba(255, 152, 0, 0.6)", 
+                row=2, col=1, 
+                annotation_text=f"Min ADX ({min_adx})"
+            )
+
+        # Pin dynamic price & indicator labels to the latest candle on the chart
+        last_time = df_chart['timestamp'].iloc[-1]
+        
+        # Current Price horizontal marker
+        fig.add_hline(
+            y=curr_price, 
+            line_dash="dot", 
+            line_color="#26a69a" if curr_price >= prev_price else "#ef5350", 
+            row=1, col=1, 
+            secondary_y=False
+        )
+        
+        # Floating price label at the tip of the latest candle
+        fig.add_annotation(
+            x=last_time, y=curr_price,
+            text=f" Price: ${curr_price:.4f}",
+            showarrow=True, arrowhead=2, ax=50, ay=0,
+            bgcolor="#26a69a" if curr_price >= prev_price else "#ef5350",
+            font=dict(color="white", size=11),
+            row=1, col=1
+        )
+        
+        # Floating 200 TEMA label at the tip of the TEMA line
+        if curr_tema > 0:
+            fig.add_annotation(
+                x=last_time, y=curr_tema,
+                text=f" TEMA: ${curr_tema:.4f}",
+                showarrow=True, arrowhead=2, ax=50, ay=25,
+                bgcolor="#ff9800",
+                font=dict(color="white", size=11),
+                row=1, col=1
+            )
+
+        # Floating ADX label at the tip of the ADX line
+        if curr_adx > 0:
+            fig.add_annotation(
+                x=last_time, y=curr_adx,
+                text=f" ADX: {curr_adx:.1f}",
+                showarrow=True, arrowhead=2, ax=50, ay=0,
+                bgcolor="#29b6f6",
+                font=dict(color="white", size=10),
+                row=2, col=1
+            )
+
+        fig.update_layout(
+            height=720,
+            margin=dict(l=10, r=60, t=40, b=10),
+            legend=dict(
+                orientation="h",
+                yanchor="bottom",
+                y=1.02,
+                xanchor="right",
+                x=0.85
+            ),
+            paper_bgcolor='rgba(0,0,0,0)',
+            plot_bgcolor='rgba(0,0,0,0)',
+            xaxis_rangeslider_visible=False
+        )
+
+        grid_color = "rgba(128, 128, 128, 0.15)"
+
+        # --- DYNAMIC AUTO-SCALING AXIS SETUP ---
+        # Allow X-axis zooming and panning
+        fig.update_xaxes(
+            showgrid=True, 
+            gridcolor=grid_color, 
+            zeroline=False,
+            fixedrange=False
+        )
+
+        # Enable dynamic Y-autoscale so visible candles fit perfectly upon zoom/scroll
+        fig.update_yaxes(
+            autorange=True,
+            fixedrange=False,
+            showgrid=True, 
+            gridcolor=grid_color, 
+            zeroline=False, 
+            secondary_y=False, 
+            row=1, col=1
+        )
+
+        # Volume secondary Y-axis configuration
+        max_vol = df_chart['volume'].max() if not df_chart['volume'].empty else 1.0
+        fig.update_yaxes(
+            range=[0, max_vol * 4], 
+            showgrid=False, 
+            secondary_y=True, 
+            row=1, col=1
+        )
+
+        # ADX Subplot Y-axis setup
+        fig.update_yaxes(
+            autorange=True,
+            fixedrange=False,
+            showgrid=True, 
+            gridcolor=grid_color, 
+            zeroline=False, 
+            row=2, col=1
+        )
+
+        # Render with scroll zoom and modebar enabled
+        st.plotly_chart(
+            fig, 
+            use_container_width=True,
+            config={
+                'scrollZoom': True,
+                'displayModeBar': True,
+                'displaylogo': False
+            }
+        )
+    else:
+        st.error(f"Failed to render chart data for {selected_symbol}.")
 
 # --- TAB 3: CLOSED TRADES ANALYTICS ---
 with tab3:
@@ -435,7 +622,7 @@ with tab3:
         closed_df = journal_df[journal_df["Status"].isin(["STOPPED_OUT", "CLOSED_TP2"])].dropna(subset=["Status"])
         if not closed_df.empty:
             st.write("### Realized Execution History")
-            st.dataframe(closed_df.fillna("—").sort_index(ascending=False), use_container_width=True)
+            st.dataframe(closed_df.sort_index(ascending=False), hide_index=True)
         else:
             st.info("No trades have hit Stop Loss or TP2 yet.")
     else:
@@ -461,7 +648,7 @@ with tab4:
 
     use_regime_filters = st.checkbox("Enforce ADX & ATR Filters in Backtest", value=False, help="Uncheck to test pure structural proximity without indicator restrictions.")
 
-    if st.button("🚀 Run Strategy Simulation", use_container_width=True):
+    if st.button("🚀 Run Strategy Simulation"):
         with st.spinner(f"Fetching historical data and backtesting {bt_symbol}..."):
             df_bt = fetch_backtest_data(bt_symbol, timeframe='1h', limit=bt_candles)
             
@@ -491,7 +678,7 @@ with tab4:
 
                     st.markdown("---")
                     st.write("### Simulated Trade History")
-                    st.dataframe(results_df.sort_index(ascending=False), use_container_width=True)
+                    st.dataframe(results_df.sort_index(ascending=False), hide_index=True)
                 else:
                     st.warning(f"No structural triggers matched for {bt_symbol} during the selected historical window.")
                     st.info(f"🔍 **Data Diagnostics ({bt_symbol}):**\n"
