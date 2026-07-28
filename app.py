@@ -2,6 +2,7 @@ import os
 import json
 import time
 import warnings
+import csv
 import requests
 import pandas as pd
 import numpy as np
@@ -362,6 +363,22 @@ tab1, tab2, tab3, tab4 = st.tabs([
 # --- TAB 1: LIVE JOURNAL ---
 with tab1:
     st.subheader("📋 Structural Trade Journal & Evaluator")
+    
+    col_title, col_reset = st.columns([0.8, 0.2])
+    with col_reset:
+        if st.button("🗑️ Clear Journal", use_container_width=True):
+            headers = [
+                "Timestamp", "Symbol", "Trigger_Reason", "Entry_Price", 
+                "Stop_Loss", "Take_Profit_1", "Take_Profit_2", "Position_USDT", 
+                "Max_Risk_USD", "Status", "Exit_Price", "Closed_Timestamp", 
+                "Realized_PnL_USD", "Realized_R"
+            ]
+            with open("trade_journal.csv", mode='w', newline='', encoding='utf-8') as f:
+                writer = csv.writer(f)
+                writer.writerow(headers)
+            st.success("Journal cleared!")
+            st.rerun() 
+
     journal_df = load_journal()
 
     if not journal_df.empty:
@@ -563,7 +580,6 @@ with tab2:
         grid_color = "rgba(128, 128, 128, 0.15)"
 
         # --- DYNAMIC AUTO-SCALING AXIS SETUP ---
-        # Allow X-axis zooming and panning
         fig.update_xaxes(
             showgrid=True, 
             gridcolor=grid_color, 
@@ -571,7 +587,6 @@ with tab2:
             fixedrange=False
         )
 
-        # Enable dynamic Y-autoscale so visible candles fit perfectly upon zoom/scroll
         fig.update_yaxes(
             autorange=True,
             fixedrange=False,
