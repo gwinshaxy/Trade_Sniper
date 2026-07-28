@@ -452,29 +452,36 @@ with tab2:
             specs=[[{"secondary_y": True}], [{"secondary_y": False}]]
         )
 
-        # 1. Candlesticks
+        # 1. Solid, High-Visibility Candlesticks
         fig.add_trace(
             go.Candlestick(
-                x=df_chart['timestamp'],
+                x=df_chart['timestamp'].dt.strftime('%Y-%m-%d %H:%M'),
                 open=df_chart['open'],
                 high=df_chart['high'],
                 low=df_chart['low'],
                 close=df_chart['close'],
                 name="OHLC",
-                increasing_line_color='#26a69a', increasing_fillcolor='#26a69a',
-                decreasing_line_color='#ef5350', decreasing_fillcolor='#ef5350'
+                increasing=dict(
+                    fillcolor='#089981', 
+                    line=dict(color='#089981', width=1.5)
+                ),
+                decreasing=dict(
+                    fillcolor='#f23645', 
+                    line=dict(color='#f23645', width=1.5)
+                ),
+                whiskerwidth=0.8
             ),
             row=1, col=1, secondary_y=False
         )
 
         # 2. Volume Bars
         volume_colors = [
-            'rgba(38, 166, 154, 0.35)' if close >= open_p else 'rgba(239, 83, 80, 0.35)'
+            'rgba(8, 153, 129, 0.4)' if close >= open_p else 'rgba(242, 54, 69, 0.4)'
             for close, open_p in zip(df_chart['close'], df_chart['open'])
         ]
         fig.add_trace(
             go.Bar(
-                x=df_chart['timestamp'],
+                x=df_chart['timestamp'].dt.strftime('%Y-%m-%d %H:%M'),
                 y=df_chart['volume'],
                 name="Volume",
                 marker_color=volume_colors,
@@ -487,7 +494,7 @@ with tab2:
         if 'tema_200' in df_chart.columns:
             fig.add_trace(
                 go.Scatter(
-                    x=df_chart['timestamp'],
+                    x=df_chart['timestamp'].dt.strftime('%Y-%m-%d %H:%M'),
                     y=df_chart['tema_200'],
                     mode='lines',
                     name='200 TEMA',
@@ -501,7 +508,7 @@ with tab2:
         if 'adx' in df_chart.columns:
             fig.add_trace(
                 go.Scatter(
-                    x=df_chart['timestamp'],
+                    x=df_chart['timestamp'].dt.strftime('%Y-%m-%d %H:%M'),
                     y=df_chart['adx'],
                     mode='lines',
                     name='ADX (14)',
@@ -518,32 +525,29 @@ with tab2:
                 annotation_text=f"Min ADX ({min_adx})"
             )
 
-        # Pin dynamic price & indicator labels to the latest candle on the chart
-        last_time = df_chart['timestamp'].iloc[-1]
+        # Pin dynamic annotations to the latest candle index
+        last_x_val = df_chart['timestamp'].dt.strftime('%Y-%m-%d %H:%M').iloc[-1]
         
-        # Current Price horizontal marker
         fig.add_hline(
             y=curr_price, 
             line_dash="dot", 
-            line_color="#26a69a" if curr_price >= prev_price else "#ef5350", 
+            line_color="#089981" if curr_price >= prev_price else "#f23645", 
             row=1, col=1, 
             secondary_y=False
         )
         
-        # Floating price label at the tip of the latest candle
         fig.add_annotation(
-            x=last_time, y=curr_price,
+            x=last_x_val, y=curr_price,
             text=f" Price: ${curr_price:.4f}",
             showarrow=True, arrowhead=2, ax=50, ay=0,
-            bgcolor="#26a69a" if curr_price >= prev_price else "#ef5350",
+            bgcolor="#089981" if curr_price >= prev_price else "#f23645",
             font=dict(color="white", size=11),
             row=1, col=1
         )
         
-        # Floating 200 TEMA label at the tip of the TEMA line
         if curr_tema > 0:
             fig.add_annotation(
-                x=last_time, y=curr_tema,
+                x=last_x_val, y=curr_tema,
                 text=f" TEMA: ${curr_tema:.4f}",
                 showarrow=True, arrowhead=2, ax=50, ay=25,
                 bgcolor="#ff9800",
@@ -551,10 +555,9 @@ with tab2:
                 row=1, col=1
             )
 
-        # Floating ADX label at the tip of the ADX line
         if curr_adx > 0:
             fig.add_annotation(
-                x=last_time, y=curr_adx,
+                x=last_x_val, y=curr_adx,
                 text=f" ADX: {curr_adx:.1f}",
                 showarrow=True, arrowhead=2, ax=50, ay=0,
                 bgcolor="#29b6f6",
@@ -584,7 +587,8 @@ with tab2:
             showgrid=True, 
             gridcolor=grid_color, 
             zeroline=False,
-            fixedrange=False
+            fixedrange=False,
+            type='category'  # Ensures rigid spacing for uniform candle bodies
         )
 
         fig.update_yaxes(
