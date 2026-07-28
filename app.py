@@ -452,24 +452,20 @@ with tab2:
             specs=[[{"secondary_y": True}], [{"secondary_y": False}]]
         )
 
-        # 1. Solid, High-Visibility Candlesticks
+        # 1. Properly Scaled Candlesticks (Passing Datetime Objects)
         fig.add_trace(
             go.Candlestick(
-                x=df_chart['timestamp'].dt.strftime('%Y-%m-%d %H:%M'),
+                x=df_chart['timestamp'],
                 open=df_chart['open'],
                 high=df_chart['high'],
                 low=df_chart['low'],
                 close=df_chart['close'],
                 name="OHLC",
-                increasing=dict(
-                    fillcolor='#089981', 
-                    line=dict(color='#089981', width=1.5)
-                ),
-                decreasing=dict(
-                    fillcolor='#f23645', 
-                    line=dict(color='#f23645', width=1.5)
-                ),
-                whiskerwidth=0.8
+                increasing_fillcolor='#089981',
+                increasing_line_color='#089981',
+                decreasing_fillcolor='#f23645',
+                decreasing_line_color='#f23645',
+                line_width=1.2
             ),
             row=1, col=1, secondary_y=False
         )
@@ -481,7 +477,7 @@ with tab2:
         ]
         fig.add_trace(
             go.Bar(
-                x=df_chart['timestamp'].dt.strftime('%Y-%m-%d %H:%M'),
+                x=df_chart['timestamp'],
                 y=df_chart['volume'],
                 name="Volume",
                 marker_color=volume_colors,
@@ -494,7 +490,7 @@ with tab2:
         if 'tema_200' in df_chart.columns:
             fig.add_trace(
                 go.Scatter(
-                    x=df_chart['timestamp'].dt.strftime('%Y-%m-%d %H:%M'),
+                    x=df_chart['timestamp'],
                     y=df_chart['tema_200'],
                     mode='lines',
                     name='200 TEMA',
@@ -508,7 +504,7 @@ with tab2:
         if 'adx' in df_chart.columns:
             fig.add_trace(
                 go.Scatter(
-                    x=df_chart['timestamp'].dt.strftime('%Y-%m-%d %H:%M'),
+                    x=df_chart['timestamp'],
                     y=df_chart['adx'],
                     mode='lines',
                     name='ADX (14)',
@@ -525,8 +521,8 @@ with tab2:
                 annotation_text=f"Min ADX ({min_adx})"
             )
 
-        # Pin dynamic annotations to the latest candle index
-        last_x_val = df_chart['timestamp'].dt.strftime('%Y-%m-%d %H:%M').iloc[-1]
+        # Dynamic Annotations
+        last_x_val = df_chart['timestamp'].iloc[-1]
         
         fig.add_hline(
             y=curr_price, 
@@ -582,13 +578,12 @@ with tab2:
 
         grid_color = "rgba(128, 128, 128, 0.15)"
 
-        # --- DYNAMIC AUTO-SCALING AXIS SETUP ---
+        # Correct Axis Configurations
         fig.update_xaxes(
             showgrid=True, 
             gridcolor=grid_color, 
             zeroline=False,
-            fixedrange=False,
-            type='category'  # Ensures rigid spacing for uniform candle bodies
+            type='date'  # Continuous datetime scaling
         )
 
         fig.update_yaxes(
@@ -620,7 +615,6 @@ with tab2:
             row=2, col=1
         )
 
-        # Render with scroll zoom and modebar enabled
         st.plotly_chart(
             fig, 
             use_container_width=True,
