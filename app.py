@@ -71,11 +71,11 @@ def clear_remote_journal():
             st.error(f"Failed to clear database: {e}")
 
 # =====================================================================
-# MARKET DATA (UNBLOCKED PUBLIC EXCHANGES + PANDAS_TA)
+# MARKET DATA & TECHNICAL INDICATOR CALCULATIONS
 # =====================================================================
 @st.cache_data(ttl=60)
-def fetch_market_data(symbol: str, timeframe: str = "1h", limit: int = 400) -> pd.DataFrame:
-    """Fetches OHLCV market data using Binance public REST API with Gate.io fallback."""
+def fetch_market_data(symbol: str, timeframe: str = "1h", limit: int = 500) -> pd.DataFrame:
+    """Fetches OHLCV market data and calculates 200 TEMA, ADX, and ATR% cleanly."""
     ohlcv = None
     
     # Primary: Binance Public REST Endpoint
@@ -100,18 +100,17 @@ def fetch_market_data(symbol: str, timeframe: str = "1h", limit: int = 400) -> p
     for col in ['open', 'high', 'low', 'close', 'volume']:
         df[col] = pd.to_numeric(df[col], errors='coerce')
         
-    # Sort and remove duplicate timestamps
+    # Drop duplicates and ensure ascending temporal order
     df = df.drop_duplicates(subset=['timestamp']).sort_values('timestamp').reset_index(drop=True)
-    
-    # UNIX timestamp in seconds for TradingView Lightweight Charts
     df['time'] = (df['timestamp'] / 1000).astype(int)
     
-    # Technical Indicators
+    # 1. TEMA 200 Calculation
     try:
         df['tema_200'] = ta.tema(df['close'], length=200)
     except Exception:
         df['tema_200'] = np.nan
         
+    # 2. ADX (14) Calculation
     try:
         adx_df = ta.adx(df['high'], df['low'], df['close'], length=14)
         if adx_df is not None and not adx_df.empty:
@@ -119,15 +118,22 @@ def fetch_market_data(symbol: str, timeframe: str = "1h", limit: int = 400) -> p
     except Exception:
         df['adx'] = 0.0
 
+    # 3. ATR % Calculation
+    try:
+        df['atr'] = ta.atr(df['high'], df['low'], df['close'], length=14)
+        df['atr_pct'] = (df['atr'] / df['close']) * 100
+    except Exception:
+        df['atr_pct'] = 0.0
+
     return df
 
 # =====================================================================
 # TRADINGVIEW LIGHTWEIGHT CHARTS HTML RENDERER
 # =====================================================================
 def render_tradingview_chart(df: pd.DataFrame, symbol: str, df_journal: pd.DataFrame):
-    """Generates an interactive HTML5 canvas with TEMA indicator and active trade overlays."""
+    """Generates an HTML5 canvas with Candlesticks, 200 TEMA overlay, and Supabase trade levels."""
     
-    # Format candlesticks dict
+    # 1. Format Candlestick Records
     candles_records = []
     for _, row in df.iterrows():
         candles_records.append({
@@ -138,20 +144,22 @@ def render_tradingview_chart(df: pd.DataFrame, symbol: str, df_journal: pd.DataF
             'close': float(row['close'])
         })
     
-    # Clean and format 200 TEMA data
+    # 2. Format 200 TEMA Series (Filter out NaN/Inf and guarantee unique sorted time keys)
     tema_records = []
     if 'tema_200' in df.columns:
-        df_tema = df[['time', 'tema_200']].dropna()
-        for _, r in df_tema.iterrows():
+        valid_tema = df[['time', 'tema_200']].dropna().copy()
+        valid_tema = valid_tema[np.isfinite(valid_tema['tema_200'])]
+        valid_tema = valid_tema.drop_duplicates(subset=['time']).sort_values('time')
+        
+        for _, r in valid_tema.iterrows():
             tema_records.append({
                 'time': int(r['time']),
-                'value': float(r['tema_200'])
+                'value': round(float(r['tema_200']), 6)
             })
 
-    # Generate JavaScript Price Lines for Entry, SL, TP1, and TP2
+    # 3. Generate JavaScript Horizontal Lines for Active Trades
     price_lines_js = ""
     if not df_journal.empty and 'symbol' in df_journal.columns:
-        # Filter trades for current asset that are active or open
         symbol_trades = df_journal[
             (df_journal['symbol'] == symbol) & 
             (df_journal['status'].isin(['OPEN', 'TP1_HIT', 'PENDING']))
@@ -160,7 +168,6 @@ def render_tradingview_chart(df: pd.DataFrame, symbol: str, df_journal: pd.DataF
         for _, trade in symbol_trades.iterrows():
             trade_id = trade.get('id', 'N/A')
             
-            # Entry Line (Blue)
             if pd.notnull(trade.get('entry_price')):
                 price_lines_js += f"""
                 candlestickSeries.createPriceLine({{
@@ -173,7 +180,6 @@ def render_tradingview_chart(df: pd.DataFrame, symbol: str, df_journal: pd.DataF
                 }});
                 """
                 
-            # Stop Loss Line (Red)
             if pd.notnull(trade.get('stop_loss')):
                 price_lines_js += f"""
                 candlestickSeries.createPriceLine({{
@@ -186,7 +192,6 @@ def render_tradingview_chart(df: pd.DataFrame, symbol: str, df_journal: pd.DataF
                 }});
                 """
 
-            # Take Profit 1 Line (Green)
             if pd.notnull(trade.get('take_profit_1')):
                 price_lines_js += f"""
                 candlestickSeries.createPriceLine({{
@@ -199,7 +204,6 @@ def render_tradingview_chart(df: pd.DataFrame, symbol: str, df_journal: pd.DataF
                 }});
                 """
 
-            # Take Profit 2 Line (Emerald Green)
             if pd.notnull(trade.get('take_profit_2')):
                 price_lines_js += f"""
                 candlestickSeries.createPriceLine({{
@@ -218,7 +222,7 @@ def render_tradingview_chart(df: pd.DataFrame, symbol: str, df_journal: pd.DataF
     <head>
         <script src="https://unpkg.com/lightweight-charts@4.1.1/dist/lightweight-charts.standalone.production.js"></script>
         <style>
-            html, body {{ margin: 0; padding: 0; width: 100%; height: 100%; background-color: #131722; color: #ffffff; font-family: monospace; }}
+            html, body {{ margin: 0; padding: 0; width: 100%; height: 100%; background-color: #131722; font-family: monospace; }}
             #chart {{ width: 100%; height: 550px; }}
             #error-overlay {{ color: #ff5252; padding: 20px; font-size: 14px; white-space: pre-wrap; display: none; }}
         </style>
@@ -257,18 +261,20 @@ def render_tradingview_chart(df: pd.DataFrame, symbol: str, df_journal: pd.DataF
                 const candleData = {json.dumps(candles_records)};
                 candlestickSeries.setData(candleData);
 
-                // 2. TEMA 200 Indicator Line
+                // 2. 200 TEMA Line Series
                 const temaData = {json.dumps(tema_records)};
-                if (temaData.length > 0) {{
+                if (temaData && temaData.length > 0) {{
                     const temaSeries = chart.addLineSeries({{
-                        color: '#ff9800',
+                        color: '#FF9800',
                         lineWidth: 2,
+                        crosshairMarkerVisible: true,
+                        priceLineVisible: false,
                         title: '200 TEMA',
                     }});
                     temaSeries.setData(temaData);
                 }}
 
-                // 3. Trade Overlays (Entry, SL, TP1, TP2)
+                // 3. Trade Entry, SL, TP Lines
                 {price_lines_js}
 
                 chart.timeScale().fitContent();
@@ -321,7 +327,7 @@ def save_config(config_data):
         st.error(f"Failed to save settings: {e}")
 
 # =====================================================================
-# UI LAYOUT
+# MAIN DASHBOARD INTERFACE
 # =====================================================================
 st.title("🎯 Trade Sniper Dashboard")
 st.caption("Live Structural Trade Monitor & Strategy Control Center")
@@ -391,7 +397,7 @@ else:
 
 st.divider()
 
-# --- MAIN TABS ---
+# --- MAIN TABBED INTERFACE ---
 tab_active, tab_history, tab_charts, tab_database = st.tabs([
     "🔥 Active Trades", 
     "📜 Closed History", 
@@ -434,7 +440,7 @@ with tab_history:
     else:
         st.info("No trade data found in database.")
 
-# TAB 3: TRADINGVIEW CHART
+# TAB 3: TRADINGVIEW CHART & LIVE MARKET METRICS
 with tab_charts:
     st.subheader("Interactive TradingView Canvas")
     
@@ -447,6 +453,33 @@ with tab_charts:
     df_chart = fetch_market_data(selected_symbol, timeframe=selected_tf)
     
     if not df_chart.empty:
+        # Get Latest Candle Statistics
+        latest = df_chart.iloc[-1]
+        cur_price = latest['close']
+        cur_tema = latest.get('tema_200', np.nan)
+        cur_adx = latest.get('adx', 0.0)
+        cur_atr_pct = latest.get('atr_pct', 0.0)
+        
+        # Calculate Distance to 200 TEMA
+        if pd.notnull(cur_tema) and cur_tema > 0:
+            proximity_pct = abs(cur_price - cur_tema) / cur_tema * 100
+            proximity_str = f"{proximity_pct:.2f}%"
+            bias_str = "ABOVE TEMA 📈" if cur_price >= cur_tema else "BELOW TEMA 📉"
+        else:
+            proximity_str = "N/A"
+            bias_str = "N/A"
+
+        # Display Live Market Intelligence Stats Bar
+        stat_c1, stat_c2, stat_c3, stat_c4, stat_c5 = st.columns(5)
+        stat_c1.metric("Current Price", f"${cur_price:.4f}")
+        stat_c2.metric("200 TEMA Price", f"${cur_tema:.4f}" if pd.notnull(cur_tema) else "N/A")
+        stat_c3.metric("TEMA Proximity", proximity_str, delta=bias_str)
+        stat_c4.metric("ADX (14)", f"{cur_adx:.1f}", delta="Trend Strength" if cur_adx >= config.get("min_adx", 20) else "Weak/Ranging")
+        stat_c5.metric("ATR %", f"{cur_atr_pct:.2f}%", delta="Volatility")
+
+        st.divider()
+
+        # Render Chart
         render_tradingview_chart(df_chart, selected_symbol, df_journal)
     else:
         st.warning("Could not fetch market data for the selected symbol.")
