@@ -1,13 +1,16 @@
 import os
 import json
+import ccxt
 import pandas as pd
 import numpy as np
+import pandas_ta as ta
 import streamlit as st
+import streamlit.components.v1 as components
 from datetime import datetime
 from dotenv import load_dotenv
 from supabase import create_client, Client
 
-# Page Config
+# Page Setup
 st.set_page_config(
     page_title="Trade Sniper Dashboard",
     page_icon="🎯",
@@ -17,7 +20,7 @@ st.set_page_config(
 load_dotenv()
 
 # =====================================================================
-# SUPABASE CONNECTION & DATA PIPELINE
+# SUPABASE DATABASE CONNECTION
 # =====================================================================
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
@@ -25,7 +28,7 @@ SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 @st.cache_resource
 def get_supabase_client() -> Client:
     if not SUPABASE_URL or not SUPABASE_KEY:
-        st.error("⚠️ Supabase credentials missing! Set SUPABASE_URL and SUPABASE_KEY in environment secrets.")
+        st.error("⚠️ Supabase credentials missing! Check environment variables.")
         return None
     try:
         return create_client(SUPABASE_URL, SUPABASE_KEY)
@@ -36,20 +39,15 @@ def get_supabase_client() -> Client:
 supabase = get_supabase_client()
 
 def load_trade_journal() -> pd.DataFrame:
-    """Fetches all trade entries from Supabase PostgreSQL database."""
     if not supabase:
         return pd.DataFrame()
-    
     try:
         response = supabase.table("trade_journal").select("*").order("id", desc=True).execute()
         data = response.data
-        
         if not data:
             return pd.DataFrame()
 
         df = pd.DataFrame(data)
-        
-        # Column mapping & type formatting
         numeric_cols = [
             'entry_price', 'stop_loss', 'take_profit_1', 'take_profit_2', 
             'position_usdt', 'max_risk_usd', 'exit_price', 
@@ -58,22 +56,142 @@ def load_trade_journal() -> pd.DataFrame:
         for col in numeric_cols:
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors='coerce')
-                
         return df
-
     except Exception as e:
-        st.error(f"Error fetching trade journal: {e}")
+        st.error(f"Error loading trade journal: {e}")
         return pd.DataFrame()
 
 def clear_remote_journal():
-    """Deletes all logged trades from Supabase table."""
     if supabase:
         try:
             supabase.table("trade_journal").delete().gt("id", 0).execute()
-            st.toast("🧹 Trade journal database cleared successfully!", icon="✅")
+            st.toast("🧹 Trade journal database cleared!", icon="✅")
             st.rerun()
         except Exception as e:
             st.error(f"Failed to clear database: {e}")
+
+# =====================================================================
+# MARKET DATA (CCXT + PANDAS_TA)
+# =====================================================================
+@st.cache_data(ttl=60)
+def fetch_market_data(symbol: str, timeframe: str = "1h", limit: int = 300) -> pd.DataFrame:
+    """Fetches OHLCV market data from Bybit via CCXT and calculates TEMA & ADX."""
+    try:
+        exchange = ccxt.bybit()
+        ohlcv = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+        df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+        
+        # TradingView Lightweight charts requires UNIX timestamp in seconds
+        df['time'] = (df['timestamp'] / 1000).astype(int)
+        
+        # Calculate Indicators
+        df['tema_200'] = ta.tema(df['close'], length=200)
+        
+        adx_df = ta.adx(df['high'], df['low'], df['close'], length=14)
+        if adx_df is not None and not adx_df.empty:
+            df['adx'] = adx_df['ADX_14']
+        
+        return df
+    except Exception as e:
+        st.error(f"Error fetching chart data for {symbol}: {e}")
+        return pd.DataFrame()
+
+# =====================================================================
+# TRADINGVIEW LIGHTWEIGHT CHARTS HTML RENDERER
+# =====================================================================
+def render_tradingview_chart(df: pd.DataFrame, symbol: str, active_trades: pd.DataFrame):
+    """Generates an embedded HTML5 canvas powered by TradingView Lightweight Charts v4."""
+    
+    # 1. Prepare Candlestick JSON Data
+    candles_data = df[['time', 'open', 'high', 'low', 'close']].to_dict(orient='records')
+    
+    # 2. Prepare TEMA JSON Data
+    df_tema = df.dropna(subset=['tema_200'])
+    tema_data = [{'time': int(r['time']), 'value': float(r['tema_200'])} for _, r in df_tema.iterrows()]
+
+    # 3. Prepare Trade Entry Markers/Lines
+    entry_lines_js = ""
+    if not active_trades.empty:
+        symbol_trades = active_trades[active_trades['symbol'] == symbol]
+        for _, trade in symbol_trades.iterrows():
+            if pd.notnull(trade['entry_price']):
+                entry_lines_js += f"""
+                candlestickSeries.createPriceLine({{
+                    price: {trade['entry_price']},
+                    color: '#2962FF',
+                    lineWidth: 2,
+                    lineStyle: LightweightCharts.LineStyle.Dashed,
+                    axisLabelVisible: true,
+                    title: 'Entry #{trade['id']}',
+                }});
+                """
+                if pd.notnull(trade['stop_loss']):
+                    entry_lines_js += f"""
+                    candlestickSeries.createPriceLine({{
+                        price: {trade['stop_loss']},
+                        color: '#FF5252',
+                        lineWidth: 1,
+                        lineStyle: LightweightCharts.LineStyle.Dotted,
+                        axisLabelVisible: true,
+                        title: 'SL',
+                    }});
+                    """
+
+    html_code = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <script src="https://unpkg.com/lightweight-charts/dist/lightweight-charts.standalone.production.js"></script>
+        <style>
+            body {{ margin: 0; padding: 0; background-color: #131722; }}
+            #chart {{ width: 100%; height: 550px; }}
+        </style>
+    </head>
+    <body>
+        <div id="chart"></div>
+        <script>
+            const chartContainer = document.getElementById('chart');
+            const chart = LightweightCharts.createChart(chartContainer, {{
+                layout: {{
+                    background: {{ type: 'solid', color: '#131722' }},
+                    textColor: '#d1d4dc',
+                }},
+                grid: {{
+                    vertLines: {{ color: 'rgba(42, 46, 57, 0.5)' }},
+                    horzLines: {{ color: 'rgba(42, 46, 57, 0.5)' }},
+                }},
+                crosshair: {{ mode: LightweightCharts.CrosshairMode.Normal }},
+                rightPriceScale: {{ borderColor: 'rgba(197, 203, 206, 0.8)' }},
+                timeScale: {{
+                    borderColor: 'rgba(197, 203, 206, 0.8)',
+                    timeVisible: true,
+                    secondsVisible: false,
+                }},
+            }});
+
+            const candlestickSeries = chart.addCandlestickSeries({{
+                upColor: '#26a69a', downColor: '#ef5350', borderVisible: false,
+                wickUpColor: '#26a69a', wickDownColor: '#ef5350',
+            }});
+            candlestickSeries.setData({json.dumps(candles_data)});
+
+            const temaSeries = chart.addLineSeries({{
+                color: '#ff9800',
+                lineWidth: 2,
+                title: '200 TEMA',
+            }});
+            temaSeries.setData({json.dumps(tema_data)});
+
+            {entry_lines_js}
+
+            window.addEventListener('resize', () => {{
+                chart.applyOptions({{ width: chartContainer.clientWidth }});
+            }});
+        </script>
+    </body>
+    </html>
+    """
+    components.html(html_code, height=560)
 
 # =====================================================================
 # CONFIG MANAGER
@@ -103,12 +221,12 @@ def save_config(config_data):
     try:
         with open(CONFIG_FILE, "w") as f:
             json.dump(config_data, f, indent=4)
-        st.toast("Settings saved successfully!", icon="💾")
+        st.toast("Settings saved!", icon="💾")
     except Exception as e:
-        st.error(f"Failed to save config: {e}")
+        st.error(f"Failed to save settings: {e}")
 
 # =====================================================================
-# STREAMLIT UI LAYOUT
+# UI LAYOUT
 # =====================================================================
 st.title("🎯 Trade Sniper Dashboard")
 st.caption("Live Structural Trade Monitor & Strategy Control Center")
@@ -116,7 +234,7 @@ st.caption("Live Structural Trade Monitor & Strategy Control Center")
 config = load_config()
 df_journal = load_trade_journal()
 
-# --- SIDEBAR: BOT CONFIGURATION ---
+# --- SIDEBAR: BOT PARAMETERS ---
 with st.sidebar:
     st.header("⚙️ Bot Parameters")
     
@@ -147,7 +265,7 @@ with st.sidebar:
             st.rerun()
 
     st.divider()
-    if st.button("Refresh Dashboard Data", use_container_width=True):
+    if st.button("Refresh Dashboard", use_container_width=True):
         st.rerun()
 
 # --- TOP METRICS ROW ---
@@ -178,12 +296,17 @@ else:
 
 st.divider()
 
-# --- TABS SECTION ---
-tab_active, tab_history, tab_database = st.tabs(["🔥 Active Trades", "📜 Closed History", "🛠️ Database Operations"])
+# --- MAIN TABS ---
+tab_active, tab_history, tab_charts, tab_database = st.tabs([
+    "🔥 Active Trades", 
+    "📜 Closed History", 
+    "📈 TradingView Chart", 
+    "🛠️ Database Operations"
+])
 
 # TAB 1: ACTIVE TRADES
 with tab_active:
-    st.subheader("Currently Open & Partial Targets")
+    st.subheader("Currently Open Positions")
     if not df_journal.empty:
         active_df = df_journal[df_journal['status'].isin(['OPEN', 'TP1_HIT'])].copy()
         if not active_df.empty:
@@ -192,7 +315,7 @@ with tab_active:
         else:
             st.info("No active signals currently open.")
     else:
-        st.info("No trade data found.")
+        st.info("No trade data found in database.")
 
 # TAB 2: CLOSED HISTORY
 with tab_history:
@@ -201,8 +324,6 @@ with tab_history:
         closed_df = df_journal[df_journal['status'].isin(['CLOSED_TP2', 'STOPPED_OUT'])].copy()
         if not closed_df.empty:
             display_cols = ['id', 'timestamp', 'closed_timestamp', 'symbol', 'status', 'entry_price', 'exit_price', 'realized_pnl_usd', 'realized_r']
-            
-            # Format PnL coloring in Streamlit table
             st.dataframe(
                 closed_df[display_cols].style.format({
                     'entry_price': '${:.4f}',
@@ -216,14 +337,30 @@ with tab_history:
         else:
             st.info("No closed trades recorded yet.")
     else:
-        st.info("No trade data found.")
+        st.info("No trade data found in database.")
 
-# TAB 3: DATABASE MANAGEMENT
+# TAB 3: TRADINGVIEW CHART
+with tab_charts:
+    st.subheader("Interactive TradingView Canvas")
+    
+    col_sym, col_tf = st.columns([2, 1])
+    with col_sym:
+        selected_symbol = st.selectbox("Select Asset", config.get("watchlist", ["NEAR/USDT"]))
+    with col_tf:
+        selected_tf = st.selectbox("Timeframe", ["15m", "1h", "4h"], index=1)
+        
+    df_chart = fetch_market_data(selected_symbol, timeframe=selected_tf)
+    
+    if not df_chart.empty:
+        render_tradingview_chart(df_chart, selected_symbol, df_journal)
+    else:
+        st.warning("Could not fetch market data for the selected symbol.")
+
+# TAB 4: DATABASE OPERATIONS
 with tab_database:
     st.subheader("Raw Supabase Table Viewer & Storage Control")
     if not df_journal.empty:
         st.dataframe(df_journal, use_container_width=True, hide_index=True)
-        
         st.divider()
         st.warning("⚠️ Dangerous Operations Zone")
         confirm_clear = st.checkbox("I confirm I want to wipe all records in the remote Supabase database.")
