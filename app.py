@@ -80,17 +80,58 @@ def calculate_tema_fallback(series: pd.Series, length: int = 200) -> pd.Series:
     ema3 = ema2.ewm(span=length, adjust=False).mean()
     return 3 * ema1 - 3 * ema2 + ema3
 
+def calculate_volume_profile(df: pd.DataFrame, num_bins: int = 24):
+    """Calculates price volume histogram and average volume threshold line."""
+    if df.empty or 'volume' not in df.columns:
+        return [], 0.0
+
+    p_min = df['low'].min()
+    p_max = df['high'].max()
+    
+    if p_min == p_max or pd.isna(p_min) or pd.isna(p_max):
+        return [], 0.0
+
+    bins = np.linspace(p_min, p_max, num_bins + 1)
+    bin_volumes = np.zeros(num_bins)
+
+    # Assign candle volume proportionally to price bins
+    for _, row in df.iterrows():
+        c_low, c_high, vol = row['low'], row['high'], row['volume']
+        if pd.isna(vol) or vol <= 0 or c_high == c_low:
+            continue
+        
+        # Find index overlap
+        mask = (bins[:-1] <= c_high) & (bins[1:] >= c_low)
+        overlapping_bins = np.where(mask)[0]
+        if len(overlapping_bins) > 0:
+            vol_per_bin = vol / len(overlapping_bins)
+            for b_idx in overlapping_bins:
+                bin_volumes[b_idx] += vol_per_bin
+
+    max_vol = float(np.max(bin_volumes)) if len(bin_volumes) > 0 else 1.0
+    avg_vol = float(np.mean(bin_volumes)) if len(bin_volumes) > 0 else 0.0
+
+    vp_data = []
+    for i in range(num_bins):
+        vp_data.append({
+            'price_low': float(bins[i]),
+            'price_high': float(bins[i+1]),
+            'price_mid': float((bins[i] + bins[i+1]) / 2),
+            'volume': float(bin_volumes[i]),
+            'vol_ratio': float(bin_volumes[i] / max_vol) if max_vol > 0 else 0.0
+        })
+
+    return vp_data, avg_vol
+
 @st.cache_data(ttl=60)
 def fetch_market_data(symbol: str, timeframe: str = "1h", limit: int = 1000) -> pd.DataFrame:
     """Fetches OHLCV market data (1000 bars for TEMA warm-up) and calculates indicators."""
     ohlcv = None
     
-    # Primary: Binance Public REST Endpoint
     try:
         exchange = ccxt.binance({'enableRateLimit': True, 'options': {'defaultType': 'spot'}})
         ohlcv = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
     except Exception:
-        # Fallback: Gate.io Endpoint
         try:
             exchange = ccxt.gate({'enableRateLimit': True})
             ohlcv = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
@@ -103,15 +144,13 @@ def fetch_market_data(symbol: str, timeframe: str = "1h", limit: int = 1000) -> 
 
     df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
     
-    # Ensure numeric types
     for col in ['open', 'high', 'low', 'close', 'volume']:
         df[col] = pd.to_numeric(df[col], errors='coerce')
         
-    # Drop duplicates and ensure ascending temporal order
     df = df.drop_duplicates(subset=['timestamp']).sort_values('timestamp').reset_index(drop=True)
     df['time'] = (df['timestamp'] / 1000).astype(int)
     
-    # 1. TEMA 200 Calculation (pandas_ta primary with native Pandas fallback)
+    # 1. TEMA 200 Calculation
     try:
         df['tema_200'] = ta.tema(df['close'], length=200)
         if df['tema_200'].dropna().empty:
@@ -142,12 +181,11 @@ def fetch_market_data(symbol: str, timeframe: str = "1h", limit: int = 1000) -> 
     return df
 
 # =====================================================================
-# TRADINGVIEW LIGHTWEIGHT CHARTS HTML RENDERER
+# TRADINGVIEW LIGHTWEIGHT CHARTS HTML RENDERER WITH VOLUME PROFILE
 # =====================================================================
 def render_tradingview_chart(df: pd.DataFrame, symbol: str, df_journal: pd.DataFrame):
-    """Generates an HTML5 canvas with Candlesticks, 200 TEMA overlay, and Supabase trade levels."""
+    """Generates chart with Candlesticks, 200 TEMA, Trade Levels, and Volume Profile + Average Line."""
     
-    # 1. Format Candlestick Records
     candles_records = []
     for _, row in df.iterrows():
         candles_records.append({
@@ -158,13 +196,11 @@ def render_tradingview_chart(df: pd.DataFrame, symbol: str, df_journal: pd.DataF
             'close': float(row['close'])
         })
     
-    # 2. Safe TEMA 200 Extraction
     tema_records = []
     if 'tema_200' in df.columns:
         valid_tema = df[['time', 'tema_200']].dropna().copy()
         valid_tema['tema_200'] = pd.to_numeric(valid_tema['tema_200'], errors='coerce')
-        valid_tema = valid_tema.dropna()
-        valid_tema = valid_tema.drop_duplicates(subset=['time']).sort_values('time')
+        valid_tema = valid_tema.dropna().drop_duplicates(subset=['time']).sort_values('time')
         
         for _, r in valid_tema.iterrows():
             val = float(r['tema_200'])
@@ -174,7 +210,11 @@ def render_tradingview_chart(df: pd.DataFrame, symbol: str, df_journal: pd.DataF
                     'value': round(val, 6)
                 })
 
-    # 3. Generate JavaScript Horizontal Lines for Active Trades
+    # Volume Profile Calculations
+    vp_bins, avg_vol = calculate_volume_profile(df, num_bins=28)
+    max_vol = max([b['volume'] for b in vp_bins]) if vp_bins else 1.0
+
+    # Generate Active Trade Price Lines
     price_lines_js = ""
     if not df_journal.empty and 'symbol' in df_journal.columns:
         symbol_trades = df_journal[
@@ -239,18 +279,27 @@ def render_tradingview_chart(df: pd.DataFrame, symbol: str, df_journal: pd.DataF
     <head>
         <script src="https://unpkg.com/lightweight-charts@4.1.1/dist/lightweight-charts.standalone.production.js"></script>
         <style>
-            html, body {{ margin: 0; padding: 0; width: 100%; height: 100%; background-color: #131722; font-family: monospace; }}
-            #chart {{ width: 100%; height: 550px; }}
+            html, body {{ margin: 0; padding: 0; width: 100%; height: 100%; background-color: #131722; font-family: monospace; overflow: hidden; }}
+            #chart-container {{ position: relative; width: 100%; height: 550px; }}
+            #chart {{ width: 100%; height: 100%; }}
+            #vp-canvas {{ position: absolute; top: 0; left: 0; pointer-events: none; z-index: 2; }}
             #error-overlay {{ color: #ff5252; padding: 20px; font-size: 14px; white-space: pre-wrap; display: none; }}
         </style>
     </head>
     <body>
-        <div id="chart"></div>
+        <div id="chart-container">
+            <div id="chart"></div>
+            <canvas id="vp-canvas"></canvas>
+        </div>
         <div id="error-overlay"></div>
         <script>
             try {{
-                const chartContainer = document.getElementById('chart');
-                const chart = LightweightCharts.createChart(chartContainer, {{
+                const chartContainer = document.getElementById('chart-container');
+                const chartElement = document.getElementById('chart');
+                const vpCanvas = document.getElementById('vp-canvas');
+                const ctx = vpCanvas.getContext('2d');
+
+                const chart = LightweightCharts.createChart(chartElement, {{
                     width: chartContainer.clientWidth || 800,
                     height: 550,
                     layout: {{
@@ -296,11 +345,82 @@ def render_tradingview_chart(df: pd.DataFrame, symbol: str, df_journal: pd.DataF
 
                 chart.timeScale().fitContent();
 
+                // 4. Volume Profile Overlay Renderer
+                const vpBins = {json.dumps(vp_bins)};
+                const maxVol = {max_vol};
+                const avgVol = {avg_vol};
+
+                function drawVolumeProfile() {{
+                    vpCanvas.width = chartContainer.clientWidth;
+                    vpCanvas.height = chartContainer.clientHeight;
+                    ctx.clearRect(0, 0, vpCanvas.width, vpCanvas.height);
+
+                    if (!vpBins || vpBins.length === 0 || maxVol <= 0) return;
+
+                    const chartWidth = vpCanvas.width - 65; // Leave room for right price scale
+                    const maxBarWidth = chartWidth * 0.22;  # Draw profile on left 22% of chart
+
+                    ctx.fillStyle = 'rgba(41, 98, 255, 0.25)'; // Semi-transparent blue bars
+                    ctx.strokeStyle = 'rgba(41, 98, 255, 0.5)';
+
+                    let avgLinePoints = [];
+
+                    vpBins.forEach(bin => {{
+                        const yTop = candlestickSeries.priceToCoordinate(bin.price_high);
+                        const yBottom = candlestickSeries.priceToCoordinate(bin.price_low);
+                        
+                        if (yTop !== null && yBottom !== null) {{
+                            const barHeight = Math.max(Math.abs(yBottom - yTop) - 1, 1);
+                            const barWidth = (bin.volume / maxVol) * maxBarWidth;
+                            const yPos = Math.min(yTop, yBottom);
+
+                            // Draw Volume Bar
+                            ctx.fillRect(0, yPos, barWidth, barHeight);
+                            ctx.strokeRect(0, yPos, barWidth, barHeight);
+
+                            // Store mid-point for Average Volume Line
+                            const yMid = (yTop + yBottom) / 2;
+                            const avgX = (avgVol / maxVol) * maxBarWidth;
+                            avgLinePoints.push({{ x: avgX, y: yMid }});
+                        }}
+                    }});
+
+                    // Draw Vertical Average Volume Line through the profile
+                    if (avgLinePoints.length > 1) {{
+                        const avgX = (avgVol / maxVol) * maxBarWidth;
+                        ctx.beginPath();
+                        ctx.setLineDash([4, 4]); // Dashed line
+                        ctx.strokeStyle = '#FFEB3B'; // Vibrant yellow
+                        ctx.lineWidth = 2;
+                        
+                        const yMin = Math.min(...avgLinePoints.map(p => p.y));
+                        const yMax = Math.max(...avgLinePoints.map(p => p.y));
+
+                        ctx.moveTo(avgX, yMin);
+                        ctx.lineTo(avgX, yMax);
+                        ctx.stroke();
+                        ctx.setLineDash([]); // Reset dash
+
+                        // Draw Average Volume Label
+                        ctx.fillStyle = '#FFEB3B';
+                        ctx.font = '10px monospace';
+                        ctx.fillText('AVG VOL', avgX + 4, yMin + 12);
+                    }}
+                }}
+
+                // Redraw volume profile on zoom/pan/resize events
+                chart.timeScale().subscribeVisibleLogicalRangeChange(drawVolumeProfile);
+                chart.priceScale('right').subscribeVisibleLogicalRangeChange(drawVolumeProfile);
                 window.addEventListener('resize', () => {{
                     chart.applyOptions({{ width: chartContainer.clientWidth }});
+                    drawVolumeProfile();
                 }});
+
+                // Initial render delay for proper price scale initialization
+                setTimeout(drawVolumeProfile, 100);
+
             }} catch (err) {{
-                document.getElementById('chart').style.display = 'none';
+                document.getElementById('chart-container').style.display = 'none';
                 const errDiv = document.getElementById('error-overlay');
                 errDiv.style.display = 'block';
                 errDiv.innerText = "JS Render Exception: " + err.message + "\\n" + err.stack;
@@ -470,14 +590,12 @@ with tab_charts:
     df_chart = fetch_market_data(selected_symbol, timeframe=selected_tf)
     
     if not df_chart.empty:
-        # Get Latest Candle Statistics
         latest = df_chart.iloc[-1]
         cur_price = latest['close']
         cur_tema = latest.get('tema_200', np.nan)
         cur_adx = latest.get('adx', 0.0)
         cur_atr_pct = latest.get('atr_pct', 0.0)
         
-        # Calculate Distance to 200 TEMA safely
         if pd.notnull(cur_tema) and float(cur_tema) > 0:
             proximity_pct = abs(cur_price - float(cur_tema)) / float(cur_tema) * 100
             proximity_str = f"{proximity_pct:.2f}%"
@@ -488,7 +606,6 @@ with tab_charts:
             bias_str = "Calculating..."
             tema_display = "N/A"
 
-        # Display Live Market Intelligence Stats Bar
         stat_c1, stat_c2, stat_c3, stat_c4, stat_c5 = st.columns(5)
         stat_c1.metric("Current Price", f"${cur_price:.4f}")
         stat_c2.metric("200 TEMA Price", tema_display)
@@ -498,7 +615,6 @@ with tab_charts:
 
         st.divider()
 
-        # Render Chart
         render_tradingview_chart(df_chart, selected_symbol, df_journal)
     else:
         st.warning("Could not fetch market data for the selected symbol.")
