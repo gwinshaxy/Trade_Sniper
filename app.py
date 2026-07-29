@@ -9,8 +9,6 @@ import numpy as np
 import pandas_ta as ta
 import streamlit as st
 import streamlit.components.v1 as components
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
 
 # Suppress minor library warnings for clean UI log outputs
 warnings.filterwarnings("ignore", category=UserWarning)
@@ -311,7 +309,7 @@ config = load_config()
 
 account_balance = st.sidebar.number_input("Account Balance ($)", value=float(config.get("account_balance", 1000.0)), step=100.0)
 risk_pct = st.sidebar.number_input("Risk Per Trade (%)", value=float(config.get("risk_pct", 1.0)), step=0.25)
-proximity_threshold = st.sidebar.number_input("Proximity Threshold (%)", value=float(config.get("proximity_threshold_pct", 3.0)), step=0.1)
+proximity_threshold = st.sidebar.number_input("Proximity Threshold (%)", value=float(config.get("proximity_threshold_pct", 1.5)), step=0.1)
 min_adx = st.sidebar.number_input("Min ADX Filter", value=float(config.get("min_adx", 18.0)), step=1.0)
 min_atr_pct = st.sidebar.number_input("Min ATR % Filter", value=float(config.get("min_atr_pct", 0.4)), step=0.1)
 scan_interval = st.sidebar.number_input("Scan Interval (Mins)", value=int(config.get("scan_interval_minutes", 15)), step=1)
@@ -400,30 +398,31 @@ with tab1:
     else:
         st.info("No trades logged in `trade_journal.csv` yet. Signals will display here as they trigger.")
 
-# --- TAB 2: CHARTING ---
+# --- TAB 2: CHARTING WITH FULLSCREEN ---
 with tab2:
     st.subheader("📈 Interactive Strategy Charting")
-    selected_symbol = st.selectbox("Select Pair to Chart", config.get("watchlist", ["NEAR/USDT"]))
+    
+    active_min_adx = float(config.get("min_adx", min_adx))
+    
+    selected_symbol = st.selectbox("Select Pair to Chart", config.get("watchlist", ["ONDO/USDT"]))
     
     col_tf, col_candles = st.columns(2)
     chart_tf = col_tf.selectbox("Timeframe", ["15m", "1h", "4h", "1d"], index=1)
-    chart_limit = col_candles.slider("Candle Limit", min_value=50, max_value=500, value=150, step=25)
+    chart_limit = col_candles.slider("Candle Limit", min_value=50, max_value=500, value=200, step=25)
 
     if st.button("🔄 Refresh Chart Data", key="refresh_chart"):
         st.rerun()
 
-    with st.spinner(f"Loading live chart for {selected_symbol}..."):
+    with st.spinner(f"Loading chart for {selected_symbol}..."):
         df_full = fetch_backtest_data(selected_symbol, timeframe=chart_tf, limit=1000)
 
     if df_full is not None and not df_full.empty:
-        df_full['tema_200'] = ta.tema(df_full['close'], length=200)
+        df_chart = df_full.tail(chart_limit).copy()
+        df_chart['timestamp'] = pd.to_datetime(df_chart['timestamp'])
+        df_chart.sort_values('timestamp', inplace=True)
+        df_chart.drop_duplicates(subset=['timestamp'], keep='first', inplace=True)
+        df_chart.reset_index(drop=True, inplace=True)
 
-        df_chart = df_full.tail(chart_limit).copy().reset_index(drop=True)
-
-        # Categorical formatting for seamless x-axis alignment
-        x_labels = df_chart['timestamp'].dt.strftime('%Y-%m-%d %H:%M')
-
-        # Get latest values for metrics display
         latest_row = df_chart.iloc[-1]
         prev_row = df_chart.iloc[-2] if len(df_chart) > 1 else latest_row
         
@@ -438,7 +437,6 @@ with tab2:
         
         proximity_pct = (abs(curr_price - curr_tema) / curr_tema) * 100.0 if curr_tema > 0 else 0.0
 
-        # Live Metric Cards Above Chart
         m_col1, m_col2, m_col3, m_col4, m_col5 = st.columns(5)
         m_col1.metric("Current Price", f"${curr_price:.4f}", f"{price_change_pct:+.2f}%")
         m_col2.metric("200 TEMA", f"${curr_tema:.4f}")
@@ -446,188 +444,261 @@ with tab2:
         m_col4.metric("ADX (14)", f"{curr_adx:.2f}")
         m_col5.metric("ATR %", f"{curr_atr_pct:.2f}%")
 
-        fig = make_subplots(
-            rows=2, cols=1, 
-            shared_xaxes=True, 
-            vertical_spacing=0.08, 
-            subplot_titles=(f"{selected_symbol} ({chart_tf.upper()}) Price, Volume & 200 TEMA", "ADX Trend Strength Indicator"),
-            row_heights=[0.7, 0.3],
-            specs=[[{"secondary_y": True}], [{"secondary_y": False}]]
-        )
+        candles_data = []
+        volume_data = []
+        tema_data = []
+        adx_data = []
 
-        # 1. Candlesticks trace using formatted categorical string timestamps
-        fig.add_trace(
-            go.Candlestick(
-                x=x_labels,
-                open=df_chart['open'],
-                high=df_chart['high'],
-                low=df_chart['low'],
-                close=df_chart['close'],
-                name="OHLC",
-                increasing_fillcolor='#089981',
-                increasing_line_color='#089981',
-                decreasing_fillcolor='#f23645',
-                decreasing_line_color='#f23645',
-                line_width=1.2
-            ),
-            row=1, col=1, secondary_y=False
-        )
+        for _, row in df_chart.iterrows():
+            ts = int(row['timestamp'].timestamp())
+            
+            candles_data.append({
+                "time": ts,
+                "open": float(row['open']),
+                "high": float(row['high']),
+                "low": float(row['low']),
+                "close": float(row['close'])
+            })
+            
+            volume_data.append({
+                "time": ts,
+                "value": float(row['volume']),
+                "color": "rgba(8, 153, 129, 0.5)" if row['close'] >= row['open'] else "rgba(242, 54, 69, 0.5)"
+            })
+            
+            if not pd.isna(row['tema_200']):
+                tema_data.append({"time": ts, "value": float(row['tema_200'])})
+                
+            if 'adx' in row and not pd.isna(row['adx']):
+                adx_data.append({"time": ts, "value": float(row['adx'])})
 
-        # 2. Volume Bars aligned with categorical x-axis
-        volume_colors = [
-            'rgba(8, 153, 129, 0.4)' if close >= open_p else 'rgba(242, 54, 69, 0.4)'
-            for close, open_p in zip(df_chart['close'], df_chart['open'])
-        ]
-        fig.add_trace(
-            go.Bar(
-                x=x_labels,
-                y=df_chart['volume'],
-                name="Volume",
-                marker_color=volume_colors,
-                showlegend=False
-            ),
-            row=1, col=1, secondary_y=True
-        )
+        chart_html = f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <script src="https://unpkg.com/lightweight-charts@4.1.1/dist/lightweight-charts.standalone.production.js"></script>
+            <style>
+                body {{
+                    margin: 0;
+                    padding: 0;
+                    background-color: #ffffff;
+                    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+                }}
+                #chart-main-wrapper {{
+                    position: relative;
+                    width: 100%;
+                    background-color: #ffffff;
+                    padding: 10px;
+                    box-sizing: border-box;
+                }}
+                #chart-main-wrapper:-webkit-full-screen {{
+                    width: 100vw;
+                    height: 100vh;
+                    padding: 20px;
+                    background-color: #ffffff;
+                }}
+                #chart-main-wrapper:fullscreen {{
+                    width: 100vw;
+                    height: 100vh;
+                    padding: 20px;
+                    background-color: #ffffff;
+                }}
+                .chart-box {{
+                    width: 100%;
+                    position: relative;
+                }}
+                .chart-title {{
+                    font-size: 13px;
+                    font-weight: 600;
+                    color: #4a5568;
+                    margin: 4px 0;
+                }}
+                .fullscreen-btn {{
+                    position: absolute;
+                    top: 10px;
+                    right: 15px;
+                    z-index: 1000;
+                    background-color: #ffffff;
+                    border: 1px solid #cbd5e1;
+                    border-radius: 6px;
+                    padding: 6px 12px;
+                    font-size: 12px;
+                    font-weight: 600;
+                    color: #334155;
+                    cursor: pointer;
+                    box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+                    transition: all 0.2s ease;
+                }}
+                .fullscreen-btn:hover {{
+                    background-color: #f8fafc;
+                    border-color: #94a3b8;
+                }}
+            </style>
+        </head>
+        <body>
+            <div id="chart-main-wrapper">
+                <button id="fullscreen-toggle" class="fullscreen-btn">⛶ Fullscreen</button>
+                
+                <div class="chart-box">
+                    <div class="chart-title">{selected_symbol} ({chart_tf.upper()}) Price & 200 TEMA</div>
+                    <div id="candlestick-chart" style="width: 100%;"></div>
+                </div>
+                <div class="chart-box">
+                    <div class="chart-title">ADX Trend Strength Indicator</div>
+                    <div id="adx-chart" style="width: 100%;"></div>
+                </div>
+            </div>
 
-        # 3. 200 TEMA Line aligned with categorical x-axis
-        if 'tema_200' in df_chart.columns:
-            fig.add_trace(
-                go.Scatter(
-                    x=x_labels,
-                    y=df_chart['tema_200'],
-                    mode='lines',
-                    name='200 TEMA',
-                    line=dict(color='#ff9800', width=2.5),
-                    connectgaps=True
-                ),
-                row=1, col=1, secondary_y=False
-            )
+            <script>
+                (function() {{
+                    try {{
+                        const candleData = {json.dumps(candles_data)};
+                        const volumeData = {json.dumps(volume_data)};
+                        const temaData = {json.dumps(tema_data)};
+                        const adxData = {json.dumps(adx_data)};
+                        const minAdxVal = {active_min_adx};
 
-        # 4. ADX Line aligned with categorical x-axis
-        if 'adx' in df_chart.columns:
-            fig.add_trace(
-                go.Scatter(
-                    x=x_labels,
-                    y=df_chart['adx'],
-                    mode='lines',
-                    name='ADX (14)',
-                    line=dict(color='#29b6f6', width=2.0),
-                    connectgaps=True
-                ),
-                row=2, col=1
-            )
-            fig.add_hline(
-                y=min_adx, 
-                line_dash="dash", 
-                line_color="rgba(255, 152, 0, 0.6)", 
-                row=2, col=1, 
-                annotation_text=f"Min ADX ({min_adx})"
-            )
+                        const wrapper = document.getElementById('chart-main-wrapper');
+                        const priceContainer = document.getElementById('candlestick-chart');
+                        const adxContainer = document.getElementById('adx-chart');
+                        const fsBtn = document.getElementById('fullscreen-toggle');
 
-        # Dynamic Annotations using string label reference
-        last_x_val = x_labels.iloc[-1]
-        
-        fig.add_hline(
-            y=curr_price, 
-            line_dash="dot", 
-            line_color="#089981" if curr_price >= prev_price else "#f23645", 
-            row=1, col=1, 
-            secondary_y=False
-        )
-        
-        fig.add_annotation(
-            x=last_x_val, y=curr_price,
-            text=f" Price: ${curr_price:.4f}",
-            showarrow=True, arrowhead=2, ax=50, ay=0,
-            bgcolor="#089981" if curr_price >= prev_price else "#f23645",
-            font=dict(color="white", size=11),
-            row=1, col=1
-        )
-        
-        if curr_tema > 0:
-            fig.add_annotation(
-                x=last_x_val, y=curr_tema,
-                text=f" TEMA: ${curr_tema:.4f}",
-                showarrow=True, arrowhead=2, ax=50, ay=25,
-                bgcolor="#ff9800",
-                font=dict(color="white", size=11),
-                row=1, col=1
-            )
+                        // --- INITIAL DIMENSIONS ---
+                        let priceHeight = 440;
+                        let adxHeight = 180;
 
-        if curr_adx > 0:
-            fig.add_annotation(
-                x=last_x_val, y=curr_adx,
-                text=f" ADX: {curr_adx:.1f}",
-                showarrow=True, arrowhead=2, ax=50, ay=0,
-                bgcolor="#29b6f6",
-                font=dict(color="white", size=10),
-                row=2, col=1
-            )
+                        // --- PRICE CHART ---
+                        const priceChart = LightweightCharts.createChart(priceContainer, {{
+                            width: priceContainer.clientWidth || 800,
+                            height: priceHeight,
+                            layout: {{ background: {{ type: 'solid', color: '#ffffff' }}, textColor: '#333' }},
+                            grid: {{
+                                vertLines: {{ color: 'rgba(128, 128, 128, 0.15)' }},
+                                horzLines: {{ color: 'rgba(128, 128, 128, 0.15)' }}
+                            }},
+                            crosshair: {{ mode: LightweightCharts.CrosshairMode.Normal }},
+                            rightPriceScale: {{ borderColor: '#d1d5db' }},
+                            timeScale: {{ borderColor: '#d1d5db', timeVisible: true, secondsVisible: false }}
+                        }});
 
-        fig.update_layout(
-            height=720,
-            margin=dict(l=10, r=60, t=40, b=10),
-            legend=dict(
-                orientation="h",
-                yanchor="bottom",
-                y=1.02,
-                xanchor="right",
-                x=0.85
-            ),
-            paper_bgcolor='rgba(0,0,0,0)',
-            plot_bgcolor='rgba(0,0,0,0)',
-            xaxis_rangeslider_visible=False
-        )
+                        const candleSeries = priceChart.addCandlestickSeries({{
+                            upColor: '#089981',
+                            downColor: '#f23645',
+                            borderVisible: true,
+                            borderUpColor: '#089981',
+                            borderDownColor: '#f23645',
+                            wickUpColor: '#089981',
+                            wickDownColor: '#f23645',
+                        }});
+                        candleSeries.setData(candleData);
 
-        grid_color = "rgba(128, 128, 128, 0.15)"
+                        if (temaData.length > 0) {{
+                            const temaSeries = priceChart.addLineSeries({{
+                                color: '#ff9800',
+                                lineWidth: 2,
+                                title: '200 TEMA'
+                            }});
+                            temaSeries.setData(temaData);
+                        }}
 
-        # Apply category axis configuration across all subplots
-        fig.update_xaxes(
-            type='category',
-            nticks=10,
-            showgrid=True, 
-            gridcolor=grid_color, 
-            zeroline=False
-        )
+                        const volumeSeries = priceChart.addHistogramSeries({{
+                            priceFormat: {{ type: 'volume' }},
+                            priceScaleId: ''
+                        }});
+                        volumeSeries.priceScale().applyOptions({{
+                            scaleMargins: {{ top: 0.8, bottom: 0 }}
+                        }});
+                        volumeSeries.setData(volumeData);
 
-        fig.update_yaxes(
-            autorange=True,
-            fixedrange=False,
-            showgrid=True, 
-            gridcolor=grid_color, 
-            zeroline=False, 
-            secondary_y=False, 
-            row=1, col=1
-        )
+                        // --- ADX SUBPLOT ---
+                        const adxChart = LightweightCharts.createChart(adxContainer, {{
+                            width: adxContainer.clientWidth || 800,
+                            height: adxHeight,
+                            layout: {{ background: {{ type: 'solid', color: '#ffffff' }}, textColor: '#333' }},
+                            grid: {{
+                                vertLines: {{ color: 'rgba(128, 128, 128, 0.15)' }},
+                                horzLines: {{ color: 'rgba(128, 128, 128, 0.15)' }}
+                            }},
+                            rightPriceScale: {{ borderColor: '#d1d5db' }},
+                            timeScale: {{ borderColor: '#d1d5db', timeVisible: true, secondsVisible: false }}
+                        }});
 
-        # Volume secondary Y-axis configuration
-        max_vol = df_chart['volume'].max() if not df_chart['volume'].empty else 1.0
-        fig.update_yaxes(
-            range=[0, max_vol * 4], 
-            showgrid=False, 
-            secondary_y=True, 
-            row=1, col=1
-        )
+                        if (adxData.length > 0) {{
+                            const adxSeries = adxChart.addLineSeries({{
+                                color: '#29b6f6',
+                                lineWidth: 2,
+                                title: 'ADX (14)'
+                            }});
+                            adxSeries.setData(adxData);
 
-        # ADX Subplot Y-axis setup
-        fig.update_yaxes(
-            autorange=True,
-            fixedrange=False,
-            showgrid=True, 
-            gridcolor=grid_color, 
-            zeroline=False, 
-            row=2, col=1
-        )
+                            const minAdxLine = adxChart.addLineSeries({{
+                                color: '#ff9800',
+                                lineWidth: 1,
+                                lineStyle: LightweightCharts.LineStyle.Dashed,
+                                title: 'Min ADX'
+                            }});
+                            const adxThresholdData = adxData.map(d => ({{ time: d.time, value: minAdxVal }}));
+                            minAdxLine.setData(adxThresholdData);
+                        }}
 
-        st.plotly_chart(
-            fig, 
-            use_container_width=True,
-            config={
-                'scrollZoom': True,
-                'displayModeBar': True,
-                'displaylogo': False
-            }
-        )
+                        // Sync Time Scales
+                        priceChart.timeScale().subscribeVisibleTimeRangeChange(timeRange => {{
+                            if (timeRange) adxChart.timeScale().setVisibleTimeRange(timeRange);
+                        }});
+                        adxChart.timeScale().subscribeVisibleTimeRangeChange(timeRange => {{
+                            if (timeRange) priceChart.timeScale().setVisibleTimeRange(timeRange);
+                        }});
+
+                        priceChart.timeScale().fitContent();
+                        adxChart.timeScale().fitContent();
+
+                        // --- DYNAMIC RESIZE LOGIC ---
+                        function updateChartDimensions() {{
+                            const isFS = !!(document.fullscreenElement || document.webkitFullscreenElement);
+                            
+                            if (isFS) {{
+                                const totalH = window.innerHeight - 80;
+                                const pHeight = Math.floor(totalH * 0.70);
+                                const aHeight = Math.floor(totalH * 0.28);
+                                
+                                priceChart.applyOptions({{ width: wrapper.clientWidth - 40, height: pHeight }});
+                                adxChart.applyOptions({{ width: wrapper.clientWidth - 40, height: aHeight }});
+                                fsBtn.textContent = "↙ Exit Fullscreen";
+                            }} else {{
+                                priceChart.applyOptions({{ width: priceContainer.clientWidth, height: priceHeight }});
+                                adxChart.applyOptions({{ width: adxContainer.clientWidth, height: adxHeight }});
+                                fsBtn.textContent = "⛶ Fullscreen";
+                            }}
+                        }}
+
+                        fsBtn.addEventListener('click', () => {{
+                            if (!document.fullscreenElement) {{
+                                if (wrapper.requestFullscreen) {{
+                                    wrapper.requestFullscreen();
+                                }} else if (wrapper.webkitRequestFullscreen) {{
+                                    wrapper.webkitRequestFullscreen();
+                                }}
+                            }} else {{
+                                if (document.exitFullscreen) {{
+                                    document.exitFullscreen();
+                                }}
+                            }}
+                        }});
+
+                        document.addEventListener('fullscreenchange', updateChartDimensions);
+                        document.addEventListener('webkitfullscreenchange', updateChartDimensions);
+                        window.addEventListener('resize', updateChartDimensions);
+
+                    }} catch (err) {{
+                        console.error("Chart Rendering Error:", err);
+                    }}
+                }})();
+            </script>
+        </body>
+        </html>
+        """
+
+        components.html(chart_html, height=720, scrolling=False)
     else:
         st.error(f"Failed to render chart data for {selected_symbol}.")
 
