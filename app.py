@@ -214,7 +214,7 @@ def render_tradingview_chart(df: pd.DataFrame, symbol: str, df_journal: pd.DataF
     vp_bins, avg_vol = calculate_volume_profile(df, num_bins=28)
     max_vol = max([b['volume'] for b in vp_bins]) if vp_bins else 1.0
 
-    # Generate Active Trade Price Lines
+    # Generate Active Trade Price Lines (Deduplicated to prevent axis crowding)
     price_lines_js = ""
     if not df_journal.empty and 'symbol' in df_journal.columns:
         symbol_trades = df_journal[
@@ -222,56 +222,74 @@ def render_tradingview_chart(df: pd.DataFrame, symbol: str, df_journal: pd.DataF
             (df_journal['status'].isin(['OPEN', 'TP1_HIT', 'PENDING']))
         ]
         
+        added_levels = set()
+
         for _, trade in symbol_trades.iterrows():
-            trade_id = trade.get('id', 'N/A')
+            trade_id = trade.get('id', '')
             
-            if pd.notnull(trade.get('entry_price')):
-                price_lines_js += f"""
-                candlestickSeries.createPriceLine({{
-                    price: {float(trade['entry_price'])},
-                    color: '#2962FF',
-                    lineWidth: 2,
-                    lineStyle: LightweightCharts.LineStyle.Dashed,
-                    axisLabelVisible: true,
-                    title: 'ENTRY #{trade_id}',
-                }});
-                """
+            entry_p = trade.get('entry_price')
+            if pd.notnull(entry_p) and float(entry_p) > 0:
+                key = f"ENTRY_{float(entry_p)}"
+                if key not in added_levels:
+                    added_levels.add(key)
+                    price_lines_js += f"""
+                    candlestickSeries.createPriceLine({{
+                        price: {float(entry_p)},
+                        color: '#2962FF',
+                        lineWidth: 2,
+                        lineStyle: LightweightCharts.LineStyle.Dashed,
+                        axisLabelVisible: true,
+                        title: 'ENTRY #{trade_id}',
+                    }});
+                    """
                 
-            if pd.notnull(trade.get('stop_loss')):
-                price_lines_js += f"""
-                candlestickSeries.createPriceLine({{
-                    price: {float(trade['stop_loss'])},
-                    color: '#FF5252',
-                    lineWidth: 2,
-                    lineStyle: LightweightCharts.LineStyle.Solid,
-                    axisLabelVisible: true,
-                    title: 'SL',
-                }});
-                """
+            sl_p = trade.get('stop_loss')
+            if pd.notnull(sl_p) and float(sl_p) > 0:
+                key = f"SL_{float(sl_p)}"
+                if key not in added_levels:
+                    added_levels.add(key)
+                    price_lines_js += f"""
+                    candlestickSeries.createPriceLine({{
+                        price: {float(sl_p)},
+                        color: '#FF5252',
+                        lineWidth: 2,
+                        lineStyle: LightweightCharts.LineStyle.Solid,
+                        axisLabelVisible: true,
+                        title: 'SL',
+                    }});
+                    """
 
-            if pd.notnull(trade.get('take_profit_1')):
-                price_lines_js += f"""
-                candlestickSeries.createPriceLine({{
-                    price: {float(trade['take_profit_1'])},
-                    color: '#00E676',
-                    lineWidth: 1,
-                    lineStyle: LightweightCharts.LineStyle.Dotted,
-                    axisLabelVisible: true,
-                    title: 'TP1',
-                }});
-                """
+            tp1_p = trade.get('take_profit_1')
+            if pd.notnull(tp1_p) and float(tp1_p) > 0:
+                key = f"TP1_{float(tp1_p)}"
+                if key not in added_levels:
+                    added_levels.add(key)
+                    price_lines_js += f"""
+                    candlestickSeries.createPriceLine({{
+                        price: {float(tp1_p)},
+                        color: '#00E676',
+                        lineWidth: 1,
+                        lineStyle: LightweightCharts.LineStyle.Dotted,
+                        axisLabelVisible: true,
+                        title: 'TP1',
+                    }});
+                    """
 
-            if pd.notnull(trade.get('take_profit_2')):
-                price_lines_js += f"""
-                candlestickSeries.createPriceLine({{
-                    price: {float(trade['take_profit_2'])},
-                    color: '#00B0FF',
-                    lineWidth: 1,
-                    lineStyle: LightweightCharts.LineStyle.Dotted,
-                    axisLabelVisible: true,
-                    title: 'TP2',
-                }});
-                """
+            tp2_p = trade.get('take_profit_2')
+            if pd.notnull(tp2_p) and float(tp2_p) > 0:
+                key = f"TP2_{float(tp2_p)}"
+                if key not in added_levels:
+                    added_levels.add(key)
+                    price_lines_js += f"""
+                    candlestickSeries.createPriceLine({{
+                        price: {float(tp2_p)},
+                        color: '#00B0FF',
+                        lineWidth: 1,
+                        lineStyle: LightweightCharts.LineStyle.Dotted,
+                        axisLabelVisible: true,
+                        title: 'TP2',
+                    }});
+                    """
 
     html_code = f"""
     <!DOCTYPE html>
@@ -340,7 +358,7 @@ def render_tradingview_chart(df: pd.DataFrame, symbol: str, df_journal: pd.DataF
                     temaSeries.setData(temaData);
                 }}
 
-                // 3. Trade Entry, SL, TP Lines
+                // 3. Deduplicated Trade Entry, SL, TP Lines
                 {price_lines_js}
 
                 chart.timeScale().fitContent();
@@ -358,7 +376,7 @@ def render_tradingview_chart(df: pd.DataFrame, symbol: str, df_journal: pd.DataF
                     if (!vpBins || vpBins.length === 0 || maxVol <= 0) return;
 
                     const chartWidth = vpCanvas.width - 65;
-                    const maxBarWidth = chartWidth * 0.22;
+                    const maxBarWidth = chartWidth * 0.20;
 
                     ctx.fillStyle = 'rgba(41, 98, 255, 0.25)';
                     ctx.strokeStyle = 'rgba(41, 98, 255, 0.5)';
@@ -404,7 +422,6 @@ def render_tradingview_chart(df: pd.DataFrame, symbol: str, df_journal: pd.DataF
                     }}
                 }}
 
-                // Correct event listeners attached to timeScale
                 chart.timeScale().subscribeVisibleLogicalRangeChange(drawVolumeProfile);
                 chart.timeScale().subscribeVisibleTimeRangeChange(drawVolumeProfile);
                 
