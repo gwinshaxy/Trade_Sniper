@@ -104,23 +104,27 @@ def fetch_market_data(symbol: str, timeframe: str = "1h", limit: int = 500) -> p
     df = df.drop_duplicates(subset=['timestamp']).sort_values('timestamp').reset_index(drop=True)
     df['time'] = (df['timestamp'] / 1000).astype(int)
     
-    # 1. TEMA 200 Calculation
+    # 1. TEMA 200 Calculation + Explicit Numeric Casting
     try:
-        df['tema_200'] = ta.tema(df['close'], length=200)
+        raw_tema = ta.tema(df['close'], length=200)
+        df['tema_200'] = pd.to_numeric(raw_tema, errors='coerce')
     except Exception:
         df['tema_200'] = np.nan
-        
-    # 2. ADX (14) Calculation
+
+    # 2. ADX (14) Calculation + Explicit Numeric Casting
     try:
         adx_df = ta.adx(df['high'], df['low'], df['close'], length=14)
         if adx_df is not None and not adx_df.empty:
-            df['adx'] = adx_df['ADX_14']
+            df['adx'] = pd.to_numeric(adx_df['ADX_14'], errors='coerce')
+        else:
+            df['adx'] = 0.0
     except Exception:
         df['adx'] = 0.0
 
-    # 3. ATR % Calculation
+    # 3. ATR % Calculation + Explicit Numeric Casting
     try:
-        df['atr'] = ta.atr(df['high'], df['low'], df['close'], length=14)
+        raw_atr = ta.atr(df['high'], df['low'], df['close'], length=14)
+        df['atr'] = pd.to_numeric(raw_atr, errors='coerce')
         df['atr_pct'] = (df['atr'] / df['close']) * 100
     except Exception:
         df['atr_pct'] = 0.0
@@ -144,18 +148,21 @@ def render_tradingview_chart(df: pd.DataFrame, symbol: str, df_journal: pd.DataF
             'close': float(row['close'])
         })
     
-    # 2. Format 200 TEMA Series (Filter out NaN/Inf and guarantee unique sorted time keys)
+    # 2. Safe TEMA 200 Extraction (Pandas native filtering prevents ufunc exceptions)
     tema_records = []
     if 'tema_200' in df.columns:
         valid_tema = df[['time', 'tema_200']].dropna().copy()
-        valid_tema = valid_tema[np.isfinite(valid_tema['tema_200'])]
+        valid_tema['tema_200'] = pd.to_numeric(valid_tema['tema_200'], errors='coerce')
+        valid_tema = valid_tema.dropna()
         valid_tema = valid_tema.drop_duplicates(subset=['time']).sort_values('time')
         
         for _, r in valid_tema.iterrows():
-            tema_records.append({
-                'time': int(r['time']),
-                'value': round(float(r['tema_200']), 6)
-            })
+            val = float(r['tema_200'])
+            if np.isfinite(val):  # Scalar check
+                tema_records.append({
+                    'time': int(r['time']),
+                    'value': round(val, 6)
+                })
 
     # 3. Generate JavaScript Horizontal Lines for Active Trades
     price_lines_js = ""
@@ -460,22 +467,24 @@ with tab_charts:
         cur_adx = latest.get('adx', 0.0)
         cur_atr_pct = latest.get('atr_pct', 0.0)
         
-        # Calculate Distance to 200 TEMA
-        if pd.notnull(cur_tema) and cur_tema > 0:
-            proximity_pct = abs(cur_price - cur_tema) / cur_tema * 100
+        # Calculate Distance to 200 TEMA safely
+        if pd.notnull(cur_tema) and float(cur_tema) > 0:
+            proximity_pct = abs(cur_price - float(cur_tema)) / float(cur_tema) * 100
             proximity_str = f"{proximity_pct:.2f}%"
-            bias_str = "ABOVE TEMA 📈" if cur_price >= cur_tema else "BELOW TEMA 📉"
+            bias_str = "ABOVE TEMA 📈" if cur_price >= float(cur_tema) else "BELOW TEMA 📉"
+            tema_display = f"${float(cur_tema):.4f}"
         else:
             proximity_str = "N/A"
-            bias_str = "N/A"
+            bias_str = "Calculating..."
+            tema_display = "N/A"
 
         # Display Live Market Intelligence Stats Bar
         stat_c1, stat_c2, stat_c3, stat_c4, stat_c5 = st.columns(5)
         stat_c1.metric("Current Price", f"${cur_price:.4f}")
-        stat_c2.metric("200 TEMA Price", f"${cur_tema:.4f}" if pd.notnull(cur_tema) else "N/A")
+        stat_c2.metric("200 TEMA Price", tema_display)
         stat_c3.metric("TEMA Proximity", proximity_str, delta=bias_str)
-        stat_c4.metric("ADX (14)", f"{cur_adx:.1f}", delta="Trend Strength" if cur_adx >= config.get("min_adx", 20) else "Weak/Ranging")
-        stat_c5.metric("ATR %", f"{cur_atr_pct:.2f}%", delta="Volatility")
+        stat_c4.metric("ADX (14)", f"{float(cur_adx):.1f}", delta="Strong Trend" if float(cur_adx) >= config.get("min_adx", 20) else "Weak/Ranging")
+        stat_c5.metric("ATR %", f"{float(cur_atr_pct):.2f}%", delta="Volatility")
 
         st.divider()
 
