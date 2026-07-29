@@ -211,7 +211,7 @@ def render_tradingview_chart(df: pd.DataFrame, symbol: str, df_journal: pd.DataF
     vp_bins, avg_vol = calculate_volume_profile(df, num_bins=28)
     max_vol = max([b['volume'] for b in vp_bins]) if vp_bins else 1.0
 
-    # --- AGGREGATE TRADE LINES TO PREVENT DUPLICATE AXIS TAGS ---
+    # --- AGGREGATE AND ROUND TRADE LEVELS TO ELIMINATE STACKING ---
     price_lines_js = ""
     if not df_journal.empty and 'symbol' in df_journal.columns:
         symbol_trades = df_journal[
@@ -219,34 +219,38 @@ def render_tradingview_chart(df: pd.DataFrame, symbol: str, df_journal: pd.DataF
             (df_journal['status'].isin(['OPEN', 'TP1_HIT', 'PENDING']))
         ]
         
+        # Round keys to 3 decimal places to cluster close fractional trade levels
         entries = {}
-        stop_losses = set()
-        tp1_levels = set()
-        tp2_levels = set()
+        stop_losses = {}
+        tp1_levels = {}
+        tp2_levels = {}
 
         for _, trade in symbol_trades.iterrows():
             t_id = str(trade.get('id', ''))
             
             p_entry = trade.get('entry_price')
             if pd.notnull(p_entry) and float(p_entry) > 0:
-                price_val = float(p_entry)
-                entries.setdefault(price_val, []).append(t_id)
+                price_key = round(float(p_entry), 3)
+                entries.setdefault(price_key, []).append(t_id)
 
             p_sl = trade.get('stop_loss')
             if pd.notnull(p_sl) and float(p_sl) > 0:
-                stop_losses.add(float(p_sl))
+                price_key = round(float(p_sl), 3)
+                stop_losses.setdefault(price_key, []).append(t_id)
 
             p_tp1 = trade.get('take_profit_1')
             if pd.notnull(p_tp1) and float(p_tp1) > 0:
-                tp1_levels.add(float(p_tp1))
+                price_key = round(float(p_tp1), 3)
+                tp1_levels.setdefault(price_key, []).append(t_id)
 
             p_tp2 = trade.get('take_profit_2')
             if pd.notnull(p_tp2) and float(p_tp2) > 0:
-                tp2_levels.add(float(p_tp2))
+                price_key = round(float(p_tp2), 3)
+                tp2_levels.setdefault(price_key, []).append(t_id)
 
-        # Render combined Entries
+        # Render Grouped Entries
         for price_val, ids in entries.items():
-            id_str = "#" + ", #".join(ids) if len(ids) <= 3 else f"{len(ids)} Trades"
+            label = f"ENTRY (#{ids[0]})" if len(ids) == 1 else f"ENTRY ({len(ids)} Trades)"
             price_lines_js += f"""
             candlestickSeries.createPriceLine({{
                 price: {price_val},
@@ -254,12 +258,13 @@ def render_tradingview_chart(df: pd.DataFrame, symbol: str, df_journal: pd.DataF
                 lineWidth: 2,
                 lineStyle: LightweightCharts.LineStyle.Dashed,
                 axisLabelVisible: true,
-                title: 'ENTRY {id_str}',
+                title: '{label}',
             }});
             """
 
-        # Render Stop Losses
-        for sl_val in stop_losses:
+        # Render Grouped Stop Losses
+        for sl_val, ids in stop_losses.items():
+            label = f"SL (#{ids[0]})" if len(ids) == 1 else f"SL ({len(ids)} Trades)"
             price_lines_js += f"""
             candlestickSeries.createPriceLine({{
                 price: {sl_val},
@@ -267,12 +272,13 @@ def render_tradingview_chart(df: pd.DataFrame, symbol: str, df_journal: pd.DataF
                 lineWidth: 2,
                 lineStyle: LightweightCharts.LineStyle.Solid,
                 axisLabelVisible: true,
-                title: 'SL',
+                title: '{label}',
             }});
             """
 
-        # Render Take Profit 1
-        for tp1_val in tp1_levels:
+        # Render Grouped Take Profit 1
+        for tp1_val, ids in tp1_levels.items():
+            label = f"TP1 (#{ids[0]})" if len(ids) == 1 else f"TP1 ({len(ids)} Trades)"
             price_lines_js += f"""
             candlestickSeries.createPriceLine({{
                 price: {tp1_val},
@@ -280,12 +286,13 @@ def render_tradingview_chart(df: pd.DataFrame, symbol: str, df_journal: pd.DataF
                 lineWidth: 1,
                 lineStyle: LightweightCharts.LineStyle.Dotted,
                 axisLabelVisible: true,
-                title: 'TP1',
+                title: '{label}',
             }});
             """
 
-        # Render Take Profit 2
-        for tp2_val in tp2_levels:
+        # Render Grouped Take Profit 2
+        for tp2_val, ids in tp2_levels.items():
+            label = f"TP2 (#{ids[0]})" if len(ids) == 1 else f"TP2 ({len(ids)} Trades)"
             price_lines_js += f"""
             candlestickSeries.createPriceLine({{
                 price: {tp2_val},
@@ -293,7 +300,7 @@ def render_tradingview_chart(df: pd.DataFrame, symbol: str, df_journal: pd.DataF
                 lineWidth: 1,
                 lineStyle: LightweightCharts.LineStyle.Dotted,
                 axisLabelVisible: true,
-                title: 'TP2',
+                title: '{label}',
             }});
             """
 
@@ -374,7 +381,7 @@ def render_tradingview_chart(df: pd.DataFrame, symbol: str, df_journal: pd.DataF
                     temaSeries.setData(temaData);
                 }}
 
-                // 3. Consolidated Trade Lines
+                // 3. Consolidated & Grouped Trade Lines
                 {price_lines_js}
 
                 chart.timeScale().fitContent();
