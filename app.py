@@ -71,45 +71,60 @@ def clear_remote_journal():
             st.error(f"Failed to clear database: {e}")
 
 # =====================================================================
-# MARKET DATA (CCXT + PANDAS_TA)
+# MARKET DATA (UNBLOCKED PUBLIC EXCHANGES + PANDAS_TA)
 # =====================================================================
 @st.cache_data(ttl=60)
 def fetch_market_data(symbol: str, timeframe: str = "1h", limit: int = 300) -> pd.DataFrame:
-    """Fetches OHLCV market data from Bybit via CCXT and calculates TEMA & ADX."""
+    """Fetches OHLCV market data using Binance public REST API with Gate.io fallback."""
+    ohlcv = None
+    
+    # Primary: Binance Public REST Endpoint
     try:
-        exchange = ccxt.bybit()
+        exchange = ccxt.binance({'enableRateLimit': True, 'options': {'defaultType': 'spot'}})
         ohlcv = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
-        df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-        
-        # TradingView Lightweight charts requires UNIX timestamp in seconds
-        df['time'] = (df['timestamp'] / 1000).astype(int)
-        
-        # Calculate Indicators
+    except Exception:
+        # Fallback: Gate.io Endpoint
+        try:
+            exchange = ccxt.gateio({'enableRateLimit': True})
+            ohlcv = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+        except Exception as e:
+            st.error(f"Error fetching chart data for {symbol}: {e}")
+            return pd.DataFrame()
+
+    if not ohlcv:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+    
+    # UNIX timestamp in seconds for TradingView Lightweight Charts
+    df['time'] = (df['timestamp'] / 1000).astype(int)
+    
+    # Technical Indicators
+    try:
         df['tema_200'] = ta.tema(df['close'], length=200)
+    except Exception:
+        df['tema_200'] = np.nan
         
+    try:
         adx_df = ta.adx(df['high'], df['low'], df['close'], length=14)
         if adx_df is not None and not adx_df.empty:
             df['adx'] = adx_df['ADX_14']
-        
-        return df
-    except Exception as e:
-        st.error(f"Error fetching chart data for {symbol}: {e}")
-        return pd.DataFrame()
+    except Exception:
+        df['adx'] = 0.0
+
+    return df
 
 # =====================================================================
 # TRADINGVIEW LIGHTWEIGHT CHARTS HTML RENDERER
 # =====================================================================
 def render_tradingview_chart(df: pd.DataFrame, symbol: str, active_trades: pd.DataFrame):
-    """Generates an embedded HTML5 canvas powered by TradingView Lightweight Charts v4."""
+    """Generates an interactive HTML5 canvas powered by TradingView Lightweight Charts v4."""
     
-    # 1. Prepare Candlestick JSON Data
     candles_data = df[['time', 'open', 'high', 'low', 'close']].to_dict(orient='records')
     
-    # 2. Prepare TEMA JSON Data
     df_tema = df.dropna(subset=['tema_200'])
     tema_data = [{'time': int(r['time']), 'value': float(r['tema_200'])} for _, r in df_tema.iterrows()]
 
-    # 3. Prepare Trade Entry Markers/Lines
     entry_lines_js = ""
     if not active_trades.empty:
         symbol_trades = active_trades[active_trades['symbol'] == symbol]
