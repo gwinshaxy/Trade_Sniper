@@ -211,7 +211,7 @@ def render_tradingview_chart(df: pd.DataFrame, symbol: str, df_journal: pd.DataF
     vp_bins, avg_vol = calculate_volume_profile(df, num_bins=28)
     max_vol = max([b['volume'] for b in vp_bins]) if vp_bins else 1.0
 
-    # --- AGGREGATE AND ROUND TRADE LEVELS TO ELIMINATE STACKING ---
+    # --- AGGREGATE TRADE LEVELS BY ZONE (2 DECIMALS) TO COLLAPSE AXIS BADGES ---
     price_lines_js = ""
     if not df_journal.empty and 'symbol' in df_journal.columns:
         symbol_trades = df_journal[
@@ -219,7 +219,6 @@ def render_tradingview_chart(df: pd.DataFrame, symbol: str, df_journal: pd.DataF
             (df_journal['status'].isin(['OPEN', 'TP1_HIT', 'PENDING']))
         ]
         
-        # Round keys to 3 decimal places to cluster close fractional trade levels
         entries = {}
         stop_losses = {}
         tp1_levels = {}
@@ -230,79 +229,47 @@ def render_tradingview_chart(df: pd.DataFrame, symbol: str, df_journal: pd.DataF
             
             p_entry = trade.get('entry_price')
             if pd.notnull(p_entry) and float(p_entry) > 0:
-                price_key = round(float(p_entry), 3)
-                entries.setdefault(price_key, []).append(t_id)
+                zone_key = round(float(p_entry), 2)
+                entries.setdefault(zone_key, []).append((float(p_entry), t_id))
 
             p_sl = trade.get('stop_loss')
             if pd.notnull(p_sl) and float(p_sl) > 0:
-                price_key = round(float(p_sl), 3)
-                stop_losses.setdefault(price_key, []).append(t_id)
+                zone_key = round(float(p_sl), 2)
+                stop_losses.setdefault(zone_key, []).append((float(p_sl), t_id))
 
             p_tp1 = trade.get('take_profit_1')
             if pd.notnull(p_tp1) and float(p_tp1) > 0:
-                price_key = round(float(p_tp1), 3)
-                tp1_levels.setdefault(price_key, []).append(t_id)
+                zone_key = round(float(p_tp1), 2)
+                tp1_levels.setdefault(zone_key, []).append((float(p_tp1), t_id))
 
             p_tp2 = trade.get('take_profit_2')
             if pd.notnull(p_tp2) and float(p_tp2) > 0:
-                price_key = round(float(p_tp2), 3)
-                tp2_levels.setdefault(price_key, []).append(t_id)
+                zone_key = round(float(p_tp2), 2)
+                tp2_levels.setdefault(zone_key, []).append((float(p_tp2), t_id))
 
-        # Render Grouped Entries
-        for price_val, ids in entries.items():
-            label = f"ENTRY (#{ids[0]})" if len(ids) == 1 else f"ENTRY ({len(ids)} Trades)"
-            price_lines_js += f"""
-            candlestickSeries.createPriceLine({{
-                price: {price_val},
-                color: '#2962FF',
-                lineWidth: 2,
-                lineStyle: LightweightCharts.LineStyle.Dashed,
-                axisLabelVisible: true,
-                title: '{label}',
-            }});
-            """
+        # Helper to output a single consolidated price line per zone
+        def build_line(data_dict, color, style, prefix):
+            js_out = ""
+            for _, item_list in data_dict.items():
+                avg_price = sum(x[0] for x in item_list) / len(item_list)
+                count = len(item_list)
+                label = f"{prefix} (#{item_list[0][1]})" if count == 1 else f"{prefix} ({count} Trades)"
+                js_out += f"""
+                candlestickSeries.createPriceLine({{
+                    price: {avg_price:.4f},
+                    color: '{color}',
+                    lineWidth: 2,
+                    lineStyle: LightweightCharts.LineStyle.{style},
+                    axisLabelVisible: true,
+                    title: '{label}',
+                }});
+                """
+            return js_out
 
-        # Render Grouped Stop Losses
-        for sl_val, ids in stop_losses.items():
-            label = f"SL (#{ids[0]})" if len(ids) == 1 else f"SL ({len(ids)} Trades)"
-            price_lines_js += f"""
-            candlestickSeries.createPriceLine({{
-                price: {sl_val},
-                color: '#FF5252',
-                lineWidth: 2,
-                lineStyle: LightweightCharts.LineStyle.Solid,
-                axisLabelVisible: true,
-                title: '{label}',
-            }});
-            """
-
-        # Render Grouped Take Profit 1
-        for tp1_val, ids in tp1_levels.items():
-            label = f"TP1 (#{ids[0]})" if len(ids) == 1 else f"TP1 ({len(ids)} Trades)"
-            price_lines_js += f"""
-            candlestickSeries.createPriceLine({{
-                price: {tp1_val},
-                color: '#00E676',
-                lineWidth: 1,
-                lineStyle: LightweightCharts.LineStyle.Dotted,
-                axisLabelVisible: true,
-                title: '{label}',
-            }});
-            """
-
-        # Render Grouped Take Profit 2
-        for tp2_val, ids in tp2_levels.items():
-            label = f"TP2 (#{ids[0]})" if len(ids) == 1 else f"TP2 ({len(ids)} Trades)"
-            price_lines_js += f"""
-            candlestickSeries.createPriceLine({{
-                price: {tp2_val},
-                color: '#00B0FF',
-                lineWidth: 1,
-                lineStyle: LightweightCharts.LineStyle.Dotted,
-                axisLabelVisible: true,
-                title: '{label}',
-            }});
-            """
+        price_lines_js += build_line(entries, '#2962FF', 'Dashed', 'ENTRY')
+        price_lines_js += build_line(stop_losses, '#FF5252', 'Solid', 'SL')
+        price_lines_js += build_line(tp1_levels, '#00E676', 'Dotted', 'TP1')
+        price_lines_js += build_line(tp2_levels, '#00B0FF', 'Dotted', 'TP2')
 
     html_code = f"""
     <!DOCTYPE html>
@@ -381,7 +348,7 @@ def render_tradingview_chart(df: pd.DataFrame, symbol: str, df_journal: pd.DataF
                     temaSeries.setData(temaData);
                 }}
 
-                // 3. Consolidated & Grouped Trade Lines
+                // 3. Consolidated Trade Price Lines
                 {price_lines_js}
 
                 chart.timeScale().fitContent();
