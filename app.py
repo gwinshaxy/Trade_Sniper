@@ -83,7 +83,7 @@ def fetch_market_data(symbol: str, timeframe: str = "1h", limit: int = 300) -> p
         exchange = ccxt.binance({'enableRateLimit': True, 'options': {'defaultType': 'spot'}})
         ohlcv = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
     except Exception:
-        # Fallback: Gate.io Endpoint (Correct class: ccxt.gate)
+        # Fallback: Gate.io Endpoint
         try:
             exchange = ccxt.gate({'enableRateLimit': True})
             ohlcv = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
@@ -95,6 +95,13 @@ def fetch_market_data(symbol: str, timeframe: str = "1h", limit: int = 300) -> p
         return pd.DataFrame()
 
     df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+    
+    # Ensure numeric types
+    for col in ['open', 'high', 'low', 'close', 'volume']:
+        df[col] = pd.to_numeric(df[col], errors='coerce')
+        
+    # Sort and remove duplicate timestamps
+    df = df.drop_duplicates(subset=['timestamp']).sort_values('timestamp').reset_index(drop=True)
     
     # UNIX timestamp in seconds for TradingView Lightweight Charts
     df['time'] = (df['timestamp'] / 1000).astype(int)
@@ -118,15 +125,22 @@ def fetch_market_data(symbol: str, timeframe: str = "1h", limit: int = 300) -> p
 # TRADINGVIEW LIGHTWEIGHT CHARTS HTML RENDERER
 # =====================================================================
 def render_tradingview_chart(df: pd.DataFrame, symbol: str, active_trades: pd.DataFrame):
-    """Generates an interactive HTML5 canvas powered by TradingView Lightweight Charts v4."""
+    """Generates an interactive HTML5 canvas using pinned Lightweight Charts v4.1.1."""
     
-    # Sanitize NaNs to None to ensure valid JSON serialization for JS Engine
-    df_clean = df.copy().replace({np.nan: None})
-    candles_data = df_clean[['time', 'open', 'high', 'low', 'close']].to_dict(orient='records')
+    # Format candlesticks clean dict
+    candles_records = []
+    for _, row in df.iterrows():
+        candles_records.append({
+            'time': int(row['time']),
+            'open': float(row['open']),
+            'high': float(row['high']),
+            'low': float(row['low']),
+            'close': float(row['close'])
+        })
     
-    # Filter TEMA data to valid non-null rows
+    # Filter TEMA 200 data
     df_tema = df[['time', 'tema_200']].dropna()
-    tema_data = [{'time': int(r['time']), 'value': float(r['tema_200'])} for _, r in df_tema.iterrows()]
+    tema_records = [{'time': int(r['time']), 'value': float(r['tema_200'])} for _, r in df_tema.iterrows()]
 
     entry_lines_js = ""
     if not active_trades.empty:
@@ -135,7 +149,7 @@ def render_tradingview_chart(df: pd.DataFrame, symbol: str, active_trades: pd.Da
             if pd.notnull(trade['entry_price']):
                 entry_lines_js += f"""
                 candlestickSeries.createPriceLine({{
-                    price: {trade['entry_price']},
+                    price: {float(trade['entry_price'])},
                     color: '#2962FF',
                     lineWidth: 2,
                     lineStyle: LightweightCharts.LineStyle.Dashed,
@@ -146,7 +160,7 @@ def render_tradingview_chart(df: pd.DataFrame, symbol: str, active_trades: pd.Da
                 if pd.notnull(trade['stop_loss']):
                     entry_lines_js += f"""
                     candlestickSeries.createPriceLine({{
-                        price: {trade['stop_loss']},
+                        price: {float(trade['stop_loss'])},
                         color: '#FF5252',
                         lineWidth: 1,
                         lineStyle: LightweightCharts.LineStyle.Dotted,
@@ -159,58 +173,71 @@ def render_tradingview_chart(df: pd.DataFrame, symbol: str, active_trades: pd.Da
     <!DOCTYPE html>
     <html>
     <head>
-        <script src="https://unpkg.com/lightweight-charts/dist/lightweight-charts.standalone.production.js"></script>
+        <!-- Pinned v4.1.1 bundle to prevent API breaking changes -->
+        <script src="https://unpkg.com/lightweight-charts@4.1.1/dist/lightweight-charts.standalone.production.js"></script>
         <style>
-            html, body {{ margin: 0; padding: 0; width: 100%; height: 100%; background-color: #131722; overflow: hidden; }}
+            html, body {{ margin: 0; padding: 0; width: 100%; height: 100%; background-color: #131722; color: #ffffff; font-family: monospace; }}
             #chart {{ width: 100%; height: 550px; }}
+            #error-overlay {{ color: #ff5252; padding: 20px; font-size: 14px; white-space: pre-wrap; display: none; }}
         </style>
     </head>
     <body>
         <div id="chart"></div>
+        <div id="error-overlay"></div>
         <script>
-            const chartContainer = document.getElementById('chart');
-            const chart = LightweightCharts.createChart(chartContainer, {{
-                width: chartContainer.clientWidth,
-                height: 550,
-                layout: {{
-                    background: {{ type: 'solid', color: '#131722' }},
-                    textColor: '#d1d4dc',
-                }},
-                grid: {{
-                    vertLines: {{ color: 'rgba(42, 46, 57, 0.5)' }},
-                    horzLines: {{ color: 'rgba(42, 46, 57, 0.5)' }},
-                }},
-                crosshair: {{ mode: LightweightCharts.CrosshairMode.Normal }},
-                rightPriceScale: {{ borderColor: 'rgba(197, 203, 206, 0.8)' }},
-                timeScale: {{
-                    borderColor: 'rgba(197, 203, 206, 0.8)',
-                    timeVisible: true,
-                    secondsVisible: false,
-                }},
-            }});
-
-            const candlestickSeries = chart.addCandlestickSeries({{
-                upColor: '#26a69a', downColor: '#ef5350', borderVisible: false,
-                wickUpColor: '#26a69a', wickDownColor: '#ef5350',
-            }});
-            candlestickSeries.setData({json.dumps(candles_data)});
-
-            if ({json.dumps(tema_data)}.length > 0) {{
-                const temaSeries = chart.addLineSeries({{
-                    color: '#ff9800',
-                    lineWidth: 2,
-                    title: '200 TEMA',
+            try {{
+                const chartContainer = document.getElementById('chart');
+                const chart = LightweightCharts.createChart(chartContainer, {{
+                    width: chartContainer.clientWidth || 800,
+                    height: 550,
+                    layout: {{
+                        background: {{ type: 'solid', color: '#131722' }},
+                        textColor: '#d1d4dc',
+                    }},
+                    grid: {{
+                        vertLines: {{ color: 'rgba(42, 46, 57, 0.5)' }},
+                        horzLines: {{ color: 'rgba(42, 46, 57, 0.5)' }},
+                    }},
+                    crosshair: {{ mode: LightweightCharts.CrosshairMode.Normal }},
+                    rightPriceScale: {{ borderColor: 'rgba(197, 203, 206, 0.8)' }},
+                    timeScale: {{
+                        borderColor: 'rgba(197, 203, 206, 0.8)',
+                        timeVisible: true,
+                        secondsVisible: false,
+                    }},
                 }});
-                temaSeries.setData({json.dumps(tema_data)});
+
+                const candlestickSeries = chart.addCandlestickSeries({{
+                    upColor: '#26a69a', downColor: '#ef5350', borderVisible: false,
+                    wickUpColor: '#26a69a', wickDownColor: '#ef5350',
+                }});
+                
+                const candleData = {json.dumps(candles_records)};
+                candlestickSeries.setData(candleData);
+
+                const temaData = {json.dumps(tema_records)};
+                if (temaData.length > 0) {{
+                    const temaSeries = chart.addLineSeries({{
+                        color: '#ff9800',
+                        lineWidth: 2,
+                        title: '200 TEMA',
+                    }});
+                    temaSeries.setData(temaData);
+                }}
+
+                {entry_lines_js}
+
+                chart.timeScale().fitContent();
+
+                window.addEventListener('resize', () => {{
+                    chart.applyOptions({{ width: chartContainer.clientWidth }});
+                }});
+            }} catch (err) {{
+                document.getElementById('chart').style.display = 'none';
+                const errDiv = document.getElementById('error-overlay');
+                errDiv.style.display = 'block';
+                errDiv.innerText = "JS Render Exception: " + err.message + "\\n" + err.stack;
             }}
-
-            {entry_lines_js}
-
-            chart.timeScale().fitContent();
-
-            window.addEventListener('resize', () => {{
-                chart.applyOptions({{ width: chartContainer.clientWidth }});
-            }});
         </script>
     </body>
     </html>
