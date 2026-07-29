@@ -83,7 +83,7 @@ def fetch_market_data(symbol: str, timeframe: str = "1h", limit: int = 300) -> p
         exchange = ccxt.binance({'enableRateLimit': True, 'options': {'defaultType': 'spot'}})
         ohlcv = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
     except Exception:
-        # Fallback: Gate.io Endpoint (Correct class name: ccxt.gate)
+        # Fallback: Gate.io Endpoint (Correct class: ccxt.gate)
         try:
             exchange = ccxt.gate({'enableRateLimit': True})
             ohlcv = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
@@ -113,15 +113,19 @@ def fetch_market_data(symbol: str, timeframe: str = "1h", limit: int = 300) -> p
         df['adx'] = 0.0
 
     return df
+
 # =====================================================================
 # TRADINGVIEW LIGHTWEIGHT CHARTS HTML RENDERER
 # =====================================================================
 def render_tradingview_chart(df: pd.DataFrame, symbol: str, active_trades: pd.DataFrame):
     """Generates an interactive HTML5 canvas powered by TradingView Lightweight Charts v4."""
     
-    candles_data = df[['time', 'open', 'high', 'low', 'close']].to_dict(orient='records')
+    # Sanitize NaNs to None to ensure valid JSON serialization for JS Engine
+    df_clean = df.copy().replace({np.nan: None})
+    candles_data = df_clean[['time', 'open', 'high', 'low', 'close']].to_dict(orient='records')
     
-    df_tema = df.dropna(subset=['tema_200'])
+    # Filter TEMA data to valid non-null rows
+    df_tema = df[['time', 'tema_200']].dropna()
     tema_data = [{'time': int(r['time']), 'value': float(r['tema_200'])} for _, r in df_tema.iterrows()]
 
     entry_lines_js = ""
@@ -157,7 +161,7 @@ def render_tradingview_chart(df: pd.DataFrame, symbol: str, active_trades: pd.Da
     <head>
         <script src="https://unpkg.com/lightweight-charts/dist/lightweight-charts.standalone.production.js"></script>
         <style>
-            body {{ margin: 0; padding: 0; background-color: #131722; }}
+            html, body {{ margin: 0; padding: 0; width: 100%; height: 100%; background-color: #131722; overflow: hidden; }}
             #chart {{ width: 100%; height: 550px; }}
         </style>
     </head>
@@ -166,6 +170,8 @@ def render_tradingview_chart(df: pd.DataFrame, symbol: str, active_trades: pd.Da
         <script>
             const chartContainer = document.getElementById('chart');
             const chart = LightweightCharts.createChart(chartContainer, {{
+                width: chartContainer.clientWidth,
+                height: 550,
                 layout: {{
                     background: {{ type: 'solid', color: '#131722' }},
                     textColor: '#d1d4dc',
@@ -189,14 +195,18 @@ def render_tradingview_chart(df: pd.DataFrame, symbol: str, active_trades: pd.Da
             }});
             candlestickSeries.setData({json.dumps(candles_data)});
 
-            const temaSeries = chart.addLineSeries({{
-                color: '#ff9800',
-                lineWidth: 2,
-                title: '200 TEMA',
-            }});
-            temaSeries.setData({json.dumps(tema_data)});
+            if ({json.dumps(tema_data)}.length > 0) {{
+                const temaSeries = chart.addLineSeries({{
+                    color: '#ff9800',
+                    lineWidth: 2,
+                    title: '200 TEMA',
+                }});
+                temaSeries.setData({json.dumps(tema_data)});
+            }}
 
             {entry_lines_js}
+
+            chart.timeScale().fitContent();
 
             window.addEventListener('resize', () => {{
                 chart.applyOptions({{ width: chartContainer.clientWidth }});
@@ -205,7 +215,7 @@ def render_tradingview_chart(df: pd.DataFrame, symbol: str, active_trades: pd.Da
     </body>
     </html>
     """
-    components.html(html_code, height=560)
+    components.html(html_code, height=570)
 
 # =====================================================================
 # CONFIG MANAGER
