@@ -74,7 +74,7 @@ def clear_remote_journal():
 # MARKET DATA (UNBLOCKED PUBLIC EXCHANGES + PANDAS_TA)
 # =====================================================================
 @st.cache_data(ttl=60)
-def fetch_market_data(symbol: str, timeframe: str = "1h", limit: int = 300) -> pd.DataFrame:
+def fetch_market_data(symbol: str, timeframe: str = "1h", limit: int = 400) -> pd.DataFrame:
     """Fetches OHLCV market data using Binance public REST API with Gate.io fallback."""
     ohlcv = None
     
@@ -124,10 +124,10 @@ def fetch_market_data(symbol: str, timeframe: str = "1h", limit: int = 300) -> p
 # =====================================================================
 # TRADINGVIEW LIGHTWEIGHT CHARTS HTML RENDERER
 # =====================================================================
-def render_tradingview_chart(df: pd.DataFrame, symbol: str, active_trades: pd.DataFrame):
-    """Generates an interactive HTML5 canvas using pinned Lightweight Charts v4.1.1."""
+def render_tradingview_chart(df: pd.DataFrame, symbol: str, df_journal: pd.DataFrame):
+    """Generates an interactive HTML5 canvas with TEMA indicator and active trade overlays."""
     
-    # Format candlesticks clean dict
+    # Format candlesticks dict
     candles_records = []
     for _, row in df.iterrows():
         candles_records.append({
@@ -138,42 +138,84 @@ def render_tradingview_chart(df: pd.DataFrame, symbol: str, active_trades: pd.Da
             'close': float(row['close'])
         })
     
-    # Filter TEMA 200 data
-    df_tema = df[['time', 'tema_200']].dropna()
-    tema_records = [{'time': int(r['time']), 'value': float(r['tema_200'])} for _, r in df_tema.iterrows()]
+    # Clean and format 200 TEMA data
+    tema_records = []
+    if 'tema_200' in df.columns:
+        df_tema = df[['time', 'tema_200']].dropna()
+        for _, r in df_tema.iterrows():
+            tema_records.append({
+                'time': int(r['time']),
+                'value': float(r['tema_200'])
+            })
 
-    entry_lines_js = ""
-    if not active_trades.empty:
-        symbol_trades = active_trades[active_trades['symbol'] == symbol]
+    # Generate JavaScript Price Lines for Entry, SL, TP1, and TP2
+    price_lines_js = ""
+    if not df_journal.empty and 'symbol' in df_journal.columns:
+        # Filter trades for current asset that are active or open
+        symbol_trades = df_journal[
+            (df_journal['symbol'] == symbol) & 
+            (df_journal['status'].isin(['OPEN', 'TP1_HIT', 'PENDING']))
+        ]
+        
         for _, trade in symbol_trades.iterrows():
-            if pd.notnull(trade['entry_price']):
-                entry_lines_js += f"""
+            trade_id = trade.get('id', 'N/A')
+            
+            # Entry Line (Blue)
+            if pd.notnull(trade.get('entry_price')):
+                price_lines_js += f"""
                 candlestickSeries.createPriceLine({{
                     price: {float(trade['entry_price'])},
                     color: '#2962FF',
                     lineWidth: 2,
                     lineStyle: LightweightCharts.LineStyle.Dashed,
                     axisLabelVisible: true,
-                    title: 'Entry #{trade['id']}',
+                    title: 'ENTRY #{trade_id}',
                 }});
                 """
-                if pd.notnull(trade['stop_loss']):
-                    entry_lines_js += f"""
-                    candlestickSeries.createPriceLine({{
-                        price: {float(trade['stop_loss'])},
-                        color: '#FF5252',
-                        lineWidth: 1,
-                        lineStyle: LightweightCharts.LineStyle.Dotted,
-                        axisLabelVisible: true,
-                        title: 'SL',
-                    }});
-                    """
+                
+            # Stop Loss Line (Red)
+            if pd.notnull(trade.get('stop_loss')):
+                price_lines_js += f"""
+                candlestickSeries.createPriceLine({{
+                    price: {float(trade['stop_loss'])},
+                    color: '#FF5252',
+                    lineWidth: 2,
+                    lineStyle: LightweightCharts.LineStyle.Solid,
+                    axisLabelVisible: true,
+                    title: 'SL',
+                }});
+                """
+
+            # Take Profit 1 Line (Green)
+            if pd.notnull(trade.get('take_profit_1')):
+                price_lines_js += f"""
+                candlestickSeries.createPriceLine({{
+                    price: {float(trade['take_profit_1'])},
+                    color: '#00E676',
+                    lineWidth: 1,
+                    lineStyle: LightweightCharts.LineStyle.Dotted,
+                    axisLabelVisible: true,
+                    title: 'TP1',
+                }});
+                """
+
+            # Take Profit 2 Line (Emerald Green)
+            if pd.notnull(trade.get('take_profit_2')):
+                price_lines_js += f"""
+                candlestickSeries.createPriceLine({{
+                    price: {float(trade['take_profit_2'])},
+                    color: '#00B0FF',
+                    lineWidth: 1,
+                    lineStyle: LightweightCharts.LineStyle.Dotted,
+                    axisLabelVisible: true,
+                    title: 'TP2',
+                }});
+                """
 
     html_code = f"""
     <!DOCTYPE html>
     <html>
     <head>
-        <!-- Pinned v4.1.1 bundle to prevent API breaking changes -->
         <script src="https://unpkg.com/lightweight-charts@4.1.1/dist/lightweight-charts.standalone.production.js"></script>
         <style>
             html, body {{ margin: 0; padding: 0; width: 100%; height: 100%; background-color: #131722; color: #ffffff; font-family: monospace; }}
@@ -207,14 +249,15 @@ def render_tradingview_chart(df: pd.DataFrame, symbol: str, active_trades: pd.Da
                     }},
                 }});
 
+                // 1. Candlestick Series
                 const candlestickSeries = chart.addCandlestickSeries({{
                     upColor: '#26a69a', downColor: '#ef5350', borderVisible: false,
                     wickUpColor: '#26a69a', wickDownColor: '#ef5350',
                 }});
-                
                 const candleData = {json.dumps(candles_records)};
                 candlestickSeries.setData(candleData);
 
+                // 2. TEMA 200 Indicator Line
                 const temaData = {json.dumps(tema_records)};
                 if (temaData.length > 0) {{
                     const temaSeries = chart.addLineSeries({{
@@ -225,7 +268,8 @@ def render_tradingview_chart(df: pd.DataFrame, symbol: str, active_trades: pd.Da
                     temaSeries.setData(temaData);
                 }}
 
-                {entry_lines_js}
+                // 3. Trade Overlays (Entry, SL, TP1, TP2)
+                {price_lines_js}
 
                 chart.timeScale().fitContent();
 
