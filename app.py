@@ -1,778 +1,233 @@
 import os
 import json
-import time
-import warnings
-import csv
-import requests
 import pandas as pd
 import numpy as np
-import pandas_ta as ta
 import streamlit as st
-import streamlit.components.v1 as components
+from datetime import datetime
+from dotenv import load_dotenv
+from supabase import create_client, Client
 
-# Suppress minor library warnings for clean UI log outputs
-warnings.filterwarnings("ignore", category=UserWarning)
-
-# =====================================================================
-# PAGE CONFIGURATION
-# =====================================================================
+# Page Config
 st.set_page_config(
     page_title="Trade Sniper Dashboard",
     page_icon="🎯",
-    layout="wide",
-    initial_sidebar_state="expanded"
+    layout="wide"
 )
 
-CONFIG_FILE = "config.json"
-JOURNAL_FILE = "trade_journal.csv"
-
-DEFAULT_CONFIG = {
-    "account_balance": 1000.0,
-    "risk_pct": 1.0,
-    "proximity_threshold_pct": 1.5,
-    "min_adx": 18.0,
-    "min_atr_pct": 0.4,
-    "scan_interval_minutes": 15,
-    "alert_cooldown_hours": 4,
-    "journal_file": JOURNAL_FILE,
-    "watchlist": [
-        "ONDO/USDT",
-        "PENDLE/USDT",
-        "LINK/USDT",
-        "TIA/USDT",
-        "NEAR/USDT",
-        "XRP/USDT"
-    ]
-}
+load_dotenv()
 
 # =====================================================================
-# DATA & CONFIG LOADERS
+# SUPABASE CONNECTION & DATA PIPELINE
 # =====================================================================
-def load_config() -> dict:
-    if os.path.exists(CONFIG_FILE):
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+
+@st.cache_resource
+def get_supabase_client() -> Client:
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        st.error("⚠️ Supabase credentials missing! Set SUPABASE_URL and SUPABASE_KEY in environment secrets.")
+        return None
+    try:
+        return create_client(SUPABASE_URL, SUPABASE_KEY)
+    except Exception as e:
+        st.error(f"Failed to connect to Supabase: {e}")
+        return None
+
+supabase = get_supabase_client()
+
+def load_trade_journal() -> pd.DataFrame:
+    """Fetches all trade entries from Supabase PostgreSQL database."""
+    if not supabase:
+        return pd.DataFrame()
+    
+    try:
+        response = supabase.table("trade_journal").select("*").order("id", desc=True).execute()
+        data = response.data
+        
+        if not data:
+            return pd.DataFrame()
+
+        df = pd.DataFrame(data)
+        
+        # Column mapping & type formatting
+        numeric_cols = [
+            'entry_price', 'stop_loss', 'take_profit_1', 'take_profit_2', 
+            'position_usdt', 'max_risk_usd', 'exit_price', 
+            'realized_pnl_usd', 'realized_r'
+        ]
+        for col in numeric_cols:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors='coerce')
+                
+        return df
+
+    except Exception as e:
+        st.error(f"Error fetching trade journal: {e}")
+        return pd.DataFrame()
+
+def clear_remote_journal():
+    """Deletes all logged trades from Supabase table."""
+    if supabase:
         try:
-            with open(CONFIG_FILE, "r") as f:
-                config = json.load(f)
-                return {**DEFAULT_CONFIG, **config}
-        except Exception:
-            return DEFAULT_CONFIG
-    return DEFAULT_CONFIG
+            supabase.table("trade_journal").delete().gt("id", 0).execute()
+            st.toast("🧹 Trade journal database cleared successfully!", icon="✅")
+            st.rerun()
+        except Exception as e:
+            st.error(f"Failed to clear database: {e}")
 
-def save_config(config_data: dict):
+# =====================================================================
+# CONFIG MANAGER
+# =====================================================================
+CONFIG_FILE = "config.json"
+
+def load_config():
+    default_config = {
+        "account_balance": 1000.0,
+        "risk_pct": 1.0,
+        "proximity_threshold_pct": 2.0,
+        "min_adx": 20.0,
+        "min_atr_pct": 0.4,
+        "scan_interval_minutes": 15,
+        "alert_cooldown_hours": 4,
+        "watchlist": ["ONDO/USDT", "PENDLE/USDT", "LINK/USDT", "TIA/USDT", "NEAR/USDT", "SYRUP/USDT"]
+    }
+    if not os.path.exists(CONFIG_FILE):
+        return default_config
+    try:
+        with open(CONFIG_FILE, "r") as f:
+            return {**default_config, **json.load(f)}
+    except Exception:
+        return default_config
+
+def save_config(config_data):
     try:
         with open(CONFIG_FILE, "w") as f:
             json.dump(config_data, f, indent=4)
-        st.sidebar.success("Configuration saved!")
+        st.toast("Settings saved successfully!", icon="💾")
     except Exception as e:
-        st.sidebar.error(f"Failed to save configuration: {e}")
-
-@st.cache_data(ttl=5)
-def load_journal() -> pd.DataFrame:
-    if os.path.exists(JOURNAL_FILE):
-        try:
-            df = pd.read_csv(JOURNAL_FILE, na_values=["—", "-", "N/A", "nan", "None", ""])
-            
-            expected_cols = [
-                "Timestamp", "Symbol", "Trigger_Reason", "Entry_Price", 
-                "Stop_Loss", "Take_Profit_1", "Take_Profit_2", "Position_USDT", 
-                "Max_Risk_USD", "Status", "Exit_Price", "Closed_Timestamp", 
-                "Realized_PnL_USD", "Realized_R"
-            ]
-            for col in expected_cols:
-                if col not in df.columns:
-                    df[col] = np.nan
-
-            numeric_cols = [
-                "Entry_Price", "Stop_Loss", "Take_Profit_1", "Take_Profit_2", 
-                "Position_USDT", "Max_Risk_USD", "Exit_Price", "Realized_PnL_USD", "Realized_R"
-            ]
-            for col in numeric_cols:
-                if col in df.columns:
-                    df[col] = pd.to_numeric(df[col], errors='coerce')
-
-            string_cols = ["Timestamp", "Symbol", "Trigger_Reason", "Status", "Closed_Timestamp"]
-            for col in string_cols:
-                if col in df.columns:
-                    df[col] = df[col].astype(str).replace({'nan': '', 'None': ''})
-
-            return df
-        except Exception as e:
-            st.error(f"Error loading trade journal: {e}")
-            return pd.DataFrame()
-    return pd.DataFrame()
+        st.error(f"Failed to save config: {e}")
 
 # =====================================================================
-# DATA FETCHING & TECHNICAL ENGINE
+# STREAMLIT UI LAYOUT
 # =====================================================================
-def sanitize_symbol(raw_symbol: str) -> str:
-    clean = raw_symbol.strip().upper()
-    if "/" not in clean and clean.endswith("USDT"):
-        clean = clean[:-4] + "/USDT"
-    return clean
+st.title("🎯 Trade Sniper Dashboard")
+st.caption("Live Structural Trade Monitor & Strategy Control Center")
 
-def fetch_backtest_data(symbol: str, timeframe='1h', limit=1000):
-    formatted_symbol = sanitize_symbol(symbol).replace('/', '').upper()
-    fetch_limit = max(limit, 1000)
-    
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-        "Accept": "application/json"
-    }
-
-    raw_candles = None
-    provider = None
-
-    try:
-        url = f"https://api.binance.com/api/v3/klines?symbol={formatted_symbol}&interval={timeframe}&limit={fetch_limit}"
-        res = requests.get(url, headers=headers, timeout=8)
-        if res.status_code == 200:
-            data = res.json()
-            if isinstance(data, list) and len(data) > 0:
-                raw_candles = [[c[0], c[1], c[2], c[3], c[4], c[5]] for c in data]
-                provider = "Binance Global"
-    except Exception:
-        pass
-
-    if not raw_candles:
-        try:
-            url = f"https://api.binance.us/api/v3/klines?symbol={formatted_symbol}&interval={timeframe}&limit={fetch_limit}"
-            res = requests.get(url, headers=headers, timeout=8)
-            if res.status_code == 200:
-                data = res.json()
-                if isinstance(data, list) and len(data) > 0:
-                    raw_candles = [[c[0], c[1], c[2], c[3], c[4], c[5]] for c in data]
-                    provider = "Binance US"
-        except Exception:
-            pass
-
-    if not raw_candles:
-        try:
-            url = f"https://api.bybit.com/v5/market/kline?category=spot&symbol={formatted_symbol}&interval=60&limit={fetch_limit}"
-            res = requests.get(url, headers=headers, timeout=8)
-            if res.status_code == 200:
-                data = res.json()
-                if data.get('retCode') == 0 and len(data['result']['list']) > 0:
-                    klist = data['result']['list'][::-1]
-                    raw_candles = [[float(c[0]), c[1], c[2], c[3], c[4], c[5]] for c in klist]
-                    provider = "Bybit REST"
-        except Exception:
-            pass
-
-    if not raw_candles or len(raw_candles) == 0:
-        st.error(f"Unable to fetch history for {symbol} across public endpoints.")
-        return None
-
-    df = pd.DataFrame(raw_candles, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-    df['timestamp'] = pd.to_datetime(pd.to_numeric(df['timestamp']), unit='ms')
-    df.drop_duplicates(subset=['timestamp'], inplace=True)
-    df.sort_values('timestamp', inplace=True)
-    df.reset_index(drop=True, inplace=True)
-
-    for col in ['open', 'high', 'low', 'close', 'volume']:
-        df[col] = pd.to_numeric(df[col], errors='coerce').astype('float64')
-
-    df['tema_200'] = ta.tema(df['close'], length=200)
-    df['atr'] = ta.atr(df['high'], df['low'], df['close'], length=14)
-    
-    adx_df = ta.adx(df['high'], df['low'], df['close'], length=14)
-    if adx_df is not None and not adx_df.empty:
-        adx_cols = [c for c in adx_df.columns if c.startswith('ADX_')]
-        df['adx'] = adx_df[adx_cols[0]] if adx_cols else adx_df.iloc[:, 0]
-    else:
-        df['adx'] = 25.0
-
-    df.attrs['source_exchange'] = provider
-    return df
-
-def run_backtest_simulation(symbol, df, risk_pct=1.0, initial_capital=1000.0, proximity_pct=1.5, min_adx=18.0, min_atr_pct=0.4, use_filters=True):
-    if df is None or df.empty or 'tema_200' not in df.columns:
-        return None, None, {"error": "DataFrame is uninitialized or missing TEMA."}
-
-    clean_df = df.dropna(subset=['tema_200', 'atr']).copy().reset_index(drop=True)
-    if clean_df.empty:
-        return None, None, {"error": "All rows dropped during TEMA 200 warmup window."}
-
-    trades = []
-    capital = float(initial_capital)
-    in_trade = False
-    entry_price = 0.0
-    stop_loss = 0.0
-    tp1 = 0.0
-    tp2 = 0.0
-    risk_usd = 0.0
-
-    min_proximities = []
-    adx_values = []
-    atr_pct_values = []
-
-    for i in range(len(clean_df)):
-        current_row = clean_df.iloc[i]
-        close_p = float(current_row['close'])
-        high_p = float(current_row['high'])
-        low_p = float(current_row['low'])
-        tema_p = float(current_row['tema_200'])
-        atr_p = float(current_row['atr'])
-        adx_p = float(current_row.get('adx', 25.0)) if not pd.isna(current_row.get('adx')) else 25.0
-
-        if pd.isna(tema_p) or pd.isna(atr_p) or tema_p == 0:
-            continue
-
-        dist_close_pct = abs(close_p - tema_p) / tema_p * 100.0
-        dist_low_pct = abs(low_p - tema_p) / tema_p * 100.0
-        dist_high_pct = abs(high_p - tema_p) / tema_p * 100.0
-        min_dist = min(dist_close_pct, dist_low_pct, dist_high_pct)
-        atr_pct = (atr_p / close_p) * 100.0 if close_p > 0 else 0.0
-
-        min_proximities.append(min_dist)
-        adx_values.append(adx_p)
-        atr_pct_values.append(atr_pct)
-
-        if in_trade:
-            if low_p <= stop_loss:
-                pnl = -risk_usd
-                capital += pnl
-                trades.append({
-                    "Timestamp": current_row['timestamp'],
-                    "Symbol": symbol,
-                    "Type": "LONG",
-                    "Entry": round(entry_price, 4),
-                    "Exit": round(stop_loss, 4),
-                    "Result": "STOPPED_OUT",
-                    "PnL ($)": round(pnl, 2),
-                    "Capital ($)": round(capital, 2)
-                })
-                in_trade = False
-
-            elif high_p >= tp2:
-                pnl = risk_usd * 2.0
-                capital += pnl
-                trades.append({
-                    "Timestamp": current_row['timestamp'],
-                    "Symbol": symbol,
-                    "Type": "LONG",
-                    "Entry": round(entry_price, 4),
-                    "Exit": round(tp2, 4),
-                    "Result": "TP2_HIT",
-                    "PnL ($)": round(pnl, 2),
-                    "Capital ($)": round(capital, 2)
-                })
-                in_trade = False
-        else:
-            filters_passed = True
-            if use_filters:
-                if adx_p < min_adx or atr_pct < min_atr_pct:
-                    filters_passed = False
-
-            if min_dist <= proximity_pct and filters_passed:
-                in_trade = True
-                entry_price = close_p
-                stop_loss = entry_price - (1.5 * atr_p)
-                tp1 = entry_price + (1.5 * atr_p)
-                tp2 = entry_price + (3.0 * atr_p)
-                risk_usd = capital * (risk_pct / 100.0)
-
-    if in_trade and len(clean_df) > 0:
-        last_row = clean_df.iloc[-1]
-        exit_p = float(last_row['close'])
-        pnl = ((exit_p - entry_price) / entry_price) * risk_usd if entry_price > 0 else 0.0
-        capital += pnl
-        trades.append({
-            "Timestamp": last_row['timestamp'],
-            "Symbol": symbol,
-            "Type": "LONG",
-            "Entry": round(entry_price, 4),
-            "Exit": round(exit_p, 4),
-            "Result": "ACTIVE_AT_END",
-            "PnL ($)": round(pnl, 2),
-            "Capital ($)": round(capital, 2)
-        })
-
-    trades_df = pd.DataFrame(trades)
-    diagnostics = {
-        "source_exchange": df.attrs.get('source_exchange', 'Unknown'),
-        "raw_candles_fetched": len(df),
-        "valid_candles_tested": len(clean_df),
-        "closest_proximity_found": round(min(min_proximities), 2) if min_proximities else None,
-        "max_adx_found": round(max(adx_values), 2) if adx_values else None,
-        "max_atr_pct_found": round(max(atr_pct_values), 2) if atr_pct_values else None,
-    }
-    return trades_df, capital, diagnostics
-
-# =====================================================================
-# DASHBOARD LAYOUT
-# =====================================================================
-st.title("🎯 Trade Sniper Dashboard & Controls")
-
-# --- SIDEBAR CONFIGURATION MANAGER ---
-st.sidebar.header("⚙️ Bot Parameters")
 config = load_config()
+df_journal = load_trade_journal()
 
-account_balance = st.sidebar.number_input("Account Balance ($)", value=float(config.get("account_balance", 1000.0)), step=100.0)
-risk_pct = st.sidebar.number_input("Risk Per Trade (%)", value=float(config.get("risk_pct", 1.0)), step=0.25)
-proximity_threshold = st.sidebar.number_input("Proximity Threshold (%)", value=float(config.get("proximity_threshold_pct", 1.5)), step=0.1)
-min_adx = st.sidebar.number_input("Min ADX Filter", value=float(config.get("min_adx", 18.0)), step=1.0)
-min_atr_pct = st.sidebar.number_input("Min ATR % Filter", value=float(config.get("min_atr_pct", 0.4)), step=0.1)
-scan_interval = st.sidebar.number_input("Scan Interval (Mins)", value=int(config.get("scan_interval_minutes", 15)), step=1)
-cooldown_hours = st.sidebar.number_input("Alert Cooldown (Hours)", value=int(config.get("alert_cooldown_hours", 4)), step=1)
-
-st.sidebar.markdown("---")
-st.sidebar.subheader("📌 Watchlist Manager")
-
-custom_symbol_input = st.sidebar.text_input("Add Single Symbol (e.g., SOL/USDT)", "").strip().upper()
-if st.sidebar.button("➕ Add to Watchlist"):
-    if custom_symbol_input:
-        formatted = sanitize_symbol(custom_symbol_input)
-        current_list = config.get("watchlist", [])
-        if formatted not in current_list:
-            current_list.append(formatted)
-            config["watchlist"] = current_list
-            save_config(config)
+# --- SIDEBAR: BOT CONFIGURATION ---
+with st.sidebar:
+    st.header("⚙️ Bot Parameters")
+    
+    with st.form("config_form"):
+        account_balance = st.number_input("Account Balance ($)", value=float(config.get("account_balance", 1000.0)), step=50.0)
+        risk_pct = st.number_input("Risk Per Trade (%)", value=float(config.get("risk_pct", 1.0)), step=0.25)
+        proximity_thresh = st.number_input("Proximity Threshold (%)", value=float(config.get("proximity_threshold_pct", 2.0)), step=0.5)
+        min_adx = st.number_input("Min ADX Filter", value=float(config.get("min_adx", 20.0)), step=1.0)
+        min_atr = st.number_input("Min ATR % Filter", value=float(config.get("min_atr_pct", 0.4)), step=0.1)
+        scan_interval = st.number_input("Scan Interval (mins)", value=int(config.get("scan_interval_minutes", 15)), step=1)
+        
+        watchlist_raw = st.text_area("Watchlist (comma-separated)", value=", ".join(config.get("watchlist", [])))
+        
+        submitted = st.form_submit_button("Save Configuration")
+        if submitted:
+            new_watchlist = [symbol.strip().upper() for symbol in watchlist_raw.split(",") if symbol.strip()]
+            updated_config = {
+                "account_balance": account_balance,
+                "risk_pct": risk_pct,
+                "proximity_threshold_pct": proximity_thresh,
+                "min_adx": min_adx,
+                "min_atr_pct": min_atr,
+                "scan_interval_minutes": scan_interval,
+                "alert_cooldown_hours": config.get("alert_cooldown_hours", 4),
+                "watchlist": new_watchlist
+            }
+            save_config(updated_config)
             st.rerun()
-        else:
-            st.sidebar.warning(f"{formatted} is already in your watchlist.")
 
-watchlist_str = st.sidebar.text_area("Active Watchlist (Comma Separated)", value=", ".join(config.get("watchlist", [])))
-
-if st.sidebar.button("💾 Save All Settings"):
-    updated_watchlist = [sanitize_symbol(symbol) for symbol in watchlist_str.split(",") if symbol.strip()]
-    updated_config = {
-        "account_balance": account_balance,
-        "risk_pct": risk_pct,
-        "proximity_threshold_pct": proximity_threshold,
-        "min_adx": min_adx,
-        "min_atr_pct": min_atr_pct,
-        "scan_interval_minutes": scan_interval,
-        "alert_cooldown_hours": cooldown_hours,
-        "journal_file": JOURNAL_FILE,
-        "watchlist": updated_watchlist
-    }
-    save_config(updated_config)
-
-# =====================================================================
-# MAIN DASHBOARD TABS
-# =====================================================================
-tab1, tab2, tab3, tab4 = st.tabs([
-    "📊 Live Journal & Evaluator", 
-    "📈 Charting", 
-    "📋 Closed Trades Analytics", 
-    "🧪 Historical Backtester"
-])
-
-# --- TAB 1: LIVE JOURNAL ---
-with tab1:
-    st.subheader("📋 Structural Trade Journal & Evaluator")
-    
-    col_title, col_reset = st.columns([0.8, 0.2])
-    with col_reset:
-        if st.button("🗑️ Clear Journal", use_container_width=True):
-            headers = [
-                "Timestamp", "Symbol", "Trigger_Reason", "Entry_Price", 
-                "Stop_Loss", "Take_Profit_1", "Take_Profit_2", "Position_USDT", 
-                "Max_Risk_USD", "Status", "Exit_Price", "Closed_Timestamp", 
-                "Realized_PnL_USD", "Realized_R"
-            ]
-            with open("trade_journal.csv", mode='w', newline='', encoding='utf-8') as f:
-                writer = csv.writer(f)
-                writer.writerow(headers)
-            st.success("Journal cleared!")
-            st.rerun() 
-
-    journal_df = load_journal()
-
-    if not journal_df.empty:
-        total_signals = len(journal_df)
-        open_signals = len(journal_df[journal_df["Status"].isin(["OPEN", "TP1_HIT"])])
-        
-        pnl_series = pd.to_numeric(journal_df["Realized_PnL_USD"], errors="coerce").fillna(0.0)
-        total_realized_pnl = pnl_series.sum()
-        
-        col1, col2, col3, col4 = st.columns(4)
-        col1.metric("Total Signals Logged", total_signals)
-        col2.metric("Active / Open Positions", open_signals)
-        col3.metric("Net Realized PnL ($)", f"${total_realized_pnl:+.2f}")
-        col4.metric("Risk Setting", f"{risk_pct}% / Trade")
-
-        st.markdown("---")
-        display_df = journal_df.sort_index(ascending=False)
-        st.dataframe(display_df, hide_index=True)
-    else:
-        st.info("No trades logged in `trade_journal.csv` yet. Signals will display here as they trigger.")
-
-# --- TAB 2: CHARTING WITH FULLSCREEN ---
-with tab2:
-    st.subheader("📈 Interactive Strategy Charting")
-    
-    active_min_adx = float(config.get("min_adx", min_adx))
-    
-    selected_symbol = st.selectbox("Select Pair to Chart", config.get("watchlist", ["ONDO/USDT"]))
-    
-    col_tf, col_candles = st.columns(2)
-    chart_tf = col_tf.selectbox("Timeframe", ["15m", "1h", "4h", "1d"], index=1)
-    chart_limit = col_candles.slider("Candle Limit", min_value=50, max_value=500, value=200, step=25)
-
-    if st.button("🔄 Refresh Chart Data", key="refresh_chart"):
+    st.divider()
+    if st.button("Refresh Dashboard Data", use_container_width=True):
         st.rerun()
 
-    with st.spinner(f"Loading chart for {selected_symbol}..."):
-        df_full = fetch_backtest_data(selected_symbol, timeframe=chart_tf, limit=1000)
+# --- TOP METRICS ROW ---
+m1, m2, m3, m4, m5 = st.columns(5)
 
-    if df_full is not None and not df_full.empty:
-        df_chart = df_full.tail(chart_limit).copy()
-        df_chart['timestamp'] = pd.to_datetime(df_chart['timestamp'])
-        df_chart.sort_values('timestamp', inplace=True)
-        df_chart.drop_duplicates(subset=['timestamp'], keep='first', inplace=True)
-        df_chart.reset_index(drop=True, inplace=True)
+if not df_journal.empty:
+    total_trades = len(df_journal)
+    open_trades = len(df_journal[df_journal['status'].isin(['OPEN', 'TP1_HIT'])])
+    closed_trades = df_journal[df_journal['status'].isin(['CLOSED_TP2', 'STOPPED_OUT'])]
+    
+    net_pnl = closed_trades['realized_pnl_usd'].sum() if 'realized_pnl_usd' in closed_trades.columns else 0.0
+    total_r = closed_trades['realized_r'].sum() if 'realized_r' in closed_trades.columns else 0.0
+    
+    wins = len(closed_trades[closed_trades['realized_pnl_usd'] > 0]) if not closed_trades.empty else 0
+    win_rate = (wins / len(closed_trades) * 100) if len(closed_trades) > 0 else 0.0
 
-        latest_row = df_chart.iloc[-1]
-        prev_row = df_chart.iloc[-2] if len(df_chart) > 1 else latest_row
-        
-        curr_price = float(latest_row['close'])
-        prev_price = float(prev_row['close'])
-        price_change_pct = ((curr_price - prev_price) / prev_price) * 100.0 if prev_price > 0 else 0.0
-        
-        curr_tema = float(latest_row['tema_200']) if not pd.isna(latest_row['tema_200']) else 0.0
-        curr_adx = float(latest_row.get('adx', 0.0)) if not pd.isna(latest_row.get('adx')) else 0.0
-        curr_atr = float(latest_row.get('atr', 0.0)) if not pd.isna(latest_row.get('atr')) else 0.0
-        curr_atr_pct = (curr_atr / curr_price) * 100.0 if curr_price > 0 else 0.0
-        
-        proximity_pct = (abs(curr_price - curr_tema) / curr_tema) * 100.0 if curr_tema > 0 else 0.0
+    m1.metric("Total Signals", total_trades)
+    m2.metric("Active Trades", open_trades)
+    m3.metric("Net Realized PnL", f"${net_pnl:.2f}", delta=f"{total_r:.2f}R")
+    m4.metric("Win Rate", f"{win_rate:.1f}%")
+    m5.metric("Database", "Supabase (Live)", delta="Online")
+else:
+    m1.metric("Total Signals", "0")
+    m2.metric("Active Trades", "0")
+    m3.metric("Net Realized PnL", "$0.00")
+    m4.metric("Win Rate", "0.0%")
+    m5.metric("Database", "Supabase (Live)", delta="Connected")
 
-        m_col1, m_col2, m_col3, m_col4, m_col5 = st.columns(5)
-        m_col1.metric("Current Price", f"${curr_price:.4f}", f"{price_change_pct:+.2f}%")
-        m_col2.metric("200 TEMA", f"${curr_tema:.4f}")
-        m_col3.metric("TEMA Proximity", f"{proximity_pct:.2f}%")
-        m_col4.metric("ADX (14)", f"{curr_adx:.2f}")
-        m_col5.metric("ATR %", f"{curr_atr_pct:.2f}%")
+st.divider()
 
-        candles_data = []
-        volume_data = []
-        tema_data = []
-        adx_data = []
+# --- TABS SECTION ---
+tab_active, tab_history, tab_database = st.tabs(["🔥 Active Trades", "📜 Closed History", "🛠️ Database Operations"])
 
-        for _, row in df_chart.iterrows():
-            ts = int(row['timestamp'].timestamp())
-            
-            candles_data.append({
-                "time": ts,
-                "open": float(row['open']),
-                "high": float(row['high']),
-                "low": float(row['low']),
-                "close": float(row['close'])
-            })
-            
-            volume_data.append({
-                "time": ts,
-                "value": float(row['volume']),
-                "color": "rgba(8, 153, 129, 0.5)" if row['close'] >= row['open'] else "rgba(242, 54, 69, 0.5)"
-            })
-            
-            if not pd.isna(row['tema_200']):
-                tema_data.append({"time": ts, "value": float(row['tema_200'])})
-                
-            if 'adx' in row and not pd.isna(row['adx']):
-                adx_data.append({"time": ts, "value": float(row['adx'])})
-
-        chart_html = f"""
-        <!DOCTYPE html>
-        <html>
-        <head>
-            <script src="https://unpkg.com/lightweight-charts@4.1.1/dist/lightweight-charts.standalone.production.js"></script>
-            <style>
-                body {{
-                    margin: 0;
-                    padding: 0;
-                    background-color: #ffffff;
-                    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-                }}
-                #chart-main-wrapper {{
-                    position: relative;
-                    width: 100%;
-                    background-color: #ffffff;
-                    padding: 10px;
-                    box-sizing: border-box;
-                }}
-                #chart-main-wrapper:-webkit-full-screen {{
-                    width: 100vw;
-                    height: 100vh;
-                    padding: 20px;
-                    background-color: #ffffff;
-                }}
-                #chart-main-wrapper:fullscreen {{
-                    width: 100vw;
-                    height: 100vh;
-                    padding: 20px;
-                    background-color: #ffffff;
-                }}
-                .chart-box {{
-                    width: 100%;
-                    position: relative;
-                }}
-                .chart-title {{
-                    font-size: 13px;
-                    font-weight: 600;
-                    color: #4a5568;
-                    margin: 4px 0;
-                }}
-                .fullscreen-btn {{
-                    position: absolute;
-                    top: 10px;
-                    right: 15px;
-                    z-index: 1000;
-                    background-color: #ffffff;
-                    border: 1px solid #cbd5e1;
-                    border-radius: 6px;
-                    padding: 6px 12px;
-                    font-size: 12px;
-                    font-weight: 600;
-                    color: #334155;
-                    cursor: pointer;
-                    box-shadow: 0 1px 3px rgba(0,0,0,0.1);
-                    transition: all 0.2s ease;
-                }}
-                .fullscreen-btn:hover {{
-                    background-color: #f8fafc;
-                    border-color: #94a3b8;
-                }}
-            </style>
-        </head>
-        <body>
-            <div id="chart-main-wrapper">
-                <button id="fullscreen-toggle" class="fullscreen-btn">⛶ Fullscreen</button>
-                
-                <div class="chart-box">
-                    <div class="chart-title">{selected_symbol} ({chart_tf.upper()}) Price & 200 TEMA</div>
-                    <div id="candlestick-chart" style="width: 100%;"></div>
-                </div>
-                <div class="chart-box">
-                    <div class="chart-title">ADX Trend Strength Indicator</div>
-                    <div id="adx-chart" style="width: 100%;"></div>
-                </div>
-            </div>
-
-            <script>
-                (function() {{
-                    try {{
-                        const candleData = {json.dumps(candles_data)};
-                        const volumeData = {json.dumps(volume_data)};
-                        const temaData = {json.dumps(tema_data)};
-                        const adxData = {json.dumps(adx_data)};
-                        const minAdxVal = {active_min_adx};
-
-                        const wrapper = document.getElementById('chart-main-wrapper');
-                        const priceContainer = document.getElementById('candlestick-chart');
-                        const adxContainer = document.getElementById('adx-chart');
-                        const fsBtn = document.getElementById('fullscreen-toggle');
-
-                        // --- INITIAL DIMENSIONS ---
-                        let priceHeight = 440;
-                        let adxHeight = 180;
-
-                        // --- PRICE CHART ---
-                        const priceChart = LightweightCharts.createChart(priceContainer, {{
-                            width: priceContainer.clientWidth || 800,
-                            height: priceHeight,
-                            layout: {{ background: {{ type: 'solid', color: '#ffffff' }}, textColor: '#333' }},
-                            grid: {{
-                                vertLines: {{ color: 'rgba(128, 128, 128, 0.15)' }},
-                                horzLines: {{ color: 'rgba(128, 128, 128, 0.15)' }}
-                            }},
-                            crosshair: {{ mode: LightweightCharts.CrosshairMode.Normal }},
-                            rightPriceScale: {{ borderColor: '#d1d5db' }},
-                            timeScale: {{ borderColor: '#d1d5db', timeVisible: true, secondsVisible: false }}
-                        }});
-
-                        const candleSeries = priceChart.addCandlestickSeries({{
-                            upColor: '#089981',
-                            downColor: '#f23645',
-                            borderVisible: true,
-                            borderUpColor: '#089981',
-                            borderDownColor: '#f23645',
-                            wickUpColor: '#089981',
-                            wickDownColor: '#f23645',
-                        }});
-                        candleSeries.setData(candleData);
-
-                        if (temaData.length > 0) {{
-                            const temaSeries = priceChart.addLineSeries({{
-                                color: '#ff9800',
-                                lineWidth: 2,
-                                title: '200 TEMA'
-                            }});
-                            temaSeries.setData(temaData);
-                        }}
-
-                        const volumeSeries = priceChart.addHistogramSeries({{
-                            priceFormat: {{ type: 'volume' }},
-                            priceScaleId: ''
-                        }});
-                        volumeSeries.priceScale().applyOptions({{
-                            scaleMargins: {{ top: 0.8, bottom: 0 }}
-                        }});
-                        volumeSeries.setData(volumeData);
-
-                        // --- ADX SUBPLOT ---
-                        const adxChart = LightweightCharts.createChart(adxContainer, {{
-                            width: adxContainer.clientWidth || 800,
-                            height: adxHeight,
-                            layout: {{ background: {{ type: 'solid', color: '#ffffff' }}, textColor: '#333' }},
-                            grid: {{
-                                vertLines: {{ color: 'rgba(128, 128, 128, 0.15)' }},
-                                horzLines: {{ color: 'rgba(128, 128, 128, 0.15)' }}
-                            }},
-                            rightPriceScale: {{ borderColor: '#d1d5db' }},
-                            timeScale: {{ borderColor: '#d1d5db', timeVisible: true, secondsVisible: false }}
-                        }});
-
-                        if (adxData.length > 0) {{
-                            const adxSeries = adxChart.addLineSeries({{
-                                color: '#29b6f6',
-                                lineWidth: 2,
-                                title: 'ADX (14)'
-                            }});
-                            adxSeries.setData(adxData);
-
-                            const minAdxLine = adxChart.addLineSeries({{
-                                color: '#ff9800',
-                                lineWidth: 1,
-                                lineStyle: LightweightCharts.LineStyle.Dashed,
-                                title: 'Min ADX'
-                            }});
-                            const adxThresholdData = adxData.map(d => ({{ time: d.time, value: minAdxVal }}));
-                            minAdxLine.setData(adxThresholdData);
-                        }}
-
-                        // Sync Time Scales
-                        priceChart.timeScale().subscribeVisibleTimeRangeChange(timeRange => {{
-                            if (timeRange) adxChart.timeScale().setVisibleTimeRange(timeRange);
-                        }});
-                        adxChart.timeScale().subscribeVisibleTimeRangeChange(timeRange => {{
-                            if (timeRange) priceChart.timeScale().setVisibleTimeRange(timeRange);
-                        }});
-
-                        priceChart.timeScale().fitContent();
-                        adxChart.timeScale().fitContent();
-
-                        // --- DYNAMIC RESIZE LOGIC ---
-                        function updateChartDimensions() {{
-                            const isFS = !!(document.fullscreenElement || document.webkitFullscreenElement);
-                            
-                            if (isFS) {{
-                                const totalH = window.innerHeight - 80;
-                                const pHeight = Math.floor(totalH * 0.70);
-                                const aHeight = Math.floor(totalH * 0.28);
-                                
-                                priceChart.applyOptions({{ width: wrapper.clientWidth - 40, height: pHeight }});
-                                adxChart.applyOptions({{ width: wrapper.clientWidth - 40, height: aHeight }});
-                                fsBtn.textContent = "↙ Exit Fullscreen";
-                            }} else {{
-                                priceChart.applyOptions({{ width: priceContainer.clientWidth, height: priceHeight }});
-                                adxChart.applyOptions({{ width: adxContainer.clientWidth, height: adxHeight }});
-                                fsBtn.textContent = "⛶ Fullscreen";
-                            }}
-                        }}
-
-                        fsBtn.addEventListener('click', () => {{
-                            if (!document.fullscreenElement) {{
-                                if (wrapper.requestFullscreen) {{
-                                    wrapper.requestFullscreen();
-                                }} else if (wrapper.webkitRequestFullscreen) {{
-                                    wrapper.webkitRequestFullscreen();
-                                }}
-                            }} else {{
-                                if (document.exitFullscreen) {{
-                                    document.exitFullscreen();
-                                }}
-                            }}
-                        }});
-
-                        document.addEventListener('fullscreenchange', updateChartDimensions);
-                        document.addEventListener('webkitfullscreenchange', updateChartDimensions);
-                        window.addEventListener('resize', updateChartDimensions);
-
-                    }} catch (err) {{
-                        console.error("Chart Rendering Error:", err);
-                    }}
-                }})();
-            </script>
-        </body>
-        </html>
-        """
-
-        components.html(chart_html, height=720, scrolling=False)
-    else:
-        st.error(f"Failed to render chart data for {selected_symbol}.")
-
-# --- TAB 3: CLOSED TRADES ANALYTICS ---
-with tab3:
-    st.subheader("📋 Closed Trades & Realized Execution")
-    journal_df = load_journal()
-    if not journal_df.empty:
-        closed_df = journal_df[journal_df["Status"].isin(["STOPPED_OUT", "CLOSED_TP2"])].dropna(subset=["Status"])
-        if not closed_df.empty:
-            st.write("### Realized Execution History")
-            st.dataframe(closed_df.sort_index(ascending=False), hide_index=True)
+# TAB 1: ACTIVE TRADES
+with tab_active:
+    st.subheader("Currently Open & Partial Targets")
+    if not df_journal.empty:
+        active_df = df_journal[df_journal['status'].isin(['OPEN', 'TP1_HIT'])].copy()
+        if not active_df.empty:
+            display_cols = ['id', 'timestamp', 'symbol', 'status', 'entry_price', 'stop_loss', 'take_profit_1', 'take_profit_2', 'position_usdt', 'max_risk_usd', 'trigger_reason']
+            st.dataframe(active_df[display_cols], use_container_width=True, hide_index=True)
         else:
-            st.info("No trades have hit Stop Loss or TP2 yet.")
+            st.info("No active signals currently open.")
     else:
-        st.info("Historical execution performance will populate here.")
+        st.info("No trade data found.")
 
-# --- TAB 4: HISTORICAL BACKTESTER ---
-with tab4:
-    st.subheader("🧪 Quantitative Strategy Backtester")
-    st.markdown("Simulate structural TEMA proximity strategies against historical OHLCV candles.")
-
-    b_col1, b_col2, b_col3 = st.columns(3)
-    
-    active_watchlist = config.get("watchlist", ["XRP/USDT", "NEAR/USDT"])
-    selected_preset = b_col1.selectbox("Select Target Pair", ["Custom Symbol..."] + active_watchlist)
-    
-    if selected_preset == "Custom Symbol...":
-        bt_symbol = st.text_input("Enter Symbol Pair (e.g., SOL/USDT)", value="SOL/USDT").strip().upper()
-    else:
-        bt_symbol = selected_preset
-
-    bt_candles = b_col2.slider("Candle Lookback (1H)", min_value=200, max_value=1000, value=1000, step=100)
-    bt_capital = b_col3.number_input("Starting Capital ($)", value=1000.0, step=100.0)
-
-    use_regime_filters = st.checkbox("Enforce ADX & ATR Filters in Backtest", value=False, help="Uncheck to test pure structural proximity without indicator restrictions.")
-
-    if st.button("🚀 Run Strategy Simulation"):
-        with st.spinner(f"Fetching historical data and backtesting {bt_symbol}..."):
-            df_bt = fetch_backtest_data(bt_symbol, timeframe='1h', limit=bt_candles)
+# TAB 2: CLOSED HISTORY
+with tab_history:
+    st.subheader("Closed Trade Performance")
+    if not df_journal.empty:
+        closed_df = df_journal[df_journal['status'].isin(['CLOSED_TP2', 'STOPPED_OUT'])].copy()
+        if not closed_df.empty:
+            display_cols = ['id', 'timestamp', 'closed_timestamp', 'symbol', 'status', 'entry_price', 'exit_price', 'realized_pnl_usd', 'realized_r']
             
-            if df_bt is not None and not df_bt.empty:
-                results_df, final_cap, diag = run_backtest_simulation(
-                    symbol=bt_symbol, 
-                    df=df_bt, 
-                    risk_pct=risk_pct, 
-                    initial_capital=bt_capital, 
-                    proximity_pct=proximity_threshold,
-                    min_adx=min_adx,
-                    min_atr_pct=min_atr_pct,
-                    use_filters=use_regime_filters
-                )
-                
-                if results_df is not None and not results_df.empty:
-                    net_profit = final_cap - bt_capital
-                    win_trades = len(results_df[results_df["Result"] == "TP2_HIT"])
-                    loss_trades = len(results_df[results_df["Result"] == "STOPPED_OUT"])
-                    win_rate = (win_trades / len(results_df)) * 100.0 if len(results_df) > 0 else 0.0
+            # Format PnL coloring in Streamlit table
+            st.dataframe(
+                closed_df[display_cols].style.format({
+                    'entry_price': '${:.4f}',
+                    'exit_price': '${:.4f}',
+                    'realized_pnl_usd': '${:.2f}',
+                    'realized_r': '{:.2f}R'
+                }),
+                use_container_width=True, 
+                hide_index=True
+            )
+        else:
+            st.info("No closed trades recorded yet.")
+    else:
+        st.info("No trade data found.")
 
-                    m1, m2, m3, m4 = st.columns(4)
-                    m1.metric("Final Capital ($)", f"${final_cap:.2f}")
-                    m2.metric("Net Profit ($)", f"${net_profit:+.2f}")
-                    m3.metric("Total Trades", len(results_df))
-                    m4.metric("Win Rate (%)", f"{win_rate:.1f}%")
-
-                    st.markdown("---")
-                    st.write("### Simulated Trade History")
-                    st.dataframe(results_df.sort_index(ascending=False), hide_index=True)
-                else:
-                    st.warning(f"No structural triggers matched for {bt_symbol} during the selected historical window.")
-                    st.info(f"🔍 **Data Diagnostics ({bt_symbol}):**\n"
-                            f"- Data Provider Used: **{diag.get('source_exchange')}**\n"
-                            f"- Raw Candles Fetched: **{diag.get('raw_candles_fetched')}**\n"
-                            f"- Valid Candles Tested (after TEMA 200 warmup): **{diag.get('valid_candles_tested')}**\n"
-                            f"- Closest Distance to 200 TEMA: **{diag.get('closest_proximity_found')}%** (Your Threshold: {proximity_threshold}%)\n"
-                            f"- Max ADX Value: **{diag.get('max_adx_found')}** (Filter: {min_adx})\n"
-                            f"- Max ATR %: **{diag.get('max_atr_pct_found')}%** (Filter: {min_atr_pct}%)\n")
+# TAB 3: DATABASE MANAGEMENT
+with tab_database:
+    st.subheader("Raw Supabase Table Viewer & Storage Control")
+    if not df_journal.empty:
+        st.dataframe(df_journal, use_container_width=True, hide_index=True)
+        
+        st.divider()
+        st.warning("⚠️ Dangerous Operations Zone")
+        confirm_clear = st.checkbox("I confirm I want to wipe all records in the remote Supabase database.")
+        if st.button("Wipe Remote Journal Database", type="primary", disabled=not confirm_clear):
+            clear_remote_journal()
+    else:
+        st.info("Journal database is currently empty.")

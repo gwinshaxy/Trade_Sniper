@@ -1,5 +1,4 @@
 import os
-import csv
 import time
 import json
 import asyncio
@@ -10,11 +9,17 @@ import numpy as np
 from datetime import datetime
 from dotenv import load_dotenv
 from telegram import Bot
+from supabase import create_client, Client
 
 load_dotenv()
 
 CONFIG_FILE = "config.json"
 last_alert_time = {}
+
+# Initialize Supabase Client
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY) if SUPABASE_URL and SUPABASE_KEY else None
 
 def load_config():
     default_config = {
@@ -25,7 +30,6 @@ def load_config():
         "min_atr_pct": 0.4,
         "scan_interval_minutes": 15,
         "alert_cooldown_hours": 4,
-        "journal_file": "trade_journal.csv",
         "watchlist": [
             "ONDO/USDT",
             "PENDLE/USDT",
@@ -61,40 +65,38 @@ def get_exchange():
 
 exchange = get_exchange()
 
-def init_journal_file(journal_file="trade_journal.csv"):
-    headers = [
-        "Timestamp", "Symbol", "Trigger_Reason", "Entry_Price", 
-        "Stop_Loss", "Take_Profit_1", "Take_Profit_2", "Position_USDT", 
-        "Max_Risk_USD", "Status", "Exit_Price", "Closed_Timestamp", 
-        "Realized_PnL_USD", "Realized_R"
-    ]
-    
-    if not os.path.exists(journal_file):
-        with open(journal_file, mode='w', newline='', encoding='utf-8') as f:
-            writer = csv.writer(f)
-            writer.writerow(headers)
-        print(f"Initialized new trade journal at '{journal_file}'.")
-    else:
-        df = pd.read_csv(journal_file)
-        missing_cols = [col for col in headers if col not in df.columns]
-        if missing_cols:
-            for col in missing_cols:
-                df[col] = None
-            df.to_csv(journal_file, index=False)
-            print(f"Upgraded journal columns in '{journal_file}'.")
+def init_db():
+    if not supabase:
+        print("⚠️ Supabase credentials missing. Check SUPABASE_URL and SUPABASE_KEY.")
+        return
+    print("⚡ Connected to Supabase external database.")
 
-def log_trade_signal(journal_file, symbol, reasons, entry, sl, tp1, tp2, position_usdt, risk_usd):
+def log_trade_signal(symbol, reasons, entry, sl, tp1, tp2, position_usdt, risk_usd):
+    if not supabase:
+        print("⚠️ Cannot log trade: Supabase connection unavailable.")
+        return
+
     timestamp_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     reasons_str = " | ".join(reasons)
+
+    data = {
+        "timestamp": timestamp_str,
+        "symbol": symbol,
+        "trigger_reason": reasons_str,
+        "entry_price": float(entry),
+        "stop_loss": float(sl),
+        "take_profit_1": float(tp1),
+        "take_profit_2": float(tp2),
+        "position_usdt": float(position_usdt),
+        "max_risk_usd": float(risk_usd),
+        "status": "OPEN"
+    }
     
-    with open(journal_file, mode='a', newline='', encoding='utf-8') as f:
-        writer = csv.writer(f)
-        writer.writerow([
-            timestamp_str, symbol, reasons_str, f"{entry:.4f}",
-            f"{sl:.4f}", f"{tp1:.4f}", f"{tp2:.4f}", f"{position_usdt:.2f}",
-            f"{risk_usd:.2f}", "OPEN", "", "", "", ""
-        ])
-    print(f"💾 Trade signal logged to '{journal_file}' for {symbol}.")
+    try:
+        supabase.table("trade_journal").insert(data).execute()
+        print(f"💾 Trade signal logged to Supabase for {symbol}.")
+    except Exception as e:
+        print(f"Error inserting trade into Supabase: {e}")
 
 def calculate_native_tema(df, length=200):
     ema1 = df['close'].ewm(span=length, adjust=False).mean()
@@ -123,7 +125,6 @@ def fetch_market_data(symbol, timeframe='1h', limit=500):
         except Exception:
             df['tema_200'] = calculate_native_tema(df, length=200)
 
-    # --- CALCULATE ADX (14) & ATR % ---
     try:
         adx_df = ta.adx(df['high'], df['low'], df['close'], length=14)
         if adx_df is not None and not adx_df.empty:
@@ -176,44 +177,35 @@ def safe_format(value):
     return f"${value:.4f}"
 
 # =====================================================================
-# ACTIVE TRADE EVALUATOR ENGINE (TYPE-SAFE & DYNAMIC LOOKBACK)
+# ACTIVE TRADE EVALUATOR ENGINE (SUPABASE INTEGRATED)
 # =====================================================================
 async def evaluate_active_trades(bot, chat_id, config):
-    journal_file = config.get("journal_file", "trade_journal.csv")
-    if not os.path.exists(journal_file):
+    if not supabase:
         return
 
     try:
-        df = pd.read_csv(journal_file)
+        response = supabase.table("trade_journal").select("*").in_("status", ["OPEN", "TP1_HIT"]).execute()
+        open_trades = response.data
     except Exception as e:
-        print(f"Error reading journal for evaluation: {e}")
+        print(f"Error fetching active trades from Supabase: {e}")
         return
 
-    if 'Status' not in df.columns or df.empty:
+    if not open_trades:
         return
 
-    string_cols = ['Status', 'Exit_Price', 'Closed_Timestamp', 'Realized_PnL_USD', 'Realized_R']
-    for col in string_cols:
-        if col in df.columns:
-            df[col] = df[col].astype('object')
+    print(f"\n🔄 Evaluating {len(open_trades)} active signals in Supabase database...")
 
-    open_mask = df['Status'].isin(['OPEN', 'TP1_HIT'])
-    if not open_mask.any():
-        return
-
-    print(f"\n🔄 Evaluating active signals in trade journal...")
-    updated = False
-
-    for idx, row in df[open_mask].iterrows():
+    for trade in open_trades:
         try:
-            symbol = str(row['Symbol'])
-            entry = float(row['Entry_Price'])
-            sl = float(row['Stop_Loss'])
-            tp1 = float(row['Take_Profit_1'])
-            tp2 = float(row['Take_Profit_2'])
-            risk_usd = float(row['Max_Risk_USD'])
-            current_status = str(row['Status'])
-            trade_time_str = str(row['Timestamp'])
+            trade_id = trade['id']
+            symbol = str(trade['symbol'])
+            entry = float(trade['entry_price'])
+            sl = float(trade['stop_loss'])
+            tp1 = float(trade['take_profit_1'])
+            tp2 = float(trade['take_profit_2'])
+            risk_usd = float(trade['max_risk_usd'])
+            current_status = str(trade['status'])
+            trade_time_str = str(trade['timestamp'])
             
             trade_dt = datetime.strptime(trade_time_str, "%Y-%m-%d %H:%M:%S")
             hours_elapsed = (datetime.now() - trade_dt).total_seconds() / 3600
@@ -238,12 +230,14 @@ async def evaluate_active_trades(bot, chat_id, config):
                 pnl_usd = -risk_usd
                 realized_r = -1.0
                 
-                df.at[idx, 'Status'] = 'STOPPED_OUT'
-                df.at[idx, 'Exit_Price'] = f"{sl:.4f}"
-                df.at[idx, 'Closed_Timestamp'] = str(close_time)
-                df.at[idx, 'Realized_PnL_USD'] = f"{pnl_usd:.2f}"
-                df.at[idx, 'Realized_R'] = f"{realized_r:.2f}"
-                updated = True
+                update_data = {
+                    "status": "STOPPED_OUT",
+                    "exit_price": float(sl),
+                    "closed_timestamp": str(close_time),
+                    "realized_pnl_usd": float(pnl_usd),
+                    "realized_r": float(realized_r)
+                }
+                supabase.table("trade_journal").update(update_data).eq("id", trade_id).execute()
 
                 if bot and chat_id:
                     msg = (
@@ -259,12 +253,14 @@ async def evaluate_active_trades(bot, chat_id, config):
                 r_multiple = abs(tp2 - entry) / abs(entry - sl) if abs(entry - sl) > 0 else 0
                 pnl_usd = risk_usd * r_multiple
 
-                df.at[idx, 'Status'] = 'CLOSED_TP2'
-                df.at[idx, 'Exit_Price'] = f"{tp2:.4f}"
-                df.at[idx, 'Closed_Timestamp'] = str(close_time)
-                df.at[idx, 'Realized_PnL_USD'] = f"{pnl_usd:.2f}"
-                df.at[idx, 'Realized_R'] = f"{r_multiple:.2f}"
-                updated = True
+                update_data = {
+                    "status": "CLOSED_TP2",
+                    "exit_price": float(tp2),
+                    "closed_timestamp": str(close_time),
+                    "realized_pnl_usd": float(pnl_usd),
+                    "realized_r": float(r_multiple)
+                }
+                supabase.table("trade_journal").update(update_data).eq("id", trade_id).execute()
 
                 if bot and chat_id:
                     msg = (
@@ -279,8 +275,7 @@ async def evaluate_active_trades(bot, chat_id, config):
             elif latest_high >= tp1 and current_status == 'OPEN':
                 r_multiple = abs(tp1 - entry) / abs(entry - sl) if abs(entry - sl) > 0 else 0
                 
-                df.at[idx, 'Status'] = 'TP1_HIT'
-                updated = True
+                supabase.table("trade_journal").update({"status": "TP1_HIT"}).eq("id", trade_id).execute()
 
                 if bot and chat_id:
                     msg = (
@@ -292,14 +287,10 @@ async def evaluate_active_trades(bot, chat_id, config):
                     await bot.send_message(chat_id=chat_id, text=msg, parse_mode="Markdown")
 
         except Exception as e:
-            print(f"Error evaluating row {idx} for {symbol}: {e}")
-
-    if updated:
-        df.to_csv(journal_file, index=False)
-        print("💾 Updated active trade statuses in CSV journal.")
+            print(f"Error evaluating trade ID {trade.get('id')} for {symbol}: {e}")
 
 # =====================================================================
-# ANALYSIS & SCANNER LOOP (FILTERED)
+# ANALYSIS & SCANNER LOOP
 # =====================================================================
 async def analyze_symbol(symbol, bot, chat_id, config):
     current_time = time.time()
@@ -308,7 +299,6 @@ async def analyze_symbol(symbol, bot, chat_id, config):
     risk_pct = config.get("risk_pct", 1.0)
     proximity_threshold = config.get("proximity_threshold_pct", 2.0)
     cooldown_hours = config.get("alert_cooldown_hours", 4)
-    journal_file = config.get("journal_file", "trade_journal.csv")
     min_adx = config.get("min_adx", 20.0)
     min_atr_pct = config.get("min_atr_pct", 0.4)
     
@@ -329,7 +319,7 @@ async def analyze_symbol(symbol, bot, chat_id, config):
     val_4h = df_4h['tema_200'].dropna().iloc[-1] if not df_4h['tema_200'].dropna().empty else None
     poc_price, hvn_prices = calculate_volume_profile(df_1h, num_bins=30)
     
-    # 1. Proximity Triggers
+    # Proximity Triggers
     triggered_reasons = []
     
     if val_1h is not None:
@@ -351,7 +341,7 @@ async def analyze_symbol(symbol, bot, chat_id, config):
         print(f"[{symbol}] Price (${current_price:.4f}) outside threshold. No trigger.")
         return
 
-    # 2. Hard Indicator Regime Filters (ADX & ATR%)
+    # Hard Indicator Regime Filters
     current_adx = df_1h['adx_14'].dropna().iloc[-1] if 'adx_14' in df_1h else 0.0
     current_atr_pct = df_1h['atr_pct'].dropna().iloc[-1] if 'atr_pct' in df_1h else 0.0
 
@@ -365,7 +355,7 @@ async def analyze_symbol(symbol, bot, chat_id, config):
 
     print(f"🎯 TRIGGER & FILTERS MATCH for {symbol}: {', '.join(triggered_reasons)} (ADX: {current_adx:.2f}, ATR%: {current_atr_pct:.2f}%)")
 
-    # 3. Execution & Sizing Parameters
+    # Execution & Sizing Parameters
     direction = "LONG"
     entry_price = current_price
     
@@ -381,9 +371,9 @@ async def analyze_symbol(symbol, bot, chat_id, config):
     
     rr_ratio = abs(tp1 - entry_price) / abs(entry_price - stop_loss) if abs(entry_price - stop_loss) > 0 else 0
 
-    # Log to CSV
+    # Log trade directly to Supabase cloud database
     log_trade_signal(
-        journal_file, symbol, triggered_reasons, entry_price, 
+        symbol, triggered_reasons, entry_price, 
         stop_loss, tp1, tp2, position_usdt, risk_usd
     )
 
@@ -410,7 +400,7 @@ async def analyze_symbol(symbol, bot, chat_id, config):
         f"💰 **Position Sizing:**\n"
         f"• Position Value: `${position_usdt:.2f}` ({units:.2f} units)\n"
         f"• Risk/Reward Ratio: `{rr_ratio:.2f}R`\n\n"
-        f"📄 Signal logged to `trade_journal.csv`"
+        f"📄 Signal logged to Supabase Database"
     )
     
     if bot and chat_id:
@@ -418,7 +408,7 @@ async def analyze_symbol(symbol, bot, chat_id, config):
 
 async def run_scanner():
     config = load_config()
-    init_journal_file(config.get("journal_file", "trade_journal.csv"))
+    init_db()
 
     telegram_bot_token = os.getenv("TELEGRAM_BOT_TOKEN") or config.get("telegram_bot_token")
     telegram_chat_id = os.getenv("TELEGRAM_CHAT_ID") or config.get("telegram_chat_id")
@@ -434,7 +424,7 @@ async def run_scanner():
         watchlist = current_config.get("watchlist", [])
         scan_interval = current_config.get("scan_interval_minutes", 15)
         
-        # 1. Run Active Trade Evaluator
+        # 1. Run Active Trade Evaluator against Supabase
         await evaluate_active_trades(bot, telegram_chat_id, current_config)
 
         # 2. Run Watchlist Proximity Scanner
