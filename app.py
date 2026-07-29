@@ -357,10 +357,10 @@ def render_tradingview_chart(df: pd.DataFrame, symbol: str, df_journal: pd.DataF
 
                     if (!vpBins || vpBins.length === 0 || maxVol <= 0) return;
 
-                    const chartWidth = vpCanvas.width - 65; // Leave room for right price scale
-                    const maxBarWidth = chartWidth * 0.22;  # Draw profile on left 22% of chart
+                    const chartWidth = vpCanvas.width - 65;
+                    const maxBarWidth = chartWidth * 0.22;
 
-                    ctx.fillStyle = 'rgba(41, 98, 255, 0.25)'; // Semi-transparent blue bars
+                    ctx.fillStyle = 'rgba(41, 98, 255, 0.25)';
                     ctx.strokeStyle = 'rgba(41, 98, 255, 0.5)';
 
                     let avgLinePoints = [];
@@ -369,28 +369,25 @@ def render_tradingview_chart(df: pd.DataFrame, symbol: str, df_journal: pd.DataF
                         const yTop = candlestickSeries.priceToCoordinate(bin.price_high);
                         const yBottom = candlestickSeries.priceToCoordinate(bin.price_low);
                         
-                        if (yTop !== null && yBottom !== null) {{
+                        if (yTop !== null && yBottom !== null && !isNaN(yTop) && !isNaN(yBottom)) {{
                             const barHeight = Math.max(Math.abs(yBottom - yTop) - 1, 1);
                             const barWidth = (bin.volume / maxVol) * maxBarWidth;
                             const yPos = Math.min(yTop, yBottom);
 
-                            // Draw Volume Bar
                             ctx.fillRect(0, yPos, barWidth, barHeight);
                             ctx.strokeRect(0, yPos, barWidth, barHeight);
 
-                            // Store mid-point for Average Volume Line
                             const yMid = (yTop + yBottom) / 2;
                             const avgX = (avgVol / maxVol) * maxBarWidth;
                             avgLinePoints.push({{ x: avgX, y: yMid }});
                         }}
                     }});
 
-                    // Draw Vertical Average Volume Line through the profile
                     if (avgLinePoints.length > 1) {{
                         const avgX = (avgVol / maxVol) * maxBarWidth;
                         ctx.beginPath();
-                        ctx.setLineDash([4, 4]); // Dashed line
-                        ctx.strokeStyle = '#FFEB3B'; // Vibrant yellow
+                        ctx.setLineDash([4, 4]);
+                        ctx.strokeStyle = '#FFEB3B';
                         ctx.lineWidth = 2;
                         
                         const yMin = Math.min(...avgLinePoints.map(p => p.y));
@@ -399,16 +396,14 @@ def render_tradingview_chart(df: pd.DataFrame, symbol: str, df_journal: pd.DataF
                         ctx.moveTo(avgX, yMin);
                         ctx.lineTo(avgX, yMax);
                         ctx.stroke();
-                        ctx.setLineDash([]); // Reset dash
+                        ctx.setLineDash([]);
 
-                        // Draw Average Volume Label
                         ctx.fillStyle = '#FFEB3B';
                         ctx.font = '10px monospace';
                         ctx.fillText('AVG VOL', avgX + 4, yMin + 12);
                     }}
                 }}
 
-                // Redraw volume profile on zoom/pan/resize events
                 chart.timeScale().subscribeVisibleLogicalRangeChange(drawVolumeProfile);
                 chart.priceScale('right').subscribeVisibleLogicalRangeChange(drawVolumeProfile);
                 window.addEventListener('resize', () => {{
@@ -416,8 +411,7 @@ def render_tradingview_chart(df: pd.DataFrame, symbol: str, df_journal: pd.DataF
                     drawVolumeProfile();
                 }});
 
-                // Initial render delay for proper price scale initialization
-                setTimeout(drawVolumeProfile, 100);
+                setTimeout(drawVolumeProfile, 150);
 
             }} catch (err) {{
                 document.getElementById('chart-container').style.display = 'none';
