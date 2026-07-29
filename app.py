@@ -83,9 +83,9 @@ def fetch_market_data(symbol: str, timeframe: str = "1h", limit: int = 300) -> p
         exchange = ccxt.binance({'enableRateLimit': True, 'options': {'defaultType': 'spot'}})
         ohlcv = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
     except Exception:
-        # Fallback: Gate.io Endpoint
+        # Fallback: Gate.io Endpoint (Correct class name: ccxt.gate)
         try:
-            exchange = ccxt.gateio({'enableRateLimit': True})
+            exchange = ccxt.gate({'enableRateLimit': True})
             ohlcv = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
         except Exception as e:
             st.error(f"Error fetching chart data for {symbol}: {e}")
@@ -113,7 +113,6 @@ def fetch_market_data(symbol: str, timeframe: str = "1h", limit: int = 300) -> p
         df['adx'] = 0.0
 
     return df
-
 # =====================================================================
 # TRADINGVIEW LIGHTWEIGHT CHARTS HTML RENDERER
 # =====================================================================
