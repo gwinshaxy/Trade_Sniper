@@ -420,6 +420,9 @@ with tab2:
 
         df_chart = df_full.tail(chart_limit).copy().reset_index(drop=True)
 
+        # Categorical formatting for seamless x-axis alignment
+        x_labels = df_chart['timestamp'].dt.strftime('%Y-%m-%d %H:%M')
+
         # Get latest values for metrics display
         latest_row = df_chart.iloc[-1]
         prev_row = df_chart.iloc[-2] if len(df_chart) > 1 else latest_row
@@ -452,10 +455,10 @@ with tab2:
             specs=[[{"secondary_y": True}], [{"secondary_y": False}]]
         )
 
-        # 1. Properly Scaled Candlesticks (Passing Datetime Objects)
+        # 1. Candlesticks trace using formatted categorical string timestamps
         fig.add_trace(
             go.Candlestick(
-                x=df_chart['timestamp'],
+                x=x_labels,
                 open=df_chart['open'],
                 high=df_chart['high'],
                 low=df_chart['low'],
@@ -470,14 +473,14 @@ with tab2:
             row=1, col=1, secondary_y=False
         )
 
-        # 2. Volume Bars
+        # 2. Volume Bars aligned with categorical x-axis
         volume_colors = [
             'rgba(8, 153, 129, 0.4)' if close >= open_p else 'rgba(242, 54, 69, 0.4)'
             for close, open_p in zip(df_chart['close'], df_chart['open'])
         ]
         fig.add_trace(
             go.Bar(
-                x=df_chart['timestamp'],
+                x=x_labels,
                 y=df_chart['volume'],
                 name="Volume",
                 marker_color=volume_colors,
@@ -486,11 +489,11 @@ with tab2:
             row=1, col=1, secondary_y=True
         )
 
-        # 3. 200 TEMA Line
+        # 3. 200 TEMA Line aligned with categorical x-axis
         if 'tema_200' in df_chart.columns:
             fig.add_trace(
                 go.Scatter(
-                    x=df_chart['timestamp'],
+                    x=x_labels,
                     y=df_chart['tema_200'],
                     mode='lines',
                     name='200 TEMA',
@@ -500,11 +503,11 @@ with tab2:
                 row=1, col=1, secondary_y=False
             )
 
-        # 4. ADX Line
+        # 4. ADX Line aligned with categorical x-axis
         if 'adx' in df_chart.columns:
             fig.add_trace(
                 go.Scatter(
-                    x=df_chart['timestamp'],
+                    x=x_labels,
                     y=df_chart['adx'],
                     mode='lines',
                     name='ADX (14)',
@@ -521,8 +524,8 @@ with tab2:
                 annotation_text=f"Min ADX ({min_adx})"
             )
 
-        # Dynamic Annotations
-        last_x_val = df_chart['timestamp'].iloc[-1]
+        # Dynamic Annotations using string label reference
+        last_x_val = x_labels.iloc[-1]
         
         fig.add_hline(
             y=curr_price, 
@@ -578,12 +581,13 @@ with tab2:
 
         grid_color = "rgba(128, 128, 128, 0.15)"
 
-        # Correct Axis Configurations
+        # Apply category axis configuration across all subplots
         fig.update_xaxes(
+            type='category',
+            nticks=10,
             showgrid=True, 
             gridcolor=grid_color, 
-            zeroline=False,
-            type='date'  # Continuous datetime scaling
+            zeroline=False
         )
 
         fig.update_yaxes(
