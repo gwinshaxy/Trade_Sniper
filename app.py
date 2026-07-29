@@ -404,8 +404,10 @@ def render_tradingview_chart(df: pd.DataFrame, symbol: str, df_journal: pd.DataF
                     }}
                 }}
 
+                // Correct event listeners attached to timeScale
                 chart.timeScale().subscribeVisibleLogicalRangeChange(drawVolumeProfile);
-                chart.priceScale('right').subscribeVisibleLogicalRangeChange(drawVolumeProfile);
+                chart.timeScale().subscribeVisibleTimeRangeChange(drawVolumeProfile);
+                
                 window.addEventListener('resize', () => {{
                     chart.applyOptions({{ width: chartContainer.clientWidth }});
                     drawVolumeProfile();
