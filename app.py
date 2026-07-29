@@ -73,9 +73,16 @@ def clear_remote_journal():
 # =====================================================================
 # MARKET DATA & TECHNICAL INDICATOR CALCULATIONS
 # =====================================================================
+def calculate_tema_fallback(series: pd.Series, length: int = 200) -> pd.Series:
+    """Pure Pandas fallback calculation for TEMA 200."""
+    ema1 = series.ewm(span=length, adjust=False).mean()
+    ema2 = ema1.ewm(span=length, adjust=False).mean()
+    ema3 = ema2.ewm(span=length, adjust=False).mean()
+    return 3 * ema1 - 3 * ema2 + ema3
+
 @st.cache_data(ttl=60)
-def fetch_market_data(symbol: str, timeframe: str = "1h", limit: int = 500) -> pd.DataFrame:
-    """Fetches OHLCV market data and calculates 200 TEMA, ADX, and ATR% cleanly."""
+def fetch_market_data(symbol: str, timeframe: str = "1h", limit: int = 1000) -> pd.DataFrame:
+    """Fetches OHLCV market data (1000 bars for TEMA warm-up) and calculates indicators."""
     ohlcv = None
     
     # Primary: Binance Public REST Endpoint
@@ -104,14 +111,17 @@ def fetch_market_data(symbol: str, timeframe: str = "1h", limit: int = 500) -> p
     df = df.drop_duplicates(subset=['timestamp']).sort_values('timestamp').reset_index(drop=True)
     df['time'] = (df['timestamp'] / 1000).astype(int)
     
-    # 1. TEMA 200 Calculation + Explicit Numeric Casting
+    # 1. TEMA 200 Calculation (pandas_ta primary with native Pandas fallback)
     try:
-        raw_tema = ta.tema(df['close'], length=200)
-        df['tema_200'] = pd.to_numeric(raw_tema, errors='coerce')
+        df['tema_200'] = ta.tema(df['close'], length=200)
+        if df['tema_200'].dropna().empty:
+            df['tema_200'] = calculate_tema_fallback(df['close'], length=200)
     except Exception:
-        df['tema_200'] = np.nan
+        df['tema_200'] = calculate_tema_fallback(df['close'], length=200)
+        
+    df['tema_200'] = pd.to_numeric(df['tema_200'], errors='coerce')
 
-    # 2. ADX (14) Calculation + Explicit Numeric Casting
+    # 2. ADX (14) Calculation
     try:
         adx_df = ta.adx(df['high'], df['low'], df['close'], length=14)
         if adx_df is not None and not adx_df.empty:
@@ -121,7 +131,7 @@ def fetch_market_data(symbol: str, timeframe: str = "1h", limit: int = 500) -> p
     except Exception:
         df['adx'] = 0.0
 
-    # 3. ATR % Calculation + Explicit Numeric Casting
+    # 3. ATR % Calculation
     try:
         raw_atr = ta.atr(df['high'], df['low'], df['close'], length=14)
         df['atr'] = pd.to_numeric(raw_atr, errors='coerce')
@@ -148,7 +158,7 @@ def render_tradingview_chart(df: pd.DataFrame, symbol: str, df_journal: pd.DataF
             'close': float(row['close'])
         })
     
-    # 2. Safe TEMA 200 Extraction (Pandas native filtering prevents ufunc exceptions)
+    # 2. Safe TEMA 200 Extraction
     tema_records = []
     if 'tema_200' in df.columns:
         valid_tema = df[['time', 'tema_200']].dropna().copy()
@@ -158,7 +168,7 @@ def render_tradingview_chart(df: pd.DataFrame, symbol: str, df_journal: pd.DataF
         
         for _, r in valid_tema.iterrows():
             val = float(r['tema_200'])
-            if np.isfinite(val):  # Scalar check
+            if np.isfinite(val):
                 tema_records.append({
                     'time': int(r['time']),
                     'value': round(val, 6)
