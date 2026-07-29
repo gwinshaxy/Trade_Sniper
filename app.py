@@ -94,13 +94,11 @@ def calculate_volume_profile(df: pd.DataFrame, num_bins: int = 24):
     bins = np.linspace(p_min, p_max, num_bins + 1)
     bin_volumes = np.zeros(num_bins)
 
-    # Assign candle volume proportionally to price bins
     for _, row in df.iterrows():
         c_low, c_high, vol = row['low'], row['high'], row['volume']
         if pd.isna(vol) or vol <= 0 or c_high == c_low:
             continue
         
-        # Find index overlap
         mask = (bins[:-1] <= c_high) & (bins[1:] >= c_low)
         overlapping_bins = np.where(mask)[0]
         if len(overlapping_bins) > 0:
@@ -181,10 +179,10 @@ def fetch_market_data(symbol: str, timeframe: str = "1h", limit: int = 1000) -> 
     return df
 
 # =====================================================================
-# TRADINGVIEW LIGHTWEIGHT CHARTS HTML RENDERER WITH VOLUME PROFILE
+# TRADINGVIEW LIGHTWEIGHT CHARTS HTML RENDERER WITH FULLSCREEN CONTROL
 # =====================================================================
 def render_tradingview_chart(df: pd.DataFrame, symbol: str, df_journal: pd.DataFrame):
-    """Generates chart with Candlesticks, 200 TEMA, Trade Levels, and Volume Profile + Average Line."""
+    """Generates chart with Candlesticks, 200 TEMA, Aggregated Trade Levels, Volume Profile, and Fullscreen Mode."""
     
     candles_records = []
     for _, row in df.iterrows():
@@ -210,11 +208,10 @@ def render_tradingview_chart(df: pd.DataFrame, symbol: str, df_journal: pd.DataF
                     'value': round(val, 6)
                 })
 
-    # Volume Profile Calculations
     vp_bins, avg_vol = calculate_volume_profile(df, num_bins=28)
     max_vol = max([b['volume'] for b in vp_bins]) if vp_bins else 1.0
 
-    # Generate Active Trade Price Lines (Deduplicated to prevent axis crowding)
+    # --- AGGREGATE TRADE LINES TO PREVENT DUPLICATE AXIS TAGS ---
     price_lines_js = ""
     if not df_journal.empty and 'symbol' in df_journal.columns:
         symbol_trades = df_journal[
@@ -222,74 +219,83 @@ def render_tradingview_chart(df: pd.DataFrame, symbol: str, df_journal: pd.DataF
             (df_journal['status'].isin(['OPEN', 'TP1_HIT', 'PENDING']))
         ]
         
-        added_levels = set()
+        entries = {}
+        stop_losses = set()
+        tp1_levels = set()
+        tp2_levels = set()
 
         for _, trade in symbol_trades.iterrows():
-            trade_id = trade.get('id', '')
+            t_id = str(trade.get('id', ''))
             
-            entry_p = trade.get('entry_price')
-            if pd.notnull(entry_p) and float(entry_p) > 0:
-                key = f"ENTRY_{float(entry_p)}"
-                if key not in added_levels:
-                    added_levels.add(key)
-                    price_lines_js += f"""
-                    candlestickSeries.createPriceLine({{
-                        price: {float(entry_p)},
-                        color: '#2962FF',
-                        lineWidth: 2,
-                        lineStyle: LightweightCharts.LineStyle.Dashed,
-                        axisLabelVisible: true,
-                        title: 'ENTRY #{trade_id}',
-                    }});
-                    """
-                
-            sl_p = trade.get('stop_loss')
-            if pd.notnull(sl_p) and float(sl_p) > 0:
-                key = f"SL_{float(sl_p)}"
-                if key not in added_levels:
-                    added_levels.add(key)
-                    price_lines_js += f"""
-                    candlestickSeries.createPriceLine({{
-                        price: {float(sl_p)},
-                        color: '#FF5252',
-                        lineWidth: 2,
-                        lineStyle: LightweightCharts.LineStyle.Solid,
-                        axisLabelVisible: true,
-                        title: 'SL',
-                    }});
-                    """
+            p_entry = trade.get('entry_price')
+            if pd.notnull(p_entry) and float(p_entry) > 0:
+                price_val = float(p_entry)
+                entries.setdefault(price_val, []).append(t_id)
 
-            tp1_p = trade.get('take_profit_1')
-            if pd.notnull(tp1_p) and float(tp1_p) > 0:
-                key = f"TP1_{float(tp1_p)}"
-                if key not in added_levels:
-                    added_levels.add(key)
-                    price_lines_js += f"""
-                    candlestickSeries.createPriceLine({{
-                        price: {float(tp1_p)},
-                        color: '#00E676',
-                        lineWidth: 1,
-                        lineStyle: LightweightCharts.LineStyle.Dotted,
-                        axisLabelVisible: true,
-                        title: 'TP1',
-                    }});
-                    """
+            p_sl = trade.get('stop_loss')
+            if pd.notnull(p_sl) and float(p_sl) > 0:
+                stop_losses.add(float(p_sl))
 
-            tp2_p = trade.get('take_profit_2')
-            if pd.notnull(tp2_p) and float(tp2_p) > 0:
-                key = f"TP2_{float(tp2_p)}"
-                if key not in added_levels:
-                    added_levels.add(key)
-                    price_lines_js += f"""
-                    candlestickSeries.createPriceLine({{
-                        price: {float(tp2_p)},
-                        color: '#00B0FF',
-                        lineWidth: 1,
-                        lineStyle: LightweightCharts.LineStyle.Dotted,
-                        axisLabelVisible: true,
-                        title: 'TP2',
-                    }});
-                    """
+            p_tp1 = trade.get('take_profit_1')
+            if pd.notnull(p_tp1) and float(p_tp1) > 0:
+                tp1_levels.add(float(p_tp1))
+
+            p_tp2 = trade.get('take_profit_2')
+            if pd.notnull(p_tp2) and float(p_tp2) > 0:
+                tp2_levels.add(float(p_tp2))
+
+        # Render combined Entries
+        for price_val, ids in entries.items():
+            id_str = "#" + ", #".join(ids) if len(ids) <= 3 else f"{len(ids)} Trades"
+            price_lines_js += f"""
+            candlestickSeries.createPriceLine({{
+                price: {price_val},
+                color: '#2962FF',
+                lineWidth: 2,
+                lineStyle: LightweightCharts.LineStyle.Dashed,
+                axisLabelVisible: true,
+                title: 'ENTRY {id_str}',
+            }});
+            """
+
+        # Render Stop Losses
+        for sl_val in stop_losses:
+            price_lines_js += f"""
+            candlestickSeries.createPriceLine({{
+                price: {sl_val},
+                color: '#FF5252',
+                lineWidth: 2,
+                lineStyle: LightweightCharts.LineStyle.Solid,
+                axisLabelVisible: true,
+                title: 'SL',
+            }});
+            """
+
+        # Render Take Profit 1
+        for tp1_val in tp1_levels:
+            price_lines_js += f"""
+            candlestickSeries.createPriceLine({{
+                price: {tp1_val},
+                color: '#00E676',
+                lineWidth: 1,
+                lineStyle: LightweightCharts.LineStyle.Dotted,
+                axisLabelVisible: true,
+                title: 'TP1',
+            }});
+            """
+
+        # Render Take Profit 2
+        for tp2_val in tp2_levels:
+            price_lines_js += f"""
+            candlestickSeries.createPriceLine({{
+                price: {tp2_val},
+                color: '#00B0FF',
+                lineWidth: 1,
+                lineStyle: LightweightCharts.LineStyle.Dotted,
+                axisLabelVisible: true,
+                title: 'TP2',
+            }});
+            """
 
     html_code = f"""
     <!DOCTYPE html>
@@ -298,14 +304,23 @@ def render_tradingview_chart(df: pd.DataFrame, symbol: str, df_journal: pd.DataF
         <script src="https://unpkg.com/lightweight-charts@4.1.1/dist/lightweight-charts.standalone.production.js"></script>
         <style>
             html, body {{ margin: 0; padding: 0; width: 100%; height: 100%; background-color: #131722; font-family: monospace; overflow: hidden; }}
-            #chart-container {{ position: relative; width: 100%; height: 550px; }}
+            #chart-container {{ position: relative; width: 100%; height: 550px; background-color: #131722; }}
+            #chart-container.fullscreen {{ position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; z-index: 99999; }}
             #chart {{ width: 100%; height: 100%; }}
             #vp-canvas {{ position: absolute; top: 0; left: 0; pointer-events: none; z-index: 2; }}
+            #fullscreen-btn {{
+                position: absolute; top: 10px; right: 80px; z-index: 100;
+                background-color: rgba(42, 46, 57, 0.85); color: #d1d4dc;
+                border: 1px solid rgba(197, 203, 206, 0.4); border-radius: 4px;
+                padding: 4px 10px; font-size: 11px; cursor: pointer; transition: all 0.2s;
+            }}
+            #fullscreen-btn:hover {{ background-color: #2962FF; color: #ffffff; border-color: #2962FF; }}
             #error-overlay {{ color: #ff5252; padding: 20px; font-size: 14px; white-space: pre-wrap; display: none; }}
         </style>
     </head>
     <body>
         <div id="chart-container">
+            <button id="fullscreen-btn" onclick="toggleFullscreen()">⛶ Fullscreen</button>
             <div id="chart"></div>
             <canvas id="vp-canvas"></canvas>
         </div>
@@ -315,11 +330,12 @@ def render_tradingview_chart(df: pd.DataFrame, symbol: str, df_journal: pd.DataF
                 const chartContainer = document.getElementById('chart-container');
                 const chartElement = document.getElementById('chart');
                 const vpCanvas = document.getElementById('vp-canvas');
+                const fsBtn = document.getElementById('fullscreen-btn');
                 const ctx = vpCanvas.getContext('2d');
 
                 const chart = LightweightCharts.createChart(chartElement, {{
                     width: chartContainer.clientWidth || 800,
-                    height: 550,
+                    height: chartContainer.clientHeight || 550,
                     layout: {{
                         background: {{ type: 'solid', color: '#131722' }},
                         textColor: '#d1d4dc',
@@ -358,12 +374,12 @@ def render_tradingview_chart(df: pd.DataFrame, symbol: str, df_journal: pd.DataF
                     temaSeries.setData(temaData);
                 }}
 
-                // 3. Deduplicated Trade Entry, SL, TP Lines
+                // 3. Consolidated Trade Lines
                 {price_lines_js}
 
                 chart.timeScale().fitContent();
 
-                // 4. Volume Profile Overlay Renderer
+                // 4. Volume Profile Canvas Overlay
                 const vpBins = {json.dumps(vp_bins)};
                 const maxVol = {max_vol};
                 const avgVol = {avg_vol};
@@ -422,11 +438,40 @@ def render_tradingview_chart(df: pd.DataFrame, symbol: str, df_journal: pd.DataF
                     }}
                 }}
 
+                // --- FULLSCREEN TOGGLE FUNCTIONALITY ---
+                window.toggleFullscreen = function() {{
+                    const isFullscreen = chartContainer.classList.toggle('fullscreen');
+                    if (isFullscreen) {{
+                        fsBtn.innerText = "✕ Exit Fullscreen";
+                        chart.applyOptions({{
+                            width: window.innerWidth,
+                            height: window.innerHeight
+                        }});
+                    }} else {{
+                        fsBtn.innerText = "⛶ Fullscreen";
+                        chart.applyOptions({{
+                            width: chartContainer.parentElement.clientWidth || 800,
+                            height: 550
+                        }});
+                    }}
+                    drawVolumeProfile();
+                }};
+
+                document.addEventListener('keydown', (e) => {{
+                    if (e.key === 'Escape' && chartContainer.classList.contains('fullscreen')) {{
+                        toggleFullscreen();
+                    }}
+                }});
+
                 chart.timeScale().subscribeVisibleLogicalRangeChange(drawVolumeProfile);
                 chart.timeScale().subscribeVisibleTimeRangeChange(drawVolumeProfile);
                 
                 window.addEventListener('resize', () => {{
-                    chart.applyOptions({{ width: chartContainer.clientWidth }});
+                    if (chartContainer.classList.contains('fullscreen')) {{
+                        chart.applyOptions({{ width: window.innerWidth, height: window.innerHeight }});
+                    }} else {{
+                        chart.applyOptions({{ width: chartContainer.clientWidth, height: 550 }});
+                    }}
                     drawVolumeProfile();
                 }});
 
