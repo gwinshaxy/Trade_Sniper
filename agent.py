@@ -25,6 +25,7 @@ def load_config():
     default_config = {
         "account_balance": 1000.0,
         "risk_pct": 1.0,
+        "min_rr_ratio": 1.5,  # Minimum Risk/Reward threshold
         "proximity_threshold_pct": 2.0,
         "min_adx": 20.0,
         "min_atr_pct": 0.4,
@@ -91,7 +92,7 @@ def log_trade_signal(symbol, reasons, entry, sl, tp1, tp2, position_usdt, risk_u
         "max_risk_usd": float(risk_usd),
         "status": "OPEN"
     }
-    
+
     try:
         supabase.table("trade_journal").insert(data).execute()
         print(f"💾 Trade signal logged to Supabase for {symbol}.")
@@ -116,7 +117,7 @@ def fetch_market_data(symbol, timeframe='1h', limit=500):
 
     df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
     df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-    
+
     if len(df) >= 200:
         try:
             df['tema_200'] = ta.tema(df['close'], length=200)
@@ -141,32 +142,32 @@ def fetch_market_data(symbol, timeframe='1h', limit=500):
     except Exception:
         df['atr_14'] = 0.0
         df['atr_pct'] = 0.0
-        
+
     return df
 
 def calculate_volume_profile(df, num_bins=30):
     price_min = df['low'].min()
     price_max = df['high'].max()
-    
+
     bins = np.linspace(price_min, price_max, num_bins)
     df['bin'] = pd.cut(df['close'], bins=bins)
-    
+
     volume_profile = df.groupby('bin', observed=False)['volume'].sum().reset_index()
     volume_profile['price_mid'] = volume_profile['bin'].apply(lambda x: x.mid)
-    
+
     poc_row = volume_profile.loc[volume_profile['volume'].idxmax()]
     poc_price = poc_row['price_mid']
-    
+
     hvn_nodes = volume_profile.sort_values(by='volume', ascending=False).head(3)
     return poc_price, hvn_nodes['price_mid'].tolist()
 
 def calculate_fixed_risk_position(account_balance, entry_price, stop_loss_price, risk_pct=1.0):
     risk_amount = account_balance * (risk_pct / 100.0)
     price_risk_per_unit = abs(entry_price - stop_loss_price)
-    
+
     if price_risk_per_unit == 0:
         return 0, 0, 0
-    
+
     units = risk_amount / price_risk_per_unit
     position_size_usdt = units * entry_price
     return units, position_size_usdt, risk_amount
@@ -196,9 +197,9 @@ async def evaluate_active_trades(bot, chat_id, config):
     print(f"\n🔄 Evaluating {len(open_trades)} active signals in Supabase database...")
 
     for trade in open_trades:
+        symbol = str(trade.get('symbol', 'UNKNOWN'))
         try:
             trade_id = trade['id']
-            symbol = str(trade['symbol'])
             entry = float(trade['entry_price'])
             sl = float(trade['stop_loss'])
             tp1 = float(trade['take_profit_1'])
@@ -206,10 +207,10 @@ async def evaluate_active_trades(bot, chat_id, config):
             risk_usd = float(trade['max_risk_usd'])
             current_status = str(trade['status'])
             trade_time_str = str(trade['timestamp'])
-            
+
             trade_dt = datetime.strptime(trade_time_str, "%Y-%m-%d %H:%M:%S")
             hours_elapsed = (datetime.now() - trade_dt).total_seconds() / 3600
-            
+
             candles_needed = max(50, int(hours_elapsed * 4) + 10)
             candles_needed = min(candles_needed, 1000)
 
@@ -229,7 +230,7 @@ async def evaluate_active_trades(bot, chat_id, config):
             if latest_low <= sl:
                 pnl_usd = -risk_usd
                 realized_r = -1.0
-                
+
                 update_data = {
                     "status": "STOPPED_OUT",
                     "exit_price": float(sl),
@@ -274,7 +275,7 @@ async def evaluate_active_trades(bot, chat_id, config):
             # 3. Check Take Profit 1
             elif latest_high >= tp1 and current_status == 'OPEN':
                 r_multiple = abs(tp1 - entry) / abs(entry - sl) if abs(entry - sl) > 0 else 0
-                
+
                 supabase.table("trade_journal").update({"status": "TP1_HIT"}).eq("id", trade_id).execute()
 
                 if bot and chat_id:
@@ -294,14 +295,15 @@ async def evaluate_active_trades(bot, chat_id, config):
 # =====================================================================
 async def analyze_symbol(symbol, bot, chat_id, config):
     current_time = time.time()
-    
+
     account_balance = config.get("account_balance", 1000.0)
     risk_pct = config.get("risk_pct", 1.0)
+    min_rr_threshold = config.get("min_rr_ratio", 1.5)
     proximity_threshold = config.get("proximity_threshold_pct", 2.0)
     cooldown_hours = config.get("alert_cooldown_hours", 4)
     min_adx = config.get("min_adx", 20.0)
     min_atr_pct = config.get("min_atr_pct", 0.4)
-    
+
     if symbol in last_alert_time:
         elapsed_hours = (current_time - last_alert_time[symbol]) / 3600
         if elapsed_hours < cooldown_hours:
@@ -310,7 +312,7 @@ async def analyze_symbol(symbol, bot, chat_id, config):
 
     df_1h = fetch_market_data(symbol, timeframe='1h', limit=500)
     df_4h = fetch_market_data(symbol, timeframe='4h', limit=500)
-    
+
     if df_1h is None or df_4h is None:
         return
 
@@ -318,25 +320,25 @@ async def analyze_symbol(symbol, bot, chat_id, config):
     val_1h = df_1h['tema_200'].dropna().iloc[-1] if not df_1h['tema_200'].dropna().empty else None
     val_4h = df_4h['tema_200'].dropna().iloc[-1] if not df_4h['tema_200'].dropna().empty else None
     poc_price, hvn_prices = calculate_volume_profile(df_1h, num_bins=30)
-    
+
     # Proximity Triggers
     triggered_reasons = []
-    
+
     if val_1h is not None:
         dist_1h = abs(current_price - val_1h) / val_1h * 100
         if dist_1h <= proximity_threshold:
             triggered_reasons.append(f"Near 1H 200 TEMA ({dist_1h:.2f}% away)")
-            
+
     if val_4h is not None:
         dist_4h = abs(current_price - val_4h) / val_4h * 100
         if dist_4h <= proximity_threshold:
             triggered_reasons.append(f"Near 4H 200 TEMA ({dist_4h:.2f}% away)")
-            
+
     if poc_price is not None:
         dist_poc = abs(current_price - poc_price) / poc_price * 100
         if dist_poc <= proximity_threshold:
             triggered_reasons.append(f"Near Volume POC ({dist_poc:.2f}% away)")
-            
+
     if not triggered_reasons:
         print(f"[{symbol}] Price (${current_price:.4f}) outside threshold. No trigger.")
         return
@@ -358,18 +360,31 @@ async def analyze_symbol(symbol, bot, chat_id, config):
     # Execution & Sizing Parameters
     direction = "LONG"
     entry_price = current_price
-    
+
     atr_val = df_1h['atr_14'].dropna().iloc[-1] if 'atr_14' in df_1h and not pd.isna(df_1h['atr_14'].iloc[-1]) else entry_price * 0.01
     stop_loss = entry_price - (1.5 * atr_val) if atr_val > 0 else entry_price * 0.985
+
+    # Filter valid HVN prices sitting strictly above entry price
+    valid_hvns = [h for h in hvn_prices if h > entry_price] if hvn_prices else []
     
-    tp1 = hvn_prices[0] if hvn_prices and hvn_prices[0] > entry_price else entry_price * 1.03
+    tp1 = valid_hvns[0] if valid_hvns else entry_price * 1.03
     tp2 = poc_price if poc_price > entry_price else entry_price * 1.05
+
+    risk_amount_per_unit = abs(entry_price - stop_loss)
+    reward_amount_per_unit = abs(tp1 - entry_price)
+
+    rr_ratio = reward_amount_per_unit / risk_amount_per_unit if risk_amount_per_unit > 0 else 0.0
+
+    # =====================================================================
+    # 🚫 HARD FILTER GATE: RISK / REWARD CHECK
+    # =====================================================================
+    if rr_ratio < min_rr_threshold:
+        print(f"[{symbol}] 🛑 SIGNAL REJECTED: Risk/Reward ({rr_ratio:.2f}R) is below minimum threshold ({min_rr_threshold:.2f}R).")
+        return
 
     units, position_usdt, risk_usd = calculate_fixed_risk_position(
         account_balance, entry_price, stop_loss, risk_pct=risk_pct
     )
-    
-    rr_ratio = abs(tp1 - entry_price) / abs(entry_price - stop_loss) if abs(entry_price - stop_loss) > 0 else 0
 
     # Log trade directly to Supabase cloud database
     log_trade_signal(
@@ -402,7 +417,7 @@ async def analyze_symbol(symbol, bot, chat_id, config):
         f"• Risk/Reward Ratio: `{rr_ratio:.2f}R`\n\n"
         f"📄 Signal logged to Supabase Database"
     )
-    
+
     if bot and chat_id:
         await bot.send_message(chat_id=chat_id, text=message, parse_mode="Markdown")
 
@@ -414,16 +429,16 @@ async def run_scanner():
     telegram_chat_id = os.getenv("TELEGRAM_CHAT_ID") or config.get("telegram_chat_id")
 
     bot = Bot(token=telegram_bot_token) if telegram_bot_token else None
-    
+
     if bot and telegram_chat_id:
         startup_msg = "🟢 **Structural Trading Agent Initialized & Active.** Scanning loop starting..."
         await bot.send_message(chat_id=telegram_chat_id, text=startup_msg, parse_mode="Markdown")
-    
+
     while True:
         current_config = load_config()
         watchlist = current_config.get("watchlist", [])
         scan_interval = current_config.get("scan_interval_minutes", 15)
-        
+
         # 1. Run Active Trade Evaluator against Supabase
         await evaluate_active_trades(bot, telegram_chat_id, current_config)
 
@@ -435,7 +450,7 @@ async def run_scanner():
                 await asyncio.sleep(2)
             except Exception as e:
                 print(f"Error scanning {symbol}: {e}")
-                
+
         print(f"Cycle completed. Sleeping for {scan_interval} minutes...")
         await asyncio.sleep(scan_interval * 60)
 
