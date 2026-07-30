@@ -187,7 +187,118 @@ def fetch_market_data(symbol: str, timeframe: str = "1h", limit: int = 1000) -> 
     return df
 
 # =====================================================================
-# TRADINGVIEW LIGHTWEIGHT CHARTS HTML RENDERER WITH FULLSCREEN CONTROL
+# HISTORICAL BACKTESTING ENGINE
+# =====================================================================
+def run_backtest(df: pd.DataFrame, initial_balance: float, risk_pct: float, target_rr: float, min_adx: float, min_atr_pct: float, proximity_pct: float):
+    """Simulates trading strategy against historical dataframe."""
+    if df.empty or len(df) < 200:
+        return pd.DataFrame(), {}
+
+    balance = initial_balance
+    trades = []
+    in_trade = False
+    active_trade = None
+
+    for i in range(200, len(df)):
+        row = df.iloc[i]
+        price = row['close']
+        tema = row['tema_200']
+        adx = row['adx']
+        atr_pct = row['atr_pct']
+        atr_val = row['atr']
+        timestamp = datetime.fromtimestamp(row['time']).strftime('%Y-%m-%d %H:%M')
+
+        if not in_trade:
+            # Check strategy entry conditions
+            if pd.notnull(tema) and tema > 0 and adx >= min_adx and atr_pct >= min_atr_pct:
+                prox = abs(price - tema) / tema * 100
+                if prox <= proximity_pct:
+                    # Direction check: Long if above TEMA, Short if below
+                    side = "LONG" if price >= tema else "SHORT"
+                    entry_price = price
+                    
+                    if side == "LONG":
+                        sl = entry_price - (1.5 * atr_val)
+                        tp = entry_price + (1.5 * atr_val * target_rr)
+                    else:
+                        sl = entry_price + (1.5 * atr_val)
+                        tp = entry_price - (1.5 * atr_val * target_rr)
+
+                    risk_usd = balance * (risk_pct / 100.0)
+                    
+                    in_trade = True
+                    active_trade = {
+                        "entry_time": timestamp,
+                        "side": side,
+                        "entry": entry_price,
+                        "sl": sl,
+                        "tp": tp,
+                        "risk_usd": risk_usd
+                    }
+        else:
+            # Evaluate exit conditions for active trade
+            high = row['high']
+            low = row['low']
+            side = active_trade["side"]
+            
+            pnl_r = 0.0
+            pnl_usd = 0.0
+            exit_price = None
+            result = None
+
+            if side == "LONG":
+                if low <= active_trade["sl"]:
+                    result = "LOSS"
+                    exit_price = active_trade["sl"]
+                    pnl_r = -1.0
+                    pnl_usd = -active_trade["risk_usd"]
+                elif high >= active_trade["tp"]:
+                    result = "WIN"
+                    exit_price = active_trade["tp"]
+                    pnl_r = target_rr
+                    pnl_usd = active_trade["risk_usd"] * target_rr
+            else:
+                if high >= active_trade["sl"]:
+                    result = "LOSS"
+                    exit_price = active_trade["sl"]
+                    pnl_r = -1.0
+                    pnl_usd = -active_trade["risk_usd"]
+                elif low <= active_trade["tp"]:
+                    result = "WIN"
+                    exit_price = active_trade["tp"]
+                    pnl_r = target_rr
+                    pnl_usd = active_trade["risk_usd"] * target_rr
+
+            if result:
+                balance += pnl_usd
+                trades.append({
+                    "Entry Time": active_trade["entry_time"],
+                    "Exit Time": timestamp,
+                    "Side": active_trade["side"],
+                    "Entry ($)": round(active_trade["entry"], 4),
+                    "Exit ($)": round(exit_price, 4),
+                    "Result": result,
+                    "PnL ($)": round(pnl_usd, 2),
+                    "Realized R": f"{pnl_r:.2f}R",
+                    "Balance ($)": round(balance, 2)
+                })
+                in_trade = False
+                active_trade = None
+
+    trades_df = pd.DataFrame(trades)
+    
+    metrics = {
+        "Starting Balance": f"${initial_balance:.2f}",
+        "Final Balance": f"${balance:.2f}",
+        "Total Trades": len(trades_df),
+        "Win Rate": f"{(len(trades_df[trades_df['Result'] == 'WIN']) / len(trades_df) * 100):.1f}%" if not trades_df.empty else "0.0%",
+        "Net Return": f"{((balance - initial_balance) / initial_balance * 100):.2f}%"
+    }
+
+    return trades_df, metrics
+
+# =====================================================================
+# TRADINGVIEW LIGHTWEIGHT CHARTS HTML RENDERER
 # =====================================================================
 def render_tradingview_chart(df: pd.DataFrame, symbol: str, df_journal: pd.DataFrame):
     """Generates chart with Candlesticks, 200 TEMA, Aggregated Trade Levels, Volume Profile, and Fullscreen Mode."""
@@ -219,7 +330,6 @@ def render_tradingview_chart(df: pd.DataFrame, symbol: str, df_journal: pd.DataF
     vp_bins, avg_vol = calculate_volume_profile(df, num_bins=28)
     max_vol = max([b['volume'] for b in vp_bins]) if vp_bins else 1.0
 
-    # --- AGGREGATE TRADE LEVELS BY ZONE (2 DECIMALS) TO COLLAPSE AXIS BADGES ---
     price_lines_js = ""
     if not df_journal.empty and 'symbol' in df_journal.columns:
         symbol_trades = df_journal[
@@ -537,8 +647,6 @@ with st.sidebar:
             value=float(config.get("min_atr_pct", 0.4)), 
             step=0.05
         )
-        
-        # ➕ Added: Risk/Reward & Cooldown Fields
         min_rr_ratio = st.number_input(
             "Min Risk/Reward Ratio (R)", 
             value=float(config.get("min_rr_ratio", 1.5)), 
@@ -551,14 +659,12 @@ with st.sidebar:
             max_value=48, 
             step=1
         )
-        
         scan_interval = st.number_input(
             "Scan Interval (mins)", 
             value=int(config.get("scan_interval_minutes", 15)), 
             step=1
         )
         
-        # ➕ Added: Interactive Multiselect + Custom Watchlist Ticker
         current_watchlist = config.get("watchlist", [])
         all_options = list(dict.fromkeys(AVAILABLE_PAIRS + current_watchlist))
         
@@ -624,10 +730,11 @@ else:
 st.divider()
 
 # --- MAIN TABBED INTERFACE ---
-tab_active, tab_history, tab_charts, tab_database = st.tabs([
+tab_active, tab_history, tab_charts, tab_backtest, tab_database = st.tabs([
     "🔥 Active Trades", 
     "📜 Closed History", 
     "📈 TradingView Chart", 
+    "🧪 Historical Backtest",
     "🛠️ Database Operations"
 ])
 
@@ -709,7 +816,51 @@ with tab_charts:
     else:
         st.warning("Could not fetch market data for the selected symbol.")
 
-# TAB 4: DATABASE OPERATIONS
+# TAB 4: HISTORICAL BACKTEST
+with tab_backtest:
+    st.subheader("🧪 Historical Backtesting Engine")
+    st.caption("Simulate current bot parameter filters on historical OHLCV data.")
+    
+    b_col1, b_col2, b_col3 = st.columns([2, 1, 1])
+    with b_col1:
+        bt_symbol = st.selectbox("Backtest Asset", config.get("watchlist", ["NEAR/USDT"]), key="bt_sym")
+    with b_col2:
+        bt_tf = st.selectbox("Timeframe", ["15m", "1h", "4h"], index=1, key="bt_tf")
+    with b_col3:
+        bt_limit = st.select_slider("Historical Bars Limit", options=[300, 500, 1000], value=1000)
+        
+    if st.button("🚀 Run Backtest", type="primary", use_container_width=True):
+        with st.spinner("Fetching historical data and computing signals..."):
+            df_bt = fetch_market_data(bt_symbol, timeframe=bt_tf, limit=bt_limit)
+            if not df_bt.empty:
+                sim_trades, sim_metrics = run_backtest(
+                    df=df_bt,
+                    initial_balance=config.get("account_balance", 1000.0),
+                    risk_pct=config.get("risk_pct", 1.0),
+                    target_rr=config.get("min_rr_ratio", 1.5),
+                    min_adx=config.get("min_adx", 20.0),
+                    min_atr_pct=config.get("min_atr_pct", 0.4),
+                    proximity_pct=config.get("proximity_threshold_pct", 2.0)
+                )
+                
+                # Render Metric Cards
+                m_c1, m_c2, m_c3, m_c4, m_c5 = st.columns(5)
+                m_c1.metric("Starting Balance", sim_metrics["Starting Balance"])
+                m_c2.metric("Final Balance", sim_metrics["Final Balance"])
+                m_c3.metric("Simulated Trades", sim_metrics["Total Trades"])
+                m_c4.metric("Win Rate", sim_metrics["Win Rate"])
+                m_c5.metric("Net Return", sim_metrics["Net Return"])
+                
+                st.divider()
+                
+                if not sim_trades.empty:
+                    st.dataframe(sim_trades, use_container_width=True, hide_index=True)
+                else:
+                    st.info("No trades were triggered during this historical period with the current parameters.")
+            else:
+                st.error("Failed to load historical data for backtesting.")
+
+# TAB 5: DATABASE OPERATIONS
 with tab_database:
     st.subheader("Raw Supabase Table Viewer & Storage Control")
     if not df_journal.empty:
