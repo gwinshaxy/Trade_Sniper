@@ -19,6 +19,14 @@ st.set_page_config(
 
 load_dotenv()
 
+# Master options list for popular trading pairs
+AVAILABLE_PAIRS = [
+    "ONDO/USDT", "PENDLE/USDT", "LINK/USDT", "TIA/USDT", "NEAR/USDT",
+    "BTC/USDT", "ETH/USDT", "SOL/USDT", "AVAX/USDT", "SUI/USDT",
+    "AR/USDT", "FET/USDT", "RENDER/USDT", "TAO/USDT", "SYRUP/USDT",
+    "AAVE/USDT", "UNI/USDT", "APT/USDT", "INJ/USDT", "SEI/USDT"
+]
+
 # =====================================================================
 # SUPABASE DATABASE CONNECTION
 # =====================================================================
@@ -247,7 +255,6 @@ def render_tradingview_chart(df: pd.DataFrame, symbol: str, df_journal: pd.DataF
                 zone_key = round(float(p_tp2), 2)
                 tp2_levels.setdefault(zone_key, []).append((float(p_tp2), t_id))
 
-        # Helper to output a single consolidated price line per zone
         def build_line(data_dict, color, style, prefix):
             js_out = ""
             for _, item_list in data_dict.items():
@@ -327,7 +334,6 @@ def render_tradingview_chart(df: pd.DataFrame, symbol: str, df_journal: pd.DataF
                     }},
                 }});
 
-                // 1. Candlestick Series
                 const candlestickSeries = chart.addCandlestickSeries({{
                     upColor: '#26a69a', downColor: '#ef5350', borderVisible: false,
                     wickUpColor: '#26a69a', wickDownColor: '#ef5350',
@@ -335,7 +341,6 @@ def render_tradingview_chart(df: pd.DataFrame, symbol: str, df_journal: pd.DataF
                 const candleData = {json.dumps(candles_records)};
                 candlestickSeries.setData(candleData);
 
-                // 2. 200 TEMA Line Series
                 const temaData = {json.dumps(tema_records)};
                 if (temaData && temaData.length > 0) {{
                     const temaSeries = chart.addLineSeries({{
@@ -348,12 +353,10 @@ def render_tradingview_chart(df: pd.DataFrame, symbol: str, df_journal: pd.DataF
                     temaSeries.setData(temaData);
                 }}
 
-                // 3. Consolidated Trade Price Lines
                 {price_lines_js}
 
                 chart.timeScale().fitContent();
 
-                // 4. Volume Profile Canvas Overlay
                 const vpBins = {json.dumps(vp_bins)};
                 const maxVol = {max_vol};
                 const avgVol = {avg_vol};
@@ -412,7 +415,6 @@ def render_tradingview_chart(df: pd.DataFrame, symbol: str, df_journal: pd.DataF
                     }}
                 }}
 
-                // --- FULLSCREEN TOGGLE FUNCTIONALITY ---
                 window.toggleFullscreen = function() {{
                     const isFullscreen = chartContainer.classList.toggle('fullscreen');
                     if (isFullscreen) {{
@@ -475,21 +477,22 @@ def load_config():
         "proximity_threshold_pct": 2.0,
         "min_adx": 20.0,
         "min_atr_pct": 0.4,
-        "scan_interval_minutes": 15,
+        "min_rr_ratio": 1.5,
         "alert_cooldown_hours": 4,
-        "watchlist": ["ONDO/USDT", "PENDLE/USDT", "LINK/USDT", "TIA/USDT", "NEAR/USDT", "SYRUP/USDT"]
+        "scan_interval_minutes": 15,
+        "watchlist": ["ONDO/USDT", "PENDLE/USDT", "LINK/USDT", "TIA/USDT", "NEAR/USDT"]
     }
     if not os.path.exists(CONFIG_FILE):
         return default_config
     try:
-        with open(CONFIG_FILE, "r") as f:
+        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
             return {**default_config, **json.load(f)}
     except Exception:
         return default_config
 
 def save_config(config_data):
     try:
-        with open(CONFIG_FILE, "w") as f:
+        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
             json.dump(config_data, f, indent=4)
         st.toast("Settings saved!", icon="💾")
     except Exception as e:
@@ -509,27 +512,81 @@ with st.sidebar:
     st.header("⚙️ Bot Parameters")
     
     with st.form("config_form"):
-        account_balance = st.number_input("Account Balance ($)", value=float(config.get("account_balance", 1000.0)), step=50.0)
-        risk_pct = st.number_input("Risk Per Trade (%)", value=float(config.get("risk_pct", 1.0)), step=0.25)
-        proximity_thresh = st.number_input("Proximity Threshold (%)", value=float(config.get("proximity_threshold_pct", 2.0)), step=0.5)
-        min_adx = st.number_input("Min ADX Filter", value=float(config.get("min_adx", 20.0)), step=1.0)
-        min_atr = st.number_input("Min ATR % Filter", value=float(config.get("min_atr_pct", 0.4)), step=0.1)
-        scan_interval = st.number_input("Scan Interval (mins)", value=int(config.get("scan_interval_minutes", 15)), step=1)
+        account_balance = st.number_input(
+            "Account Balance ($)", 
+            value=float(config.get("account_balance", 1000.0)), 
+            step=50.0
+        )
+        risk_pct = st.number_input(
+            "Risk Per Trade (%)", 
+            value=float(config.get("risk_pct", 1.0)), 
+            step=0.1
+        )
+        proximity_thresh = st.number_input(
+            "Proximity Threshold (%)", 
+            value=float(config.get("proximity_threshold_pct", 2.0)), 
+            step=0.1
+        )
+        min_adx = st.number_input(
+            "Min ADX Filter", 
+            value=float(config.get("min_adx", 20.0)), 
+            step=1.0
+        )
+        min_atr = st.number_input(
+            "Min ATR % Filter", 
+            value=float(config.get("min_atr_pct", 0.4)), 
+            step=0.05
+        )
         
-        watchlist_raw = st.text_area("Watchlist (comma-separated)", value=", ".join(config.get("watchlist", [])))
+        # ➕ Added: Risk/Reward & Cooldown Fields
+        min_rr_ratio = st.number_input(
+            "Min Risk/Reward Ratio (R)", 
+            value=float(config.get("min_rr_ratio", 1.5)), 
+            step=0.1
+        )
+        alert_cooldown = st.number_input(
+            "Alert Cooldown (hours)", 
+            value=int(config.get("alert_cooldown_hours", 4)), 
+            min_value=1, 
+            max_value=48, 
+            step=1
+        )
+        
+        scan_interval = st.number_input(
+            "Scan Interval (mins)", 
+            value=int(config.get("scan_interval_minutes", 15)), 
+            step=1
+        )
+        
+        # ➕ Added: Interactive Multiselect + Custom Watchlist Ticker
+        current_watchlist = config.get("watchlist", [])
+        all_options = list(dict.fromkeys(AVAILABLE_PAIRS + current_watchlist))
+        
+        selected_watchlist = st.multiselect(
+            "Select or Search Watchlist Assets:",
+            options=all_options,
+            default=current_watchlist,
+            help="Select assets to scan. Click 'x' on any chip to remove it."
+        )
+        
+        custom_asset = st.text_input("Add Custom Asset (e.g. SOL/USDT):", "").strip().upper()
         
         submitted = st.form_submit_button("Save Configuration")
         if submitted:
-            new_watchlist = [symbol.strip().upper() for symbol in watchlist_raw.split(",") if symbol.strip()]
+            final_watchlist = list(selected_watchlist)
+            if custom_asset and custom_asset not in final_watchlist:
+                final_watchlist.append(custom_asset)
+
             updated_config = {
                 "account_balance": account_balance,
                 "risk_pct": risk_pct,
                 "proximity_threshold_pct": proximity_thresh,
                 "min_adx": min_adx,
                 "min_atr_pct": min_atr,
+                "min_rr_ratio": min_rr_ratio,
+                "alert_cooldown_hours": alert_cooldown,
                 "scan_interval_minutes": scan_interval,
-                "alert_cooldown_hours": config.get("alert_cooldown_hours", 4),
-                "watchlist": new_watchlist
+                "watchlist": final_watchlist
             }
             save_config(updated_config)
             st.rerun()
@@ -615,7 +672,8 @@ with tab_charts:
     
     col_sym, col_tf = st.columns([2, 1])
     with col_sym:
-        selected_symbol = st.selectbox("Select Asset", config.get("watchlist", ["NEAR/USDT"]))
+        watchlist_options = config.get("watchlist", ["NEAR/USDT"])
+        selected_symbol = st.selectbox("Select Asset", watchlist_options if watchlist_options else ["NEAR/USDT"])
     with col_tf:
         selected_tf = st.selectbox("Timeframe", ["15m", "1h", "4h"], index=1)
         
