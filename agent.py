@@ -23,9 +23,9 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY) if SUPABASE_URL and
 
 def load_config():
     default_config = {
-        "account_balance": 1000.0,
+        "account_balance": 100.0,  # Updated default balance to $100
         "risk_pct": 1.0,
-        "min_rr_ratio": 1.5,  # Minimum Risk/Reward threshold
+        "min_rr_ratio": 1.5,
         "proximity_threshold_pct": 2.0,
         "min_adx": 20.0,
         "min_atr_pct": 0.4,
@@ -37,9 +37,21 @@ def load_config():
             "LINK/USDT",
             "TIA/USDT",
             "NEAR/USDT",
-            "SYRUP/USDT"
+            "SOL/USDT",
+            "AR/USDT",
+            "FET/USDT",
+            "RENDER/USDT",
+            "TAO/USDT",
+            "SYRUP/USDT",
+            "SEI/USDT",
+            "CFG/USDT",
+            "HNT/USDT",
+            "XRP/USDT",
+            "DOGE/USDT"
         ]
     }
+    
+    # If config.json doesn't exist, create it with defaults
     if not os.path.exists(CONFIG_FILE):
         with open(CONFIG_FILE, "w", encoding="utf-8") as f:
             json.dump(default_config, f, indent=4)
@@ -47,9 +59,12 @@ def load_config():
 
     try:
         with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-            config = json.load(f)
-            return {**default_config, **config}
-    except Exception:
+            existing_config = json.load(f)
+            # Merge existing values over defaults so custom watchlists & balance are preserved
+            merged_config = {**default_config, **existing_config}
+            return merged_config
+    except Exception as e:
+        print(f"⚠️ Error loading {CONFIG_FILE}, falling back to defaults: {e}")
         return default_config
 
 def get_exchange():
@@ -226,8 +241,12 @@ async def evaluate_active_trades(bot, chat_id, config):
             latest_high = df_candles['high'].max()
             close_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
+            # Direction inference from SL position relative to Entry
+            is_long = sl < entry
+
             # 1. Check Stop Loss
-            if latest_low <= sl:
+            sl_hit = (latest_low <= sl) if is_long else (latest_high >= sl)
+            if sl_hit:
                 pnl_usd = -risk_usd
                 realized_r = -1.0
 
@@ -250,7 +269,8 @@ async def evaluate_active_trades(bot, chat_id, config):
                     await bot.send_message(chat_id=chat_id, text=msg, parse_mode="Markdown")
 
             # 2. Check Take Profit 2
-            elif latest_high >= tp2:
+            tp2_hit = (latest_high >= tp2) if is_long else (latest_low <= tp2)
+            if tp2_hit:
                 r_multiple = abs(tp2 - entry) / abs(entry - sl) if abs(entry - sl) > 0 else 0
                 pnl_usd = risk_usd * r_multiple
 
@@ -273,7 +293,8 @@ async def evaluate_active_trades(bot, chat_id, config):
                     await bot.send_message(chat_id=chat_id, text=msg, parse_mode="Markdown")
 
             # 3. Check Take Profit 1
-            elif latest_high >= tp1 and current_status == 'OPEN':
+            tp1_hit = (latest_high >= tp1) if is_long else (latest_low <= tp1)
+            if tp1_hit and current_status == 'OPEN':
                 r_multiple = abs(tp1 - entry) / abs(entry - sl) if abs(entry - sl) > 0 else 0
 
                 supabase.table("trade_journal").update({"status": "TP1_HIT"}).eq("id", trade_id).execute()
@@ -296,7 +317,7 @@ async def evaluate_active_trades(bot, chat_id, config):
 async def analyze_symbol(symbol, bot, chat_id, config):
     current_time = time.time()
 
-    account_balance = config.get("account_balance", 1000.0)
+    account_balance = config.get("account_balance", 100.0)
     risk_pct = config.get("risk_pct", 1.0)
     min_rr_threshold = config.get("min_rr_ratio", 1.5)
     proximity_threshold = config.get("proximity_threshold_pct", 2.0)
@@ -358,17 +379,24 @@ async def analyze_symbol(symbol, bot, chat_id, config):
     print(f"🎯 TRIGGER & FILTERS MATCH for {symbol}: {', '.join(triggered_reasons)} (ADX: {current_adx:.2f}, ATR%: {current_atr_pct:.2f}%)")
 
     # Execution & Sizing Parameters
-    direction = "LONG"
+    tema_ref = val_1h if val_1h is not None else current_price
+    direction = "LONG" if current_price >= tema_ref else "SHORT"
     entry_price = current_price
 
+    # Fetch ATR value safely
     atr_val = df_1h['atr_14'].dropna().iloc[-1] if 'atr_14' in df_1h and not pd.isna(df_1h['atr_14'].iloc[-1]) else entry_price * 0.01
-    stop_loss = entry_price - (1.5 * atr_val) if atr_val > 0 else entry_price * 0.985
 
-    # Filter valid HVN prices sitting strictly above entry price
-    valid_hvns = [h for h in hvn_prices if h > entry_price] if hvn_prices else []
-    
-    tp1 = valid_hvns[0] if valid_hvns else entry_price * 1.03
-    tp2 = poc_price if poc_price > entry_price else entry_price * 1.05
+    # Dynamic Stop Loss & Take Profit Targets based on Direction
+    if direction == "LONG":
+        stop_loss = entry_price - (1.5 * atr_val) if atr_val > 0 else entry_price * 0.985
+        valid_hvns = [h for h in hvn_prices if h > entry_price] if hvn_prices else []
+        tp1 = valid_hvns[0] if valid_hvns else entry_price * 1.03
+        tp2 = poc_price if (poc_price and poc_price > entry_price) else entry_price * (1 + 0.015 * min_rr_threshold)
+    else:
+        stop_loss = entry_price + (1.5 * atr_val) if atr_val > 0 else entry_price * 1.015
+        valid_hvns = [h for h in hvn_prices if h < entry_price] if hvn_prices else []
+        tp1 = valid_hvns[-1] if valid_hvns else entry_price * 0.97
+        tp2 = poc_price if (poc_price and poc_price < entry_price) else entry_price * (1 - 0.015 * min_rr_threshold)
 
     risk_amount_per_unit = abs(entry_price - stop_loss)
     reward_amount_per_unit = abs(tp1 - entry_price)
