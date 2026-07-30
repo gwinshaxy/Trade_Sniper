@@ -1,5 +1,6 @@
 import os
 import json
+import gc
 import ccxt
 import pandas as pd
 import numpy as np
@@ -63,11 +64,13 @@ def load_trade_journal() -> pd.DataFrame:
         ]
         for col in numeric_cols:
             if col in df.columns:
-                df[col] = pd.to_numeric(df[col], errors='coerce')
+                df[col] = pd.to_numeric(df[col], errors='coerce').astype(np.float32)
         return df
     except Exception as e:
         st.error(f"Error loading trade journal: {e}")
         return pd.DataFrame()
+    finally:
+        gc.collect()
 
 def clear_remote_journal():
     if supabase:
@@ -86,21 +89,23 @@ def calculate_tema_fallback(series: pd.Series, length: int = 200) -> pd.Series:
     ema1 = series.ewm(span=length, adjust=False).mean()
     ema2 = ema1.ewm(span=length, adjust=False).mean()
     ema3 = ema2.ewm(span=length, adjust=False).mean()
-    return 3 * ema1 - 3 * ema2 + ema3
+    res = 3 * ema1 - 3 * ema2 + ema3
+    del ema1, ema2, ema3
+    return res
 
 def calculate_volume_profile(df: pd.DataFrame, num_bins: int = 24):
     """Calculates price volume histogram and average volume threshold line."""
     if df.empty or 'volume' not in df.columns:
         return [], 0.0
 
-    p_min = df['low'].min()
-    p_max = df['high'].max()
+    p_min = float(df['low'].min())
+    p_max = float(df['high'].max())
     
     if p_min == p_max or pd.isna(p_min) or pd.isna(p_max):
         return [], 0.0
 
-    bins = np.linspace(p_min, p_max, num_bins + 1)
-    bin_volumes = np.zeros(num_bins)
+    bins = np.linspace(p_min, p_max, num_bins + 1, dtype=np.float32)
+    bin_volumes = np.zeros(num_bins, dtype=np.float32)
 
     for _, row in df.iterrows():
         c_low, c_high, vol = row['low'], row['high'], row['volume']
@@ -127,11 +132,13 @@ def calculate_volume_profile(df: pd.DataFrame, num_bins: int = 24):
             'vol_ratio': float(bin_volumes[i] / max_vol) if max_vol > 0 else 0.0
         })
 
+    del bins, bin_volumes
     return vp_data, avg_vol
 
-@st.cache_data(ttl=60)
-def fetch_market_data(symbol: str, timeframe: str = "1h", limit: int = 1000) -> pd.DataFrame:
-    """Fetches OHLCV market data (1000 bars for TEMA warm-up) and calculates indicators."""
+# Optimized memory cache limits
+@st.cache_data(ttl=120, max_entries=3)
+def fetch_market_data(symbol: str, timeframe: str = "1h", limit: int = 350) -> pd.DataFrame:
+    """Fetches OHLCV market data and calculates indicators using minimal memory."""
     ohlcv = None
     
     try:
@@ -149,9 +156,12 @@ def fetch_market_data(symbol: str, timeframe: str = "1h", limit: int = 1000) -> 
         return pd.DataFrame()
 
     df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+    del ohlcv  # Free raw CCXT response list
     
-    for col in ['open', 'high', 'low', 'close', 'volume']:
-        df[col] = pd.to_numeric(df[col], errors='coerce')
+    # Downcast floats to float32 to save ~50% RAM
+    float_cols = ['open', 'high', 'low', 'close', 'volume']
+    for col in float_cols:
+        df[col] = pd.to_numeric(df[col], errors='coerce').astype(np.float32)
         
     df = df.drop_duplicates(subset=['timestamp']).sort_values('timestamp').reset_index(drop=True)
     df['time'] = (df['timestamp'] / 1000).astype(int)
@@ -164,56 +174,57 @@ def fetch_market_data(symbol: str, timeframe: str = "1h", limit: int = 1000) -> 
     except Exception:
         df['tema_200'] = calculate_tema_fallback(df['close'], length=200)
         
-    df['tema_200'] = pd.to_numeric(df['tema_200'], errors='coerce')
+    df['tema_200'] = pd.to_numeric(df['tema_200'], errors='coerce').astype(np.float32)
 
     # 2. ADX (14) Calculation
     try:
         adx_df = ta.adx(df['high'], df['low'], df['close'], length=14)
         if adx_df is not None and not adx_df.empty:
-            df['adx'] = pd.to_numeric(adx_df['ADX_14'], errors='coerce')
+            df['adx'] = pd.to_numeric(adx_df['ADX_14'], errors='coerce').astype(np.float32)
+            del adx_df
         else:
-            df['adx'] = 0.0
+            df['adx'] = np.float32(0.0)
     except Exception:
-        df['adx'] = 0.0
+        df['adx'] = np.float32(0.0)
 
     # 3. ATR % Calculation
     try:
         raw_atr = ta.atr(df['high'], df['low'], df['close'], length=14)
-        df['atr'] = pd.to_numeric(raw_atr, errors='coerce')
-        df['atr_pct'] = (df['atr'] / df['close']) * 100
+        df['atr'] = pd.to_numeric(raw_atr, errors='coerce').astype(np.float32)
+        df['atr_pct'] = ((df['atr'] / df['close']) * 100).astype(np.float32)
+        del raw_atr
     except Exception:
-        df['atr_pct'] = 0.0
+        df['atr_pct'] = np.float32(0.0)
 
+    gc.collect()
     return df
 
 # =====================================================================
 # HISTORICAL BACKTESTING ENGINE
 # =====================================================================
 def run_backtest(df: pd.DataFrame, initial_balance: float, risk_pct: float, target_rr: float, min_adx: float, min_atr_pct: float, proximity_pct: float):
-    """Simulates trading strategy against historical dataframe."""
+    """Simulates trading strategy against historical dataframe with active GC."""
     if df.empty or len(df) < 200:
         return pd.DataFrame(), {}
 
-    balance = initial_balance
+    balance = float(initial_balance)
     trades = []
     in_trade = False
     active_trade = None
 
     for i in range(200, len(df)):
         row = df.iloc[i]
-        price = row['close']
-        tema = row['tema_200']
-        adx = row['adx']
-        atr_pct = row['atr_pct']
-        atr_val = row['atr']
-        timestamp = datetime.fromtimestamp(row['time']).strftime('%Y-%m-%d %H:%M')
+        price = float(row['close'])
+        tema = float(row['tema_200']) if pd.notnull(row['tema_200']) else 0.0
+        adx = float(row['adx'])
+        atr_pct = float(row['atr_pct'])
+        atr_val = float(row['atr'])
+        timestamp = datetime.fromtimestamp(int(row['time'])).strftime('%Y-%m-%d %H:%M')
 
         if not in_trade:
-            # Check strategy entry conditions
-            if pd.notnull(tema) and tema > 0 and adx >= min_adx and atr_pct >= min_atr_pct:
+            if tema > 0 and adx >= min_adx and atr_pct >= min_atr_pct:
                 prox = abs(price - tema) / tema * 100
                 if prox <= proximity_pct:
-                    # Direction check: Long if above TEMA, Short if below
                     side = "LONG" if price >= tema else "SHORT"
                     entry_price = price
                     
@@ -236,9 +247,8 @@ def run_backtest(df: pd.DataFrame, initial_balance: float, risk_pct: float, targ
                         "risk_usd": risk_usd
                     }
         else:
-            # Evaluate exit conditions for active trade
-            high = row['high']
-            low = row['low']
+            high = float(row['high'])
+            low = float(row['low'])
             side = active_trade["side"]
             
             pnl_r = 0.0
@@ -295,39 +305,27 @@ def run_backtest(df: pd.DataFrame, initial_balance: float, risk_pct: float, targ
         "Net Return": f"{((balance - initial_balance) / initial_balance * 100):.2f}%"
     }
 
+    gc.collect()
     return trades_df, metrics
 
 # =====================================================================
 # TRADINGVIEW LIGHTWEIGHT CHARTS HTML RENDERER
 # =====================================================================
 def render_tradingview_chart(df: pd.DataFrame, symbol: str, df_journal: pd.DataFrame):
-    """Generates chart with Candlesticks, 200 TEMA, Aggregated Trade Levels, Volume Profile, and Fullscreen Mode."""
+    """Generates TradingView chart with light memory footprint."""
     
-    candles_records = []
-    for _, row in df.iterrows():
-        candles_records.append({
-            'time': int(row['time']),
-            'open': float(row['open']),
-            'high': float(row['high']),
-            'low': float(row['low']),
-            'close': float(row['close'])
-        })
+    candles_records = df[['time', 'open', 'high', 'low', 'close']].to_dict(orient='records')
     
     tema_records = []
     if 'tema_200' in df.columns:
         valid_tema = df[['time', 'tema_200']].dropna().copy()
-        valid_tema['tema_200'] = pd.to_numeric(valid_tema['tema_200'], errors='coerce')
-        valid_tema = valid_tema.dropna().drop_duplicates(subset=['time']).sort_values('time')
-        
         for _, r in valid_tema.iterrows():
             val = float(r['tema_200'])
             if np.isfinite(val):
-                tema_records.append({
-                    'time': int(r['time']),
-                    'value': round(val, 6)
-                })
+                tema_records.append({'time': int(r['time']), 'value': round(val, 6)})
+        del valid_tema
 
-    vp_bins, avg_vol = calculate_volume_profile(df, num_bins=28)
+    vp_bins, avg_vol = calculate_volume_profile(df, num_bins=24)
     max_vol = max([b['volume'] for b in vp_bins]) if vp_bins else 1.0
 
     price_lines_js = ""
@@ -337,33 +335,26 @@ def render_tradingview_chart(df: pd.DataFrame, symbol: str, df_journal: pd.DataF
             (df_journal['status'].isin(['OPEN', 'TP1_HIT', 'PENDING']))
         ]
         
-        entries = {}
-        stop_losses = {}
-        tp1_levels = {}
-        tp2_levels = {}
+        entries, stop_losses, tp1_levels, tp2_levels = {}, {}, {}, {}
 
         for _, trade in symbol_trades.iterrows():
             t_id = str(trade.get('id', ''))
             
             p_entry = trade.get('entry_price')
             if pd.notnull(p_entry) and float(p_entry) > 0:
-                zone_key = round(float(p_entry), 2)
-                entries.setdefault(zone_key, []).append((float(p_entry), t_id))
+                entries.setdefault(round(float(p_entry), 2), []).append((float(p_entry), t_id))
 
             p_sl = trade.get('stop_loss')
             if pd.notnull(p_sl) and float(p_sl) > 0:
-                zone_key = round(float(p_sl), 2)
-                stop_losses.setdefault(zone_key, []).append((float(p_sl), t_id))
+                stop_losses.setdefault(round(float(p_sl), 2), []).append((float(p_sl), t_id))
 
             p_tp1 = trade.get('take_profit_1')
             if pd.notnull(p_tp1) and float(p_tp1) > 0:
-                zone_key = round(float(p_tp1), 2)
-                tp1_levels.setdefault(zone_key, []).append((float(p_tp1), t_id))
+                tp1_levels.setdefault(round(float(p_tp1), 2), []).append((float(p_tp1), t_id))
 
             p_tp2 = trade.get('take_profit_2')
             if pd.notnull(p_tp2) and float(p_tp2) > 0:
-                zone_key = round(float(p_tp2), 2)
-                tp2_levels.setdefault(zone_key, []).append((float(p_tp2), t_id))
+                tp2_levels.setdefault(round(float(p_tp2), 2), []).append((float(p_tp2), t_id))
 
         def build_line(data_dict, color, style, prefix):
             js_out = ""
@@ -387,6 +378,8 @@ def render_tradingview_chart(df: pd.DataFrame, symbol: str, df_journal: pd.DataF
         price_lines_js += build_line(stop_losses, '#FF5252', 'Solid', 'SL')
         price_lines_js += build_line(tp1_levels, '#00E676', 'Dotted', 'TP1')
         price_lines_js += build_line(tp2_levels, '#00B0FF', 'Dotted', 'TP2')
+        
+        del entries, stop_losses, tp1_levels, tp2_levels, symbol_trades
 
     html_code = f"""
     <!DOCTYPE html>
@@ -529,16 +522,10 @@ def render_tradingview_chart(df: pd.DataFrame, symbol: str, df_journal: pd.DataF
                     const isFullscreen = chartContainer.classList.toggle('fullscreen');
                     if (isFullscreen) {{
                         fsBtn.innerText = "✕ Exit Fullscreen";
-                        chart.applyOptions({{
-                            width: window.innerWidth,
-                            height: window.innerHeight
-                        }});
+                        chart.applyOptions({{ width: window.innerWidth, height: window.innerHeight }});
                     }} else {{
                         fsBtn.innerText = "⛶ Fullscreen";
-                        chart.applyOptions({{
-                            width: chartContainer.parentElement.clientWidth || 800,
-                            height: 550
-                        }});
+                        chart.applyOptions({{ width: chartContainer.parentElement.clientWidth || 800, height: 550 }});
                     }}
                     drawVolumeProfile();
                 }};
@@ -574,6 +561,8 @@ def render_tradingview_chart(df: pd.DataFrame, symbol: str, df_journal: pd.DataF
     </html>
     """
     components.html(html_code, height=570)
+    del candles_records, tema_records, vp_bins
+    gc.collect()
 
 # =====================================================================
 # CONFIG MANAGER
@@ -695,10 +684,14 @@ with st.sidebar:
                 "watchlist": final_watchlist
             }
             save_config(updated_config)
+            st.cache_data.clear()
+            gc.collect()
             st.rerun()
 
     st.divider()
-    if st.button("Refresh Dashboard", use_container_width=True):
+    if st.button("Clear Dashboard RAM & Refresh", use_container_width=True):
+        st.cache_data.clear()
+        gc.collect()
         st.rerun()
 
 # --- TOP METRICS ROW ---
@@ -720,6 +713,7 @@ if not df_journal.empty:
     m3.metric("Net Realized PnL", f"${net_pnl:.2f}", delta=f"{total_r:.2f}R")
     m4.metric("Win Rate", f"{win_rate:.1f}%")
     m5.metric("Database", "Supabase (Live)", delta="Online")
+    del closed_trades
 else:
     m1.metric("Total Signals", "0")
     m2.metric("Active Trades", "0")
@@ -746,6 +740,7 @@ with tab_active:
         if not active_df.empty:
             display_cols = ['id', 'timestamp', 'symbol', 'status', 'entry_price', 'stop_loss', 'take_profit_1', 'take_profit_2', 'position_usdt', 'max_risk_usd', 'trigger_reason']
             st.dataframe(active_df[display_cols], use_container_width=True, hide_index=True)
+            del active_df
         else:
             st.info("No active signals currently open.")
     else:
@@ -768,6 +763,7 @@ with tab_history:
                 use_container_width=True, 
                 hide_index=True
             )
+            del closed_df
         else:
             st.info("No closed trades recorded yet.")
     else:
@@ -784,20 +780,20 @@ with tab_charts:
     with col_tf:
         selected_tf = st.selectbox("Timeframe", ["15m", "1h", "4h"], index=1)
         
-    df_chart = fetch_market_data(selected_symbol, timeframe=selected_tf)
+    df_chart = fetch_market_data(selected_symbol, timeframe=selected_tf, limit=350)
     
     if not df_chart.empty:
         latest = df_chart.iloc[-1]
-        cur_price = latest['close']
-        cur_tema = latest.get('tema_200', np.nan)
-        cur_adx = latest.get('adx', 0.0)
-        cur_atr_pct = latest.get('atr_pct', 0.0)
+        cur_price = float(latest['close'])
+        cur_tema = float(latest.get('tema_200', np.nan))
+        cur_adx = float(latest.get('adx', 0.0))
+        cur_atr_pct = float(latest.get('atr_pct', 0.0))
         
-        if pd.notnull(cur_tema) and float(cur_tema) > 0:
-            proximity_pct = abs(cur_price - float(cur_tema)) / float(cur_tema) * 100
+        if pd.notnull(cur_tema) and cur_tema > 0:
+            proximity_pct = abs(cur_price - cur_tema) / cur_tema * 100
             proximity_str = f"{proximity_pct:.2f}%"
-            bias_str = "ABOVE TEMA 📈" if cur_price >= float(cur_tema) else "BELOW TEMA 📉"
-            tema_display = f"${float(cur_tema):.4f}"
+            bias_str = "ABOVE TEMA 📈" if cur_price >= cur_tema else "BELOW TEMA 📉"
+            tema_display = f"${cur_tema:.4f}"
         else:
             proximity_str = "N/A"
             bias_str = "Calculating..."
@@ -807,12 +803,14 @@ with tab_charts:
         stat_c1.metric("Current Price", f"${cur_price:.4f}")
         stat_c2.metric("200 TEMA Price", tema_display)
         stat_c3.metric("TEMA Proximity", proximity_str, delta=bias_str)
-        stat_c4.metric("ADX (14)", f"{float(cur_adx):.1f}", delta="Strong Trend" if float(cur_adx) >= config.get("min_adx", 20) else "Weak/Ranging")
-        stat_c5.metric("ATR %", f"{float(cur_atr_pct):.2f}%", delta="Volatility")
+        stat_c4.metric("ADX (14)", f"{cur_adx:.1f}", delta="Strong Trend" if cur_adx >= config.get("min_adx", 20) else "Weak/Ranging")
+        stat_c5.metric("ATR %", f"{cur_atr_pct:.2f}%", delta="Volatility")
 
         st.divider()
 
         render_tradingview_chart(df_chart, selected_symbol, df_journal)
+        del df_chart
+        gc.collect()
     else:
         st.warning("Could not fetch market data for the selected symbol.")
 
@@ -827,7 +825,7 @@ with tab_backtest:
     with b_col2:
         bt_tf = st.selectbox("Timeframe", ["15m", "1h", "4h"], index=1, key="bt_tf")
     with b_col3:
-        bt_limit = st.select_slider("Historical Bars Limit", options=[300, 500, 1000], value=1000)
+        bt_limit = st.select_slider("Historical Bars Limit", options=[300, 500], value=350)
         
     if st.button("🚀 Run Backtest", type="primary", use_container_width=True):
         with st.spinner("Fetching historical data and computing signals..."):
@@ -857,6 +855,9 @@ with tab_backtest:
                     st.dataframe(sim_trades, use_container_width=True, hide_index=True)
                 else:
                     st.info("No trades were triggered during this historical period with the current parameters.")
+                
+                del df_bt, sim_trades, sim_metrics
+                gc.collect()
             else:
                 st.error("Failed to load historical data for backtesting.")
 
@@ -872,3 +873,6 @@ with tab_database:
             clear_remote_journal()
     else:
         st.info("Journal database is currently empty.")
+
+# End of Script Memory Flush
+gc.collect()

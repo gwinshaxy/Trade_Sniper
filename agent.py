@@ -1,6 +1,7 @@
 import os
 import time
 import json
+import gc
 import asyncio
 import ccxt
 import pandas as pd
@@ -23,7 +24,7 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY) if SUPABASE_URL and
 
 def load_config():
     default_config = {
-        "account_balance": 100.0,  # Updated default balance to $100
+        "account_balance": 100.0,
         "risk_pct": 1.0,
         "min_rr_ratio": 1.5,
         "proximity_threshold_pct": 2.0,
@@ -32,26 +33,12 @@ def load_config():
         "scan_interval_minutes": 15,
         "alert_cooldown_hours": 4,
         "watchlist": [
-            "ONDO/USDT",
-            "PENDLE/USDT",
-            "LINK/USDT",
-            "TIA/USDT",
-            "NEAR/USDT",
-            "SOL/USDT",
-            "AR/USDT",
-            "FET/USDT",
-            "RENDER/USDT",
-            "TAO/USDT",
-            "SYRUP/USDT",
-            "SEI/USDT",
-            "CFG/USDT",
-            "HNT/USDT",
-            "XRP/USDT",
-            "DOGE/USDT"
+            "ONDO/USDT", "PENDLE/USDT", "LINK/USDT", "TIA/USDT", "NEAR/USDT",
+            "SOL/USDT", "AR/USDT", "FET/USDT", "RENDER/USDT", "TAO/USDT",
+            "SYRUP/USDT", "SEI/USDT", "CFG/USDT", "HNT/USDT", "XRP/USDT", "DOGE/USDT"
         ]
     }
     
-    # If config.json doesn't exist, create it with defaults
     if not os.path.exists(CONFIG_FILE):
         with open(CONFIG_FILE, "w", encoding="utf-8") as f:
             json.dump(default_config, f, indent=4)
@@ -60,9 +47,7 @@ def load_config():
     try:
         with open(CONFIG_FILE, "r", encoding="utf-8") as f:
             existing_config = json.load(f)
-            # Merge existing values over defaults so custom watchlists & balance are preserved
-            merged_config = {**default_config, **existing_config}
-            return merged_config
+            return {**default_config, **existing_config}
     except Exception as e:
         print(f"⚠️ Error loading {CONFIG_FILE}, falling back to defaults: {e}")
         return default_config
@@ -114,13 +99,17 @@ def log_trade_signal(symbol, reasons, entry, sl, tp1, tp2, position_usdt, risk_u
     except Exception as e:
         print(f"Error inserting trade into Supabase: {e}")
 
-def calculate_native_tema(df, length=200):
-    ema1 = df['close'].ewm(span=length, adjust=False).mean()
+def calculate_native_tema(series: pd.Series, length: int = 200) -> pd.Series:
+    """Pure Pandas fallback calculation for TEMA 200."""
+    ema1 = series.ewm(span=length, adjust=False).mean()
     ema2 = ema1.ewm(span=length, adjust=False).mean()
     ema3 = ema2.ewm(span=length, adjust=False).mean()
-    return 3 * (ema1 - ema2) + ema3
+    res = 3 * ema1 - 3 * ema2 + ema3
+    del ema1, ema2, ema3
+    return res
 
-def fetch_market_data(symbol, timeframe='1h', limit=500):
+def fetch_market_data(symbol, timeframe='1h', limit=350):
+    """Fetches market data with float32 downcasting to optimize background RAM."""
     try:
         ohlcv = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
     except Exception as e:
@@ -131,66 +120,90 @@ def fetch_market_data(symbol, timeframe='1h', limit=500):
         return None
 
     df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+    del ohlcv
+    
+    # Downcast floats to save RAM
+    float_cols = ['open', 'high', 'low', 'close', 'volume']
+    for col in float_cols:
+        df[col] = pd.to_numeric(df[col], errors='coerce').astype(np.float32)
+
     df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
 
+    # 1. TEMA 200 Calculation
     if len(df) >= 200:
         try:
             df['tema_200'] = ta.tema(df['close'], length=200)
             if df['tema_200'].dropna().empty:
-                df['tema_200'] = calculate_native_tema(df, length=200)
+                df['tema_200'] = calculate_native_tema(df['close'], length=200)
         except Exception:
-            df['tema_200'] = calculate_native_tema(df, length=200)
+            df['tema_200'] = calculate_native_tema(df['close'], length=200)
+            
+        df['tema_200'] = pd.to_numeric(df['tema_200'], errors='coerce').astype(np.float32)
 
+    # 2. ADX (14) Calculation - Standardized key 'adx'
     try:
         adx_df = ta.adx(df['high'], df['low'], df['close'], length=14)
         if adx_df is not None and not adx_df.empty:
             adx_cols = [c for c in adx_df.columns if c.startswith('ADX_')]
-            df['adx_14'] = adx_df[adx_cols[0]] if adx_cols else adx_df.iloc[:, 0]
+            df['adx'] = pd.to_numeric(adx_df[adx_cols[0]] if adx_cols else adx_df.iloc[:, 0], errors='coerce').astype(np.float32)
+            del adx_df
         else:
-            df['adx_14'] = 0.0
+            df['adx'] = np.float32(0.0)
     except Exception:
-        df['adx_14'] = 0.0
+        df['adx'] = np.float32(0.0)
 
+    # 3. ATR % Calculation - Standardized keys 'atr' and 'atr_pct'
     try:
-        df['atr_14'] = ta.atr(df['high'], df['low'], df['close'], length=14)
-        df['atr_pct'] = (df['atr_14'] / df['close']) * 100.0
+        raw_atr = ta.atr(df['high'], df['low'], df['close'], length=14)
+        df['atr'] = pd.to_numeric(raw_atr, errors='coerce').astype(np.float32)
+        df['atr_pct'] = ((df['atr'] / df['close']) * 100.0).astype(np.float32)
+        del raw_atr
     except Exception:
-        df['atr_14'] = 0.0
-        df['atr_pct'] = 0.0
+        df['atr'] = np.float32(0.0)
+        df['atr_pct'] = np.float32(0.0)
 
     return df
 
 def calculate_volume_profile(df, num_bins=30):
-    price_min = df['low'].min()
-    price_max = df['high'].max()
+    price_min = float(df['low'].min())
+    price_max = float(df['high'].max())
+
+    if price_min == price_max or pd.isna(price_min) or pd.isna(price_max):
+        return None, []
 
     bins = np.linspace(price_min, price_max, num_bins)
     df['bin'] = pd.cut(df['close'], bins=bins)
 
     volume_profile = df.groupby('bin', observed=False)['volume'].sum().reset_index()
-    volume_profile['price_mid'] = volume_profile['bin'].apply(lambda x: x.mid)
+    volume_profile['price_mid'] = volume_profile['bin'].apply(lambda x: float(x.mid))
+
+    if volume_profile['volume'].sum() == 0:
+        return None, []
 
     poc_row = volume_profile.loc[volume_profile['volume'].idxmax()]
-    poc_price = poc_row['price_mid']
+    poc_price = float(poc_row['price_mid'])
 
     hvn_nodes = volume_profile.sort_values(by='volume', ascending=False).head(3)
-    return poc_price, hvn_nodes['price_mid'].tolist()
+    hvn_list = [float(x) for x in hvn_nodes['price_mid'].tolist()]
+    
+    del volume_profile, hvn_nodes
+    return poc_price, hvn_list
 
 def calculate_fixed_risk_position(account_balance, entry_price, stop_loss_price, risk_pct=1.0):
-    risk_amount = account_balance * (risk_pct / 100.0)
-    price_risk_per_unit = abs(entry_price - stop_loss_price)
+    risk_amount = float(account_balance) * (float(risk_pct) / 100.0)
+    price_risk_per_unit = abs(float(entry_price) - float(stop_loss_price))
 
     if price_risk_per_unit == 0:
-        return 0, 0, 0
+        return 0.0, 0.0, 0.0
 
     units = risk_amount / price_risk_per_unit
-    position_size_usdt = units * entry_price
-    return units, position_size_usdt, risk_amount
+    position_size_usdt = units * float(entry_price)
+    return float(units), float(position_size_usdt), float(risk_amount)
 
 def safe_format(value):
     if value is None or pd.isna(value):
         return "N/A"
-    return f"${value:.4f}"
+    return f"${float(value):.4f}"
 
 # =====================================================================
 # ACTIVE TRADE EVALUATOR ENGINE (SUPABASE INTEGRATED)
@@ -227,7 +240,7 @@ async def evaluate_active_trades(bot, chat_id, config):
             hours_elapsed = (datetime.now() - trade_dt).total_seconds() / 3600
 
             candles_needed = max(50, int(hours_elapsed * 4) + 10)
-            candles_needed = min(candles_needed, 1000)
+            candles_needed = min(candles_needed, 350)  # Capped to keep RAM light
 
             df_candles = fetch_market_data(symbol, timeframe='15m', limit=candles_needed)
             if df_candles is None or df_candles.empty:
@@ -237,11 +250,10 @@ async def evaluate_active_trades(bot, chat_id, config):
             if df_candles.empty:
                 continue
 
-            latest_low = df_candles['low'].min()
-            latest_high = df_candles['high'].max()
+            latest_low = float(df_candles['low'].min())
+            latest_high = float(df_candles['high'].max())
             close_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-            # Direction inference from SL position relative to Entry
             is_long = sl < entry
 
             # 1. Check Stop Loss
@@ -308,6 +320,8 @@ async def evaluate_active_trades(bot, chat_id, config):
                     )
                     await bot.send_message(chat_id=chat_id, text=msg, parse_mode="Markdown")
 
+            del df_candles
+
         except Exception as e:
             print(f"Error evaluating trade ID {trade.get('id')} for {symbol}: {e}")
 
@@ -317,13 +331,13 @@ async def evaluate_active_trades(bot, chat_id, config):
 async def analyze_symbol(symbol, bot, chat_id, config):
     current_time = time.time()
 
-    account_balance = config.get("account_balance", 100.0)
-    risk_pct = config.get("risk_pct", 1.0)
-    min_rr_threshold = config.get("min_rr_ratio", 1.5)
-    proximity_threshold = config.get("proximity_threshold_pct", 2.0)
-    cooldown_hours = config.get("alert_cooldown_hours", 4)
-    min_adx = config.get("min_adx", 20.0)
-    min_atr_pct = config.get("min_atr_pct", 0.4)
+    account_balance = float(config.get("account_balance", 100.0))
+    risk_pct = float(config.get("risk_pct", 1.0))
+    min_rr_threshold = float(config.get("min_rr_ratio", 1.5))
+    proximity_threshold = float(config.get("proximity_threshold_pct", 2.0))
+    cooldown_hours = float(config.get("alert_cooldown_hours", 4))
+    min_adx = float(config.get("min_adx", 20.0))
+    min_atr_pct = float(config.get("min_atr_pct", 0.4))
 
     if symbol in last_alert_time:
         elapsed_hours = (current_time - last_alert_time[symbol]) / 3600
@@ -331,15 +345,15 @@ async def analyze_symbol(symbol, bot, chat_id, config):
             print(f"[{symbol}] On cooldown ({elapsed_hours:.1f}h / {cooldown_hours}h elapsed). Skipping scan.")
             return
 
-    df_1h = fetch_market_data(symbol, timeframe='1h', limit=500)
-    df_4h = fetch_market_data(symbol, timeframe='4h', limit=500)
+    df_1h = fetch_market_data(symbol, timeframe='1h', limit=350)
+    df_4h = fetch_market_data(symbol, timeframe='4h', limit=350)
 
     if df_1h is None or df_4h is None:
         return
 
-    current_price = df_1h['close'].iloc[-1]
-    val_1h = df_1h['tema_200'].dropna().iloc[-1] if not df_1h['tema_200'].dropna().empty else None
-    val_4h = df_4h['tema_200'].dropna().iloc[-1] if not df_4h['tema_200'].dropna().empty else None
+    current_price = float(df_1h['close'].iloc[-1])
+    val_1h = float(df_1h['tema_200'].dropna().iloc[-1]) if 'tema_200' in df_1h and not df_1h['tema_200'].dropna().empty else None
+    val_4h = float(df_4h['tema_200'].dropna().iloc[-1]) if 'tema_200' in df_4h and not df_4h['tema_200'].dropna().empty else None
     poc_price, hvn_prices = calculate_volume_profile(df_1h, num_bins=30)
 
     # Proximity Triggers
@@ -362,18 +376,21 @@ async def analyze_symbol(symbol, bot, chat_id, config):
 
     if not triggered_reasons:
         print(f"[{symbol}] Price (${current_price:.4f}) outside threshold. No trigger.")
+        del df_1h, df_4h
         return
 
-    # Hard Indicator Regime Filters
-    current_adx = df_1h['adx_14'].dropna().iloc[-1] if 'adx_14' in df_1h else 0.0
-    current_atr_pct = df_1h['atr_pct'].dropna().iloc[-1] if 'atr_pct' in df_1h else 0.0
+    # Hard Indicator Regime Filters (using standardized keys 'adx' and 'atr_pct')
+    current_adx = float(df_1h['adx'].dropna().iloc[-1]) if 'adx' in df_1h else 0.0
+    current_atr_pct = float(df_1h['atr_pct'].dropna().iloc[-1]) if 'atr_pct' in df_1h else 0.0
 
     if current_adx < min_adx:
         print(f"[{symbol}] ❌ Filter Skipped: ADX ({current_adx:.2f}) below min threshold ({min_adx}).")
+        del df_1h, df_4h
         return
 
     if current_atr_pct < min_atr_pct:
         print(f"[{symbol}] ❌ Filter Skipped: ATR% ({current_atr_pct:.2f}%) below min threshold ({min_atr_pct}%).")
+        del df_1h, df_4h
         return
 
     print(f"🎯 TRIGGER & FILTERS MATCH for {symbol}: {', '.join(triggered_reasons)} (ADX: {current_adx:.2f}, ATR%: {current_atr_pct:.2f}%)")
@@ -383,10 +400,9 @@ async def analyze_symbol(symbol, bot, chat_id, config):
     direction = "LONG" if current_price >= tema_ref else "SHORT"
     entry_price = current_price
 
-    # Fetch ATR value safely
-    atr_val = df_1h['atr_14'].dropna().iloc[-1] if 'atr_14' in df_1h and not pd.isna(df_1h['atr_14'].iloc[-1]) else entry_price * 0.01
+    # Fetch ATR value safely (standardized key 'atr')
+    atr_val = float(df_1h['atr'].dropna().iloc[-1]) if 'atr' in df_1h and not pd.isna(df_1h['atr'].iloc[-1]) else entry_price * 0.01
 
-    # Dynamic Stop Loss & Take Profit Targets based on Direction
     if direction == "LONG":
         stop_loss = entry_price - (1.5 * atr_val) if atr_val > 0 else entry_price * 0.985
         valid_hvns = [h for h in hvn_prices if h > entry_price] if hvn_prices else []
@@ -403,18 +419,15 @@ async def analyze_symbol(symbol, bot, chat_id, config):
 
     rr_ratio = reward_amount_per_unit / risk_amount_per_unit if risk_amount_per_unit > 0 else 0.0
 
-    # =====================================================================
-    # 🚫 HARD FILTER GATE: RISK / REWARD CHECK
-    # =====================================================================
     if rr_ratio < min_rr_threshold:
         print(f"[{symbol}] 🛑 SIGNAL REJECTED: Risk/Reward ({rr_ratio:.2f}R) is below minimum threshold ({min_rr_threshold:.2f}R).")
+        del df_1h, df_4h
         return
 
     units, position_usdt, risk_usd = calculate_fixed_risk_position(
         account_balance, entry_price, stop_loss, risk_pct=risk_pct
     )
 
-    # Log trade directly to Supabase cloud database
     log_trade_signal(
         symbol, triggered_reasons, entry_price, 
         stop_loss, tp1, tp2, position_usdt, risk_usd
@@ -422,7 +435,6 @@ async def analyze_symbol(symbol, bot, chat_id, config):
 
     last_alert_time[symbol] = current_time
 
-    # Telegram Alert Formatting
     reasons_text = "\n".join([f"• {r}" for r in triggered_reasons])
     message = (
         f"🎯 **PROXIMITY ALERT: {symbol}** 🎯\n\n"
@@ -448,6 +460,8 @@ async def analyze_symbol(symbol, bot, chat_id, config):
 
     if bot and chat_id:
         await bot.send_message(chat_id=chat_id, text=message, parse_mode="Markdown")
+
+    del df_1h, df_4h
 
 async def run_scanner():
     config = load_config()
@@ -475,10 +489,11 @@ async def run_scanner():
         for symbol in watchlist:
             try:
                 await analyze_symbol(symbol, bot, telegram_chat_id, current_config)
-                await asyncio.sleep(2)
+                await asyncio.sleep(1)
             except Exception as e:
                 print(f"Error scanning {symbol}: {e}")
 
+        gc.collect()  # Flush scanner memory after each full loop pass
         print(f"Cycle completed. Sleeping for {scan_interval} minutes...")
         await asyncio.sleep(scan_interval * 60)
 
