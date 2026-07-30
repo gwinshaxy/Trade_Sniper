@@ -825,7 +825,7 @@ with tab_backtest:
     with b_col2:
         bt_tf = st.selectbox("Timeframe", ["15m", "1h", "4h"], index=1, key="bt_tf")
     with b_col3:
-        bt_limit = st.select_slider("Historical Bars Limit", options=[300, 500], value=350)
+        bt_limit = st.select_slider("Historical Bars Limit", options=[300, 350, 500], value=350)
         
     if st.button("🚀 Run Backtest", type="primary", use_container_width=True):
         with st.spinner("Fetching historical data and computing signals..."):
