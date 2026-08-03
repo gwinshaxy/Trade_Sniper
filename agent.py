@@ -24,12 +24,13 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY) if SUPABASE_URL and
 
 def load_config():
     default_config = {
-        "account_balance": 100.0,
+        "account_balance": 1000.0,
         "risk_pct": 1.0,
-        "min_rr_ratio": 1.5,
         "proximity_threshold_pct": 2.0,
         "min_adx": 20.0,
         "min_atr_pct": 0.4,
+        "atr_mult_sl": 1.5,
+        "min_rr_ratio": 1.5,
         "scan_interval_minutes": 15,
         "alert_cooldown_hours": 4,
         "watchlist": [
@@ -40,9 +41,9 @@ def load_config():
         # Strategy Upgrades Configurations
         "use_mtf_tema_alignment": True,
         "htf_tema_period": 200,
-        "htf_alignment_mode": "Price Level", # "Price Level" or "Slope"
+        "htf_alignment_mode": "Price Level",  # "Price Level" or "TEMA Slope"
         "use_adaptive_atr_trail": True,
-        "atr_trail_mult": 2.8,
+        "atr_trail_mult": 1.5,
         "use_equity_curve_filter": True,
         "eq_ma_period": 10,
         "reduced_risk_factor": 0.5
@@ -171,7 +172,7 @@ def calculate_volume_profile(df, num_bins=30):
     return poc_price, hvn_list
 
 def calculate_effective_risk(base_risk_pct, config):
-    """UPGRADE C: Calculates position risk factor based on equity curve drawdown filter."""
+    """Calculates position risk factor based on equity curve drawdown filter."""
     if not config.get("use_equity_curve_filter", False) or not supabase:
         return base_risk_pct
 
@@ -179,7 +180,7 @@ def calculate_effective_risk(base_risk_pct, config):
         res = supabase.table("trade_journal").select("realized_pnl_usd").in_("status", ["CLOSED_TP2", "STOPPED_OUT"]).order("id", desc=True).limit(50).execute()
         closed_trades = res.data
         if len(closed_trades) >= config.get("eq_ma_period", 10):
-            initial_balance = float(config.get("account_balance", 100.0))
+            initial_balance = float(config.get("account_balance", 1000.0))
             pnl_list = [float(t.get("realized_pnl_usd", 0.0)) for t in reversed(closed_trades)]
             equity_series = np.cumsum([initial_balance] + pnl_list)
             
@@ -289,9 +290,9 @@ async def evaluate_active_trades(bot, chat_id, config):
 
             is_long = sl < entry
 
-            # UPGRADE B: Dynamic Adaptive ATR Trailing Stop Update
-            if config.get("use_adaptive_atr_trail", False) and latest_atr > 0:
-                trail_mult = float(config.get("atr_trail_mult", 2.8))
+            # Dynamic Adaptive ATR Trailing Stop Update
+            if config.get("use_adaptive_atr_trail", True) and latest_atr > 0:
+                trail_mult = float(config.get("atr_trail_mult", config.get("atr_trail_multiplier", 1.5)))
                 if is_long:
                     new_trail_sl = latest_close - (latest_atr * trail_mult)
                     if new_trail_sl > sl:
@@ -380,13 +381,14 @@ async def evaluate_active_trades(bot, chat_id, config):
 async def analyze_symbol(symbol, bot, chat_id, config):
     current_time = time.time()
 
-    account_balance = float(config.get("account_balance", 100.0))
+    account_balance = float(config.get("account_balance", 1000.0))
     base_risk_pct = float(config.get("risk_pct", 1.0))
     min_rr_threshold = float(config.get("min_rr_ratio", 1.5))
     proximity_threshold = float(config.get("proximity_threshold_pct", 2.0))
     cooldown_hours = float(config.get("alert_cooldown_hours", 4))
     min_adx = float(config.get("min_adx", 20.0))
     min_atr_pct = float(config.get("min_atr_pct", 0.4))
+    atr_mult_sl = float(config.get("atr_mult_sl", 1.5))  # ATR Multiplier for Stop Loss
 
     if symbol in last_alert_time:
         elapsed_hours = (current_time - last_alert_time[symbol]) / 3600
@@ -430,8 +432,8 @@ async def analyze_symbol(symbol, bot, chat_id, config):
         del df_1h, df_4h
         return
 
-    # UPGRADE A: Multi-Timeframe TEMA Trend Alignment Filter
-    if config.get("use_mtf_tema_alignment", False) and val_1h is not None and val_4h is not None:
+    # Multi-Timeframe TEMA Trend Alignment Filter
+    if config.get("use_mtf_tema_alignment", config.get("use_mtf_alignment", True)) and val_1h is not None and val_4h is not None:
         alignment_mode = config.get("htf_alignment_mode", "Price Level")
         base_long = current_price >= val_1h
         base_short = current_price < val_1h
@@ -439,7 +441,7 @@ async def analyze_symbol(symbol, bot, chat_id, config):
         if alignment_mode == "Price Level":
             htf_long = current_price >= val_4h
             htf_short = current_price < val_4h
-        else: # Slope Mode
+        else:  # Slope Mode
             prev_val_4h = float(df_4h['tema_200'].dropna().iloc[-2]) if len(df_4h['tema_200'].dropna()) > 1 else val_4h
             htf_long = val_4h > prev_val_4h
             htf_short = val_4h < prev_val_4h
@@ -467,7 +469,7 @@ async def analyze_symbol(symbol, bot, chat_id, config):
 
     print(f"🎯 TRIGGER & FILTERS MATCH for {symbol}: {', '.join(triggered_reasons)} (ADX: {current_adx:.2f}, ATR%: {current_atr_pct:.2f}%)")
 
-    # Direction & Trade Sizing Calculations
+    # Direction & Trade Sizing Calculations (Applying ATR Multiplier)
     tema_ref = val_1h if val_1h is not None else current_price
     direction = "LONG" if current_price >= tema_ref else "SHORT"
     entry_price = current_price
@@ -475,15 +477,15 @@ async def analyze_symbol(symbol, bot, chat_id, config):
     atr_val = float(df_1h['atr'].dropna().iloc[-1]) if 'atr' in df_1h and not pd.isna(df_1h['atr'].iloc[-1]) else entry_price * 0.01
 
     if direction == "LONG":
-        stop_loss = entry_price - (1.5 * atr_val) if atr_val > 0 else entry_price * 0.985
+        stop_loss = entry_price - (atr_mult_sl * atr_val) if atr_val > 0 else entry_price * 0.985
         valid_hvns = [h for h in hvn_prices if h > entry_price] if hvn_prices else []
-        tp1 = valid_hvns[0] if valid_hvns else entry_price * 1.03
-        tp2 = poc_price if (poc_price and poc_price > entry_price) else entry_price * (1 + 0.015 * min_rr_threshold)
+        tp1 = valid_hvns[0] if valid_hvns else entry_price + (atr_mult_sl * atr_val * min_rr_threshold)
+        tp2 = poc_price if (poc_price and poc_price > entry_price) else entry_price + (atr_mult_sl * atr_val * min_rr_threshold * 1.5)
     else:
-        stop_loss = entry_price + (1.5 * atr_val) if atr_val > 0 else entry_price * 1.015
+        stop_loss = entry_price + (atr_mult_sl * atr_val) if atr_val > 0 else entry_price * 1.015
         valid_hvns = [h for h in hvn_prices if h < entry_price] if hvn_prices else []
-        tp1 = valid_hvns[-1] if valid_hvns else entry_price * 0.97
-        tp2 = poc_price if (poc_price and poc_price < entry_price) else entry_price * (1 - 0.015 * min_rr_threshold)
+        tp1 = valid_hvns[-1] if valid_hvns else entry_price - (atr_mult_sl * atr_val * min_rr_threshold)
+        tp2 = poc_price if (poc_price and poc_price < entry_price) else entry_price - (atr_mult_sl * atr_val * min_rr_threshold * 1.5)
 
     risk_amount_per_unit = abs(entry_price - stop_loss)
     reward_amount_per_unit = abs(tp1 - entry_price)
@@ -495,7 +497,7 @@ async def analyze_symbol(symbol, bot, chat_id, config):
         del df_1h, df_4h
         return
 
-    # Apply Upgrade C Equity Curve Filter Adjustments
+    # Apply Equity Curve Filter Adjustments
     effective_risk_pct = calculate_effective_risk(base_risk_pct, config)
 
     units, position_usdt, risk_usd = calculate_fixed_risk_position(
@@ -519,7 +521,8 @@ async def analyze_symbol(symbol, bot, chat_id, config):
         f"• 4H HTF TEMA: {safe_format(val_4h)}\n"
         f"• Point of Control (POC): {safe_format(poc_price)}\n"
         f"• ADX (14): `{current_adx:.2f}` (Min: {min_adx})\n"
-        f"• ATR %: `{current_atr_pct:.2f}%` (Min: {min_atr_pct}%)\n\n"
+        f"• ATR %: `{current_atr_pct:.2f}%` (Min: {min_atr_pct}%)\n"
+        f"• ATR Multiplier (SL): `{atr_mult_sl}x`\n\n"
         f"🎯 **Trade Parameters ({effective_risk_pct:.2f}% Risk Model):**\n"
         f"• Direction: `{direction}`\n"
         f"• Entry Zone: `${entry_price:.4f}`\n"

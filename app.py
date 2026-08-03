@@ -235,6 +235,7 @@ def run_backtest_upgraded(df: pd.DataFrame, params: dict):
     min_adx = params['min_adx']
     min_atr_pct = params['min_atr_pct']
     proximity_pct = params['proximity_pct']
+    atr_mult_sl = params.get('atr_mult_sl', 1.5)
     
     # Upgrades Toggles & Config
     use_mtf = params.get('use_mtf', True)
@@ -292,7 +293,6 @@ def run_backtest_upgraded(df: pd.DataFrame, params: dict):
                 active_trade = None
 
             elif use_atr_trail and atr_val > 0:
-                # Dynamically ratchet trailing stop levels in favorable momentum
                 if side == "LONG":
                     new_sl = price - (atr_val * atr_trail_mult)
                     active_trade["sl"] = max(active_trade["sl"], new_sl)
@@ -337,11 +337,11 @@ def run_backtest_upgraded(df: pd.DataFrame, params: dict):
                         risk_usd = balance * effective_risk
                         
                         if direction == "LONG":
-                            sl = price - (1.5 * atr_val)
-                            tp = price + (1.5 * atr_val * target_rr)
+                            sl = price - (atr_mult_sl * atr_val)
+                            tp = price + (atr_mult_sl * atr_val * target_rr)
                         else:
-                            sl = price + (1.5 * atr_val)
-                            tp = price - (1.5 * atr_val * target_rr)
+                            sl = price + (atr_mult_sl * atr_val)
+                            tp = price - (atr_mult_sl * atr_val * target_rr)
 
                         active_trade = {
                             "entry_time": timestamp,
@@ -633,6 +633,7 @@ def load_config():
         "proximity_threshold_pct": 2.0,
         "min_adx": 20.0,
         "min_atr_pct": 0.4,
+        "atr_mult_sl": 1.5,
         "min_rr_ratio": 1.5,
         "alert_cooldown_hours": 4,
         "scan_interval_minutes": 15,
@@ -681,19 +682,22 @@ with st.sidebar:
             value=float(config.get("account_balance", 1000.0)), 
             step=50.0
         )
-        risk_pct = st.number_input(
-            "Risk Per Trade (%)", 
-            value=float(config.get("risk_pct", 1.0)), 
+        risk_pct = st.slider(
+            "Base Account Risk % per Trade", 
+            0.1, 5.0, 
+            float(config.get("risk_pct", 1.0)), 
             step=0.1
         )
-        proximity_thresh = st.number_input(
-            "Proximity Threshold (%)", 
-            value=float(config.get("proximity_threshold_pct", 2.0)), 
+        proximity_thresh = st.slider(
+            "Proximity Threshold % (TEMA/POC)", 
+            0.5, 5.0, 
+            float(config.get("proximity_threshold_pct", 2.0)), 
             step=0.1
         )
-        min_adx = st.number_input(
-            "Min ADX Filter", 
-            value=float(config.get("min_adx", 20.0)), 
+        min_adx = st.slider(
+            "ADX Momentum Cutoff", 
+            10.0, 50.0, 
+            float(config.get("min_adx", 20.0)), 
             step=1.0
         )
         min_atr = st.number_input(
@@ -701,27 +705,34 @@ with st.sidebar:
             value=float(config.get("min_atr_pct", 0.4)), 
             step=0.05
         )
-        min_rr_ratio = st.number_input(
-            "Min Risk/Reward Ratio (R)", 
-            value=float(config.get("min_rr_ratio", 1.5)), 
+        atr_mult_sl = st.slider(
+            "ATR Multiplier (Stop Loss)", 
+            0.5, 4.0, 
+            float(config.get("atr_mult_sl", 1.5)), 
+            step=0.1
+        )
+        min_rr_ratio = st.slider(
+            "Reward-to-Risk Ratio (R)", 
+            1.0, 5.0, 
+            float(config.get("min_rr_ratio", 1.5)), 
             step=0.1
         )
 
         st.markdown("---")
-        st.subheader("🚀 Strategy Upgrades")
+        st.subheader("🚀 Upgrades Control Panel")
 
-        use_mtf = st.checkbox("Upgrade A: Enable 4H HTF TEMA Alignment", value=config.get("use_mtf_alignment", True))
-        htf_period = st.slider("HTF TEMA Period", 10, 200, int(config.get("htf_tema_period", 200)), step=10)
+        use_mtf = st.checkbox("Enable Upgrade A: 1H + HTF TEMA Trend Alignment", value=config.get("use_mtf_alignment", True))
+        htf_period = st.slider("HTF TEMA Lookback Period", 10, 200, int(config.get("htf_tema_period", 200)), step=10)
         htf_mode = st.radio("HTF Alignment Mode", ["Price Level", "TEMA Slope"], index=0 if config.get("htf_alignment_mode", "Price Level") == "Price Level" else 1)
 
         st.markdown("---")
-        use_atr_trail = st.checkbox("Upgrade B: Enable Dynamic ATR Trailing Stop", value=config.get("use_atr_trailing", True))
-        atr_trail_mult = st.slider("ATR Trail Multiplier", 1.0, 4.0, float(config.get("atr_trail_multiplier", 1.5)), step=0.1)
+        use_atr_trail = st.checkbox("Enable Upgrade B: Dynamic Adaptive ATR Trailing Stop", value=config.get("use_atr_trailing", True))
+        atr_trail_mult = st.slider("ATR Trailing Multiplier", 1.0, 4.0, float(config.get("atr_trail_multiplier", 1.5)), step=0.1)
 
         st.markdown("---")
-        use_equity_filter = st.checkbox("Upgrade C: Enable Equity Curve Risk Filter", value=config.get("use_equity_filter", True))
+        use_equity_filter = st.checkbox("Enable Upgrade C: Equity Curve Drawdown Filter", value=config.get("use_equity_filter", True))
         eq_ma = st.number_input("Equity MA Lookback (Trades)", value=int(config.get("eq_ma_period", 10)), step=1)
-        reduced_risk = st.slider("Drawdown Risk Factor", 0.1, 0.9, float(config.get("reduced_risk_factor", 0.5)), step=0.05)
+        reduced_risk = st.slider("Drawdown Risk Multiplier", 0.1, 0.9, float(config.get("reduced_risk_factor", 0.5)), step=0.05)
 
         st.markdown("---")
         alert_cooldown = st.number_input("Alert Cooldown (hours)", value=int(config.get("alert_cooldown_hours", 4)), min_value=1, max_value=48, step=1)
@@ -745,6 +756,7 @@ with st.sidebar:
                 "proximity_threshold_pct": proximity_thresh,
                 "min_adx": min_adx,
                 "min_atr_pct": min_atr,
+                "atr_mult_sl": atr_mult_sl,
                 "min_rr_ratio": min_rr_ratio,
                 "use_mtf_alignment": use_mtf,
                 "htf_tema_period": htf_period,
@@ -927,6 +939,7 @@ with tab_backtest:
                     'min_adx': config.get("min_adx", 20.0),
                     'min_atr_pct': config.get("min_atr_pct", 0.4),
                     'proximity_pct': config.get("proximity_threshold_pct", 2.0),
+                    'atr_mult_sl': config.get("atr_mult_sl", 1.5),
                     'use_mtf': config.get("use_mtf_alignment", True),
                     'htf_mode': config.get("htf_alignment_mode", "Price Level"),
                     'use_atr_trail': config.get("use_atr_trailing", True),
