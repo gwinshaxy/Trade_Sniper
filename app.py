@@ -172,7 +172,7 @@ def fetch_market_data(symbol: str, timeframe: str = "1h", limit: int = 350, htf_
     except Exception:
         df['tema_200'] = calculate_tema_fallback(df['close'], length=200)
 
-    # 2. Upgrade A: Resample and Calculate 4H HTF TEMA
+    # 2. Resample and Calculate 4H HTF TEMA
     try:
         df_indexed = df.set_index('datetime')
         df_4h = df_indexed.resample('4h').agg({
@@ -223,7 +223,7 @@ def fetch_market_data(symbol: str, timeframe: str = "1h", limit: int = 350, htf_
     return df
 
 # =====================================================================
-# UPGRADED HISTORICAL BACKTESTING ENGINE (UPGRADES A, B, & C)
+# HISTORICAL BACKTESTING ENGINE
 # =====================================================================
 def run_backtest_upgraded(df: pd.DataFrame, params: dict):
     if df.empty or len(df) < 200:
@@ -237,7 +237,6 @@ def run_backtest_upgraded(df: pd.DataFrame, params: dict):
     proximity_pct = params['proximity_pct']
     atr_mult_sl = params.get('atr_mult_sl', 1.5)
     
-    # Upgrades Toggles & Config
     use_mtf = params.get('use_mtf', True)
     htf_mode = params.get('htf_mode', 'Price Level')
     use_atr_trail = params.get('use_atr_trail', True)
@@ -264,7 +263,7 @@ def run_backtest_upgraded(df: pd.DataFrame, params: dict):
         atr_val = float(row['atr'])
         timestamp = datetime.fromtimestamp(int(row['time'])).strftime('%Y-%m-%d %H:%M')
 
-        # 1. PROCESS ACTIVE TRADE & UPGRADE B (Adaptive ATR Trailing Stop)
+        # 1. PROCESS ACTIVE TRADE & Adaptive ATR Trailing Stop
         if active_trade is not None:
             side = active_trade["side"]
             sl = active_trade["sl"]
@@ -300,7 +299,7 @@ def run_backtest_upgraded(df: pd.DataFrame, params: dict):
                     new_sl = price + (atr_val * atr_trail_mult)
                     active_trade["sl"] = min(active_trade["sl"], new_sl)
 
-        # 2. SCAN FOR SIGNALS & APPLY UPGRADE A & UPGRADE C
+        # 2. SCAN FOR SIGNALS
         if active_trade is None and tema_1h > 0:
             if adx >= min_adx and atr_pct >= min_atr_pct:
                 prox = abs(price - tema_1h) / tema_1h * 100
@@ -310,7 +309,7 @@ def run_backtest_upgraded(df: pd.DataFrame, params: dict):
                     base_short = price < tema_1h
                     direction = None
 
-                    # Upgrade A: Multi-Timeframe TEMA Alignment
+                    # Multi-Timeframe TEMA Alignment
                     if use_mtf:
                         if htf_mode == "Price Level":
                             htf_long = price >= tema_htf
@@ -327,7 +326,7 @@ def run_backtest_upgraded(df: pd.DataFrame, params: dict):
                         direction = "LONG" if base_long else "SHORT"
 
                     if direction:
-                        # Upgrade C: Equity Curve Drawdown Risk Filter
+                        # Equity Curve Drawdown Risk Filter
                         effective_risk = base_risk_pct
                         if use_equity_filter and len(equity_curve) >= eq_ma_period:
                             recent_eq_ma = np.mean(equity_curve[-eq_ma_period:])
@@ -637,15 +636,16 @@ def load_config():
         "min_rr_ratio": 1.5,
         "alert_cooldown_hours": 4,
         "scan_interval_minutes": 15,
-        "use_mtf_alignment": True,
+        "use_mtf_tema_alignment": True,
         "htf_tema_period": 200,
         "htf_alignment_mode": "Price Level",
-        "use_atr_trailing": True,
-        "atr_trail_multiplier": 1.5,
-        "use_equity_filter": True,
+        "use_adaptive_atr_trail": True,
+        "atr_trail_mult": 1.5,
+        "use_equity_curve_filter": True,
         "eq_ma_period": 10,
         "reduced_risk_factor": 0.5,
-        "watchlist": ["ONDO/USDT", "PENDLE/USDT", "LINK/USDT", "TIA/USDT", "NEAR/USDT"]
+        "watchlist": ["ONDO/USDT", "PENDLE/USDT", "LINK/USDT", "TIA/USDT", "NEAR/USDT"],
+        "asset_overrides": {}
     }
     if not os.path.exists(CONFIG_FILE):
         return default_config
@@ -721,16 +721,16 @@ with st.sidebar:
         st.markdown("---")
         st.subheader("🚀 Upgrades Control Panel")
 
-        use_mtf = st.checkbox("Enable Upgrade A: 1H + HTF TEMA Trend Alignment", value=config.get("use_mtf_alignment", True))
+        use_mtf = st.checkbox("Enable Upgrade A: 1H + HTF TEMA Trend Alignment", value=config.get("use_mtf_tema_alignment", True))
         htf_period = st.slider("HTF TEMA Lookback Period", 10, 200, int(config.get("htf_tema_period", 200)), step=10)
         htf_mode = st.radio("HTF Alignment Mode", ["Price Level", "TEMA Slope"], index=0 if config.get("htf_alignment_mode", "Price Level") == "Price Level" else 1)
 
         st.markdown("---")
-        use_atr_trail = st.checkbox("Enable Upgrade B: Dynamic Adaptive ATR Trailing Stop", value=config.get("use_atr_trailing", True))
-        atr_trail_mult = st.slider("ATR Trailing Multiplier", 1.0, 4.0, float(config.get("atr_trail_multiplier", 1.5)), step=0.1)
+        use_atr_trail = st.checkbox("Enable Upgrade B: Dynamic Adaptive ATR Trailing Stop", value=config.get("use_adaptive_atr_trail", True))
+        atr_trail_mult = st.slider("ATR Trailing Multiplier", 1.0, 4.0, float(config.get("atr_trail_mult", 1.5)), step=0.1)
 
         st.markdown("---")
-        use_equity_filter = st.checkbox("Enable Upgrade C: Equity Curve Drawdown Filter", value=config.get("use_equity_filter", True))
+        use_equity_filter = st.checkbox("Enable Upgrade C: Equity Curve Drawdown Filter", value=config.get("use_equity_curve_filter", True))
         eq_ma = st.number_input("Equity MA Lookback (Trades)", value=int(config.get("eq_ma_period", 10)), step=1)
         reduced_risk = st.slider("Drawdown Risk Multiplier", 0.1, 0.9, float(config.get("reduced_risk_factor", 0.5)), step=0.05)
 
@@ -750,6 +750,8 @@ with st.sidebar:
             if custom_asset and custom_asset not in final_watchlist:
                 final_watchlist.append(custom_asset)
 
+            existing_overrides = config.get("asset_overrides", {})
+
             updated_config = {
                 "account_balance": account_balance,
                 "risk_pct": risk_pct,
@@ -758,17 +760,18 @@ with st.sidebar:
                 "min_atr_pct": min_atr,
                 "atr_mult_sl": atr_mult_sl,
                 "min_rr_ratio": min_rr_ratio,
-                "use_mtf_alignment": use_mtf,
+                "use_mtf_tema_alignment": use_mtf,
                 "htf_tema_period": htf_period,
                 "htf_alignment_mode": htf_mode,
-                "use_atr_trailing": use_atr_trail,
-                "atr_trail_multiplier": atr_trail_mult,
-                "use_equity_filter": use_equity_filter,
+                "use_adaptive_atr_trail": use_atr_trail,
+                "atr_trail_mult": atr_trail_mult,
+                "use_equity_curve_filter": use_equity_filter,
                 "eq_ma_period": eq_ma,
                 "reduced_risk_factor": reduced_risk,
                 "alert_cooldown_hours": alert_cooldown,
                 "scan_interval_minutes": scan_interval,
-                "watchlist": final_watchlist
+                "watchlist": final_watchlist,
+                "asset_overrides": existing_overrides
             }
             save_config(updated_config)
             st.cache_data.clear()
@@ -940,11 +943,11 @@ with tab_backtest:
                     'min_atr_pct': config.get("min_atr_pct", 0.4),
                     'proximity_pct': config.get("proximity_threshold_pct", 2.0),
                     'atr_mult_sl': config.get("atr_mult_sl", 1.5),
-                    'use_mtf': config.get("use_mtf_alignment", True),
+                    'use_mtf': config.get("use_mtf_tema_alignment", True),
                     'htf_mode': config.get("htf_alignment_mode", "Price Level"),
-                    'use_atr_trail': config.get("use_atr_trailing", True),
-                    'atr_trail_mult': config.get("atr_trail_multiplier", 1.5),
-                    'use_equity_filter': config.get("use_equity_filter", True),
+                    'use_atr_trail': config.get("use_adaptive_atr_trail", True),
+                    'atr_trail_mult': config.get("atr_trail_mult", 1.5),
+                    'use_equity_filter': config.get("use_equity_curve_filter", True),
                     'eq_ma_period': int(config.get("eq_ma_period", 10)),
                     'reduced_risk_factor': config.get("reduced_risk_factor", 0.5)
                 }

@@ -46,7 +46,22 @@ def load_config():
         "atr_trail_mult": 1.5,
         "use_equity_curve_filter": True,
         "eq_ma_period": 10,
-        "reduced_risk_factor": 0.5
+        "reduced_risk_factor": 0.5,
+        
+        # Recommendation 2: Asset-Specific Parameter Overrides Map
+        # Format: "SYMBOL": { override_key: override_value }
+        "asset_overrides": {
+            "GBP/JPY": {
+                "min_adx": 25.0,
+                "atr_mult_sl": 2.0,
+                "proximity_threshold_pct": 2.5
+            },
+            "SOL/USDT": {
+                "min_adx": 22.0,
+                "atr_mult_sl": 1.8,
+                "proximity_threshold_pct": 2.2
+            }
+        }
     }
     
     if not os.path.exists(CONFIG_FILE):
@@ -61,6 +76,19 @@ def load_config():
     except Exception as e:
         print(f"⚠️ Error loading {CONFIG_FILE}, falling back to defaults: {e}")
         return default_config
+
+def get_symbol_config(symbol: str, global_config: dict) -> dict:
+    """
+    Combines global configurations with symbol-specific overrides.
+    Allows tailored risk and parameters per asset while using a single codebase.
+    """
+    symbol_config = global_config.copy()
+    overrides_map = global_config.get("asset_overrides", {})
+    
+    if symbol in overrides_map and isinstance(overrides_map[symbol], dict):
+        symbol_config.update(overrides_map[symbol])
+        
+    return symbol_config
 
 def get_exchange():
     try:
@@ -242,9 +270,9 @@ def safe_format(value):
     return f"${float(value):.4f}"
 
 # =====================================================================
-# ACTIVE TRADE EVALUATOR ENGINE (WITH DYNAMIC ATR TRAILING STOP)
+# ACTIVE TRADE EVALUATOR ENGINE (WITH ASSET-SPECIFIC ATR TRAILING)
 # =====================================================================
-async def evaluate_active_trades(bot, chat_id, config):
+async def evaluate_active_trades(bot, chat_id, global_config):
     if not supabase:
         return
 
@@ -262,6 +290,10 @@ async def evaluate_active_trades(bot, chat_id, config):
 
     for trade in open_trades:
         symbol = str(trade.get('symbol', 'UNKNOWN'))
+        
+        # Load asset-specific overrides for trade management
+        config = get_symbol_config(symbol, global_config)
+        
         try:
             trade_id = trade['id']
             entry = float(trade['entry_price'])
@@ -290,7 +322,7 @@ async def evaluate_active_trades(bot, chat_id, config):
 
             is_long = sl < entry
 
-            # Dynamic Adaptive ATR Trailing Stop Update
+            # Dynamic Adaptive ATR Trailing Stop Update (Using Symbol Parameters)
             if config.get("use_adaptive_atr_trail", True) and latest_atr > 0:
                 trail_mult = float(config.get("atr_trail_mult", config.get("atr_trail_multiplier", 1.5)))
                 if is_long:
@@ -376,10 +408,13 @@ async def evaluate_active_trades(bot, chat_id, config):
             print(f"Error evaluating trade ID {trade.get('id')} for {symbol}: {e}")
 
 # =====================================================================
-# ANALYSIS & SCANNER LOOP
+# ANALYSIS & SCANNER LOOP (ASSET-SPECIFIC OVERRIDES INTEGRATED)
 # =====================================================================
-async def analyze_symbol(symbol, bot, chat_id, config):
+async def analyze_symbol(symbol, bot, chat_id, global_config):
     current_time = time.time()
+
+    # Load symbol parameters with individual overrides applied
+    config = get_symbol_config(symbol, global_config)
 
     account_balance = float(config.get("account_balance", 1000.0))
     base_risk_pct = float(config.get("risk_pct", 1.0))
@@ -388,7 +423,7 @@ async def analyze_symbol(symbol, bot, chat_id, config):
     cooldown_hours = float(config.get("alert_cooldown_hours", 4))
     min_adx = float(config.get("min_adx", 20.0))
     min_atr_pct = float(config.get("min_atr_pct", 0.4))
-    atr_mult_sl = float(config.get("atr_mult_sl", 1.5))  # ATR Multiplier for Stop Loss
+    atr_mult_sl = float(config.get("atr_mult_sl", 1.5))
 
     if symbol in last_alert_time:
         elapsed_hours = (current_time - last_alert_time[symbol]) / 3600
@@ -428,7 +463,7 @@ async def analyze_symbol(symbol, bot, chat_id, config):
             triggered_reasons.append(f"Near Volume POC ({dist_poc:.2f}% away)")
 
     if not triggered_reasons:
-        print(f"[{symbol}] Price (${current_price:.4f}) outside proximity threshold. No trigger.")
+        print(f"[{symbol}] Price (${current_price:.4f}) outside proximity threshold ({proximity_threshold}%). No trigger.")
         del df_1h, df_4h
         return
 
@@ -458,18 +493,18 @@ async def analyze_symbol(symbol, bot, chat_id, config):
     current_atr_pct = float(df_1h['atr_pct'].dropna().iloc[-1]) if 'atr_pct' in df_1h else 0.0
 
     if current_adx < min_adx:
-        print(f"[{symbol}] ❌ Filter Skipped: ADX ({current_adx:.2f}) below min threshold ({min_adx}).")
+        print(f"[{symbol}] ❌ Filter Skipped: ADX ({current_adx:.2f}) below symbol threshold ({min_adx}).")
         del df_1h, df_4h
         return
 
     if current_atr_pct < min_atr_pct:
-        print(f"[{symbol}] ❌ Filter Skipped: ATR% ({current_atr_pct:.2f}%) below min threshold ({min_atr_pct}%).")
+        print(f"[{symbol}] ❌ Filter Skipped: ATR% ({current_atr_pct:.2f}%) below symbol threshold ({min_atr_pct}%).")
         del df_1h, df_4h
         return
 
     print(f"🎯 TRIGGER & FILTERS MATCH for {symbol}: {', '.join(triggered_reasons)} (ADX: {current_adx:.2f}, ATR%: {current_atr_pct:.2f}%)")
 
-    # Direction & Trade Sizing Calculations (Applying ATR Multiplier)
+    # Direction & Trade Sizing Calculations (Applying Symbol-Specific ATR Multiplier)
     tema_ref = val_1h if val_1h is not None else current_price
     direction = "LONG" if current_price >= tema_ref else "SHORT"
     entry_price = current_price
@@ -493,7 +528,7 @@ async def analyze_symbol(symbol, bot, chat_id, config):
     rr_ratio = reward_amount_per_unit / risk_amount_per_unit if risk_amount_per_unit > 0 else 0.0
 
     if rr_ratio < min_rr_threshold:
-        print(f"[{symbol}] 🛑 SIGNAL REJECTED: Risk/Reward ({rr_ratio:.2f}R) is below minimum threshold ({min_rr_threshold:.2f}R).")
+        print(f"[{symbol}] 🛑 SIGNAL REJECTED: Risk/Reward ({rr_ratio:.2f}R) is below threshold ({min_rr_threshold:.2f}R).")
         del df_1h, df_4h
         return
 
@@ -541,16 +576,16 @@ async def analyze_symbol(symbol, bot, chat_id, config):
     del df_1h, df_4h
 
 async def run_scanner():
-    config = load_config()
+    global_config = load_config()
     init_db()
 
-    telegram_bot_token = os.getenv("TELEGRAM_BOT_TOKEN") or config.get("telegram_bot_token")
-    telegram_chat_id = os.getenv("TELEGRAM_CHAT_ID") or config.get("telegram_chat_id")
+    telegram_bot_token = os.getenv("TELEGRAM_BOT_TOKEN") or global_config.get("telegram_bot_token")
+    telegram_chat_id = os.getenv("TELEGRAM_CHAT_ID") or global_config.get("telegram_chat_id")
 
     bot = Bot(token=telegram_bot_token) if telegram_bot_token else None
 
     if bot and telegram_chat_id:
-        startup_msg = "🟢 **Upgraded Structural Trading Agent Initialized & Active.** Scanning loop starting..."
+        startup_msg = "🟢 **Upgraded Structural Trading Agent Initialized & Active.** Asset-specific parameter overrides active..."
         await bot.send_message(chat_id=telegram_chat_id, text=startup_msg, parse_mode="Markdown")
 
     while True:
