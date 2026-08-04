@@ -270,7 +270,7 @@ def safe_format(value):
     return f"${float(value):.4f}"
 
 # =====================================================================
-# ACTIVE TRADE EVALUATOR ENGINE (WITH ASSET-SPECIFIC ATR TRAILING)
+# ACTIVE TRADE EVALUATOR ENGINE (WITH HARD BREAKEVEN PROTECTION)
 # =====================================================================
 async def evaluate_active_trades(bot, chat_id, global_config):
     if not supabase:
@@ -322,17 +322,25 @@ async def evaluate_active_trades(bot, chat_id, global_config):
 
             is_long = sl < entry
 
-            # Dynamic Adaptive ATR Trailing Stop Update (Using Symbol Parameters)
+            # Dynamic Adaptive ATR Trailing Stop Update (With Hard Breakeven Protection)
             if config.get("use_adaptive_atr_trail", True) and latest_atr > 0:
                 trail_mult = float(config.get("atr_trail_mult", config.get("atr_trail_multiplier", 1.5)))
                 if is_long:
                     new_trail_sl = latest_close - (latest_atr * trail_mult)
+                    # Option A Clamping: Clamp stop loss so it never drops below entry if TP1 was reached
+                    if current_status == "TP1_HIT":
+                        new_trail_sl = max(new_trail_sl, entry)
+                    
                     if new_trail_sl > sl:
                         sl = new_trail_sl
                         supabase.table("trade_journal").update({"stop_loss": float(sl)}).eq("id", trade_id).execute()
                         print(f"🛡️ Dynamic Trailing Stop updated for {symbol} (LONG) to ${sl:.4f}")
                 else:
                     new_trail_sl = latest_close + (latest_atr * trail_mult)
+                    # Option A Clamping: Clamp stop loss so it never rises above entry if TP1 was reached
+                    if current_status == "TP1_HIT":
+                        new_trail_sl = min(new_trail_sl, entry)
+                        
                     if new_trail_sl < sl:
                         sl = new_trail_sl
                         supabase.table("trade_journal").update({"stop_loss": float(sl)}).eq("id", trade_id).execute()
@@ -341,8 +349,13 @@ async def evaluate_active_trades(bot, chat_id, global_config):
             # 1. Check Stop Loss
             sl_hit = (latest_low <= sl) if is_long else (latest_high >= sl)
             if sl_hit:
-                pnl_usd = -risk_usd
-                realized_r = -1.0
+                # If stopped out after TP1 was hit, realized loss is capped at 0R / Breakeven
+                if current_status == "TP1_HIT":
+                    pnl_usd = 0.0
+                    realized_r = 0.0
+                else:
+                    pnl_usd = -risk_usd
+                    realized_r = -1.0
 
                 update_data = {
                     "status": "STOPPED_OUT",
@@ -354,10 +367,11 @@ async def evaluate_active_trades(bot, chat_id, global_config):
                 supabase.table("trade_journal").update(update_data).eq("id", trade_id).execute()
 
                 if bot and chat_id:
+                    status_title = "🛡️ **TRADE CLOSED AT BREAKEVEN / TRAILING STOP: " if current_status == "TP1_HIT" else "🛑 **TRADE STOPPED OUT: "
                     msg = (
-                        f"🛑 **TRADE STOPPED OUT: {symbol}** 🛑\n\n"
+                        f"{status_title}{symbol}**\n\n"
                         f"• Exit Price: `${sl:.4f}`\n"
-                        f"• Realized PnL: `${pnl_usd:.2f}` (-1.0R)\n"
+                        f"• Realized PnL: `${pnl_usd:.2f}` ({realized_r:.2f}R)\n"
                         f"• Timestamp: `{close_time}`"
                     )
                     await bot.send_message(chat_id=chat_id, text=msg, parse_mode="Markdown")
@@ -391,14 +405,26 @@ async def evaluate_active_trades(bot, chat_id, global_config):
             if tp1_hit and current_status == 'OPEN':
                 r_multiple = abs(tp1 - entry) / abs(entry - sl) if abs(entry - sl) > 0 else 0
 
-                supabase.table("trade_journal").update({"status": "TP1_HIT"}).eq("id", trade_id).execute()
+                # Enforce Hard Breakeven Protection immediately on TP1 Hit
+                new_sl = entry
+                if is_long:
+                    if sl < entry:
+                        sl = new_sl
+                else:
+                    if sl > entry:
+                        sl = new_sl
+
+                supabase.table("trade_journal").update({
+                    "status": "TP1_HIT",
+                    "stop_loss": float(sl)
+                }).eq("id", trade_id).execute()
 
                 if bot and chat_id:
                     msg = (
                         f"✅ **FIRST TARGET REACHED (TP1): {symbol}** ✅\n\n"
                         f"• Milestone Price: `${tp1:.4f}`\n"
                         f"• Un-realized Gain: `+{r_multiple:.2f}R`\n"
-                        f"• Status: Trailing Stop Activated"
+                        f"• Hard Breakeven Protected: Stop Loss set to `${sl:.4f}`"
                     )
                     await bot.send_message(chat_id=chat_id, text=msg, parse_mode="Markdown")
 
@@ -585,7 +611,7 @@ async def run_scanner():
     bot = Bot(token=telegram_bot_token) if telegram_bot_token else None
 
     if bot and telegram_chat_id:
-        startup_msg = "🟢 **Upgraded Structural Trading Agent Initialized & Active.** Asset-specific parameter overrides active..."
+        startup_msg = "🟢 **Upgraded Structural Trading Agent Initialized & Active.** Hard Breakeven Protection active..."
         await bot.send_message(chat_id=telegram_chat_id, text=startup_msg, parse_mode="Markdown")
 
     while True:
