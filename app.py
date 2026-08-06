@@ -37,10 +37,11 @@ def get_supabase_client() -> Client:
 supabase = get_supabase_client()
 
 AVAILABLE_PAIRS = [
-    "ONDO/USDT", "PENDLE/USDT", "LINK/USDT", "TIA/USDT", "NEAR/USDT",
-    "BTC/USDT", "ETH/USDT", "SOL/USDT", "AVAX/USDT", "SUI/USDT",
-    "AR/USDT", "FET/USDT", "RENDER/USDT", "TAO/USDT", "SYRUP/USDT",
-    "AAVE/USDT", "UNI/USDT", "APT/USDT", "INJ/USDT", "SEI/USDT"
+    "ADA/USDT", "SOL/USDT", "XRP/USDT", "ONDO/USDT", "PENDLE/USDT", 
+    "LINK/USDT", "TIA/USDT", "NEAR/USDT", "BTC/USDT", "ETH/USDT", 
+    "AVAX/USDT", "SUI/USDT", "AR/USDT", "FET/USDT", "RENDER/USDT", 
+    "TAO/USDT", "SYRUP/USDT", "AAVE/USDT", "UNI/USDT", "APT/USDT", 
+    "INJ/USDT", "SEI/USDT"
 ]
 
 def load_config():
@@ -50,36 +51,37 @@ def load_config():
         "long_risk_multiplier": 1.0,
         "short_risk_multiplier": 1.0,
         "proximity_threshold_pct": 2.0,
-        "min_adx": 20.0,
-        "min_atr_pct": 0.4,
+        "min_adx": 15.0,
+        "min_atr_pct": 0.2,
         "atr_mult_sl": 1.5,
-        "min_rr_ratio": 1.5,
+        "min_rr_ratio": 2.0,
         "scan_interval_minutes": 15,
         "alert_cooldown_hours": 4,
         "enable_live_trading": False,
         "watchlist": [
-            "ONDO/USDT", "PENDLE/USDT", "LINK/USDT", "TIA/USDT", "NEAR/USDT",
-            "SOL/USDT", "AR/USDT", "FET/USDT", "RENDER/USDT", "TAO/USDT",
-            "SYRUP/USDT", "SEI/USDT", "CFG/USDT", "HNT/USDT", "XRP/USDT", "DOGE/USDT"
+            "ADA/USDT",
+            "SOL/USDT",
+            "XRP/USDT"
         ],
         "use_mtf_tema_alignment": True,
-        "htf_tema_period": 200,
-        "htf_alignment_mode": "Price Level",
+        "htf_tema_period": 50,
+        "htf_alignment_mode": "TEMA Slope",
         "use_adaptive_atr_trail": True,
-        "atr_trail_mult": 1.5,
+        "atr_trail_mult": 2.0,
         "use_equity_curve_filter": True,
         "eq_ma_period": 10,
-        "reduced_risk_factor": 0.5,
+        "reduced_risk_factor": 0.3,
         "asset_overrides": {
-            "GBP/JPY": {
-                "min_adx": 25.0,
-                "atr_mult_sl": 2.0,
-                "proximity_threshold_pct": 2.5
-            },
             "SOL/USDT": {
-                "min_adx": 22.0,
-                "atr_mult_sl": 1.8,
-                "proximity_threshold_pct": 2.2
+                "atr_mult_sl": 2.0,
+                "proximity_threshold_pct": 0.5,
+                "atr_trail_mult": 2.2
+            },
+            "XRP/USDT": {
+                "proximity_threshold_pct": 1.5,
+                "atr_mult_sl": 2.0,
+                "min_atr_pct": 0.4,
+                "atr_trail_mult": 2.2
             }
         }
     }
@@ -95,7 +97,11 @@ def load_config():
     try:
         with open(CONFIG_FILE, "r", encoding="utf-8") as f:
             existing_config = json.load(f)
-            return {**default_config, **existing_config}
+            merged = {**default_config, **existing_config}
+            # Ensure nested asset overrides are preserved cleanly
+            if "asset_overrides" in existing_config:
+                merged["asset_overrides"] = {**default_config.get("asset_overrides", {}), **existing_config["asset_overrides"]}
+            return merged
     except Exception:
         return default_config
 
@@ -306,7 +312,7 @@ def calculate_effective_risk(base_risk_pct, direction, config):
             closed_trades = res.data
             eq_period = int(config.get("eq_ma_period", 10))
             if closed_trades and len(closed_trades) >= eq_period:
-                initial_balance = float(config.get("account_balance", 1000.0))
+                initial_balance = float(config.get("account_balance", 100.0))
                 pnl_list = [float(t.get("realized_pnl_usd", 0.0)) for t in reversed(closed_trades)]
                 equity_series = np.cumsum([initial_balance] + pnl_list)
                 
@@ -314,7 +320,7 @@ def calculate_effective_risk(base_risk_pct, direction, config):
                 current_eq = equity_series[-1]
                 
                 if current_eq < recent_ma:
-                    reduced_factor = float(config.get("reduced_risk_factor", 0.5))
+                    reduced_factor = float(config.get("reduced_risk_factor", 0.3))
                     effective_risk *= reduced_factor
         except Exception:
             pass
@@ -407,7 +413,7 @@ async def evaluate_active_trades(bot, chat_id, global_config):
 
             # Dynamic ATR Trailing Stop Update
             if config.get("use_adaptive_atr_trail", True) and latest_atr > 0:
-                trail_mult = float(config.get("atr_trail_mult", 1.5))
+                trail_mult = float(config.get("atr_trail_mult", 2.0))
                 if is_long:
                     new_trail_sl = latest_close - (latest_atr * trail_mult)
                     if current_status == "TP1_HIT":
@@ -503,13 +509,13 @@ async def analyze_symbol(symbol, bot, chat_id, global_config):
     current_time = time.time()
     config = get_symbol_config(symbol, global_config)
 
-    account_balance = float(config.get("account_balance", 1000.0))
+    account_balance = float(config.get("account_balance", 100.0))
     base_risk_pct = float(config.get("risk_pct", 1.0))
-    min_rr_threshold = float(config.get("min_rr_ratio", 1.5))
+    min_rr_threshold = float(config.get("min_rr_ratio", 2.0))
     proximity_threshold = float(config.get("proximity_threshold_pct", 2.0))
     cooldown_hours = float(config.get("alert_cooldown_hours", 4))
-    min_adx = float(config.get("min_adx", 20.0))
-    min_atr_pct = float(config.get("min_atr_pct", 0.4))
+    min_adx = float(config.get("min_adx", 15.0))
+    min_atr_pct = float(config.get("min_atr_pct", 0.2))
     atr_mult_sl = float(config.get("atr_mult_sl", 1.5))
     enable_live_trading = config.get("enable_live_trading", False)
 
@@ -519,7 +525,7 @@ async def analyze_symbol(symbol, bot, chat_id, global_config):
             return
 
     df_1h = fetch_market_data(symbol, timeframe='1h', limit=350)
-    htf_lookback = int(config.get("htf_tema_period", 200))
+    htf_lookback = int(config.get("htf_tema_period", 50))
     df_4h = fetch_market_data(symbol, timeframe='4h', limit=350, tema_length=htf_lookback)
 
     if df_1h is None or df_4h is None or df_1h.empty or df_4h.empty:
@@ -559,7 +565,7 @@ async def analyze_symbol(symbol, bot, chat_id, global_config):
 
     # Multi-Timeframe TEMA Trend Alignment Filter
     if config.get("use_mtf_tema_alignment", True) and val_1h is not None and val_4h is not None:
-        alignment_mode = config.get("htf_alignment_mode", "Price Level")
+        alignment_mode = config.get("htf_alignment_mode", "TEMA Slope")
         base_long = current_price >= val_1h
         base_short = current_price < val_1h
 
@@ -648,7 +654,7 @@ async def analyze_symbol(symbol, bot, chat_id, global_config):
         f"• Stop Loss: `${stop_loss:.4f}` (Risk: `${risk_usd:.2f}`)\n"
         f"• Target 1: `${tp1:.4f}` | Target 2: `${tp2:.4f}`\n"
         f"• R/R Ratio: `{rr_ratio:.2f}R`\n"
-        f"• Maker Execution Status: `{'DISPATCHED (ID: ' + str(order_id) + ')' if order_id else 'LOGGED (POST-ONLY / SIMULATION)'}`"
+        f"• Execution Status: `{'LIVE MAKER DISPATCHED (ID: ' + str(order_id) + ')' if order_id else 'SIMULATION / PAPER TRADING'}`"
     )
 
     if bot and chat_id:
@@ -672,12 +678,12 @@ def run_backtest_upgraded(df: pd.DataFrame, params: dict):
     atr_mult_sl = params.get('atr_mult_sl', 1.5)
     
     use_mtf = params.get('use_mtf', True)
-    htf_mode = params.get('htf_mode', 'Price Level')
+    htf_mode = params.get('htf_mode', 'TEMA Slope')
     use_atr_trail = params.get('use_atr_trail', True)
-    atr_trail_mult = params.get('atr_trail_mult', 1.5)
+    atr_trail_mult = params.get('atr_trail_mult', 2.0)
     use_equity_filter = params.get('use_equity_filter', True)
     eq_ma_period = params.get('eq_ma_period', 10)
-    reduced_risk_factor = params.get('reduced_risk_factor', 0.5)
+    reduced_risk_factor = params.get('reduced_risk_factor', 0.3)
 
     balance = float(initial_balance)
     equity_curve = [balance]
@@ -1069,9 +1075,19 @@ with st.sidebar:
     st.header("⚙️ Bot Parameters")
     
     with st.form("config_form"):
+        # Trading Mode Switcher
+        st.subheader("⚡ Execution Mode")
+        trading_mode = st.radio(
+            "Trading Mode",
+            ["Paper Trading (Simulation)", "Live Execution (Maker Post-Only)"],
+            index=1 if config.get("enable_live_trading", False) else 0
+        )
+        enable_live = (trading_mode == "Live Execution (Maker Post-Only)")
+
+        st.markdown("---")
         account_balance = st.number_input(
             "Account Balance ($)", 
-            value=float(config.get("account_balance", 1000.0)), 
+            value=float(config.get("account_balance", 100.0)), 
             step=50.0
         )
         risk_pct = st.slider(
@@ -1092,12 +1108,12 @@ with st.sidebar:
         min_adx = st.slider(
             "ADX Cutoff", 
             10.0, 50.0, 
-            float(config.get("min_adx", 20.0)), 
+            float(config.get("min_adx", 15.0)), 
             step=1.0
         )
         min_atr = st.number_input(
             "Min ATR %", 
-            value=float(config.get("min_atr_pct", 0.4)), 
+            value=float(config.get("min_atr_pct", 0.2)), 
             step=0.05
         )
         atr_mult_sl = st.slider(
@@ -1109,34 +1125,42 @@ with st.sidebar:
         min_rr_ratio = st.slider(
             "Minimum R/R Ratio", 
             1.0, 5.0, 
-            float(config.get("min_rr_ratio", 1.5)), 
+            float(config.get("min_rr_ratio", 2.0)), 
             step=0.1
         )
 
         st.markdown("---")
         st.subheader("🚀 Upgrades & Execution Panel")
-        enable_live = st.checkbox("Enable Live Trading Execution (Maker Post-Only)", value=config.get("enable_live_trading", False))
-
         use_mtf = st.checkbox("Enable 1H + HTF Trend Alignment", value=config.get("use_mtf_tema_alignment", True))
-        htf_period = st.slider("HTF TEMA Period", 10, 200, int(config.get("htf_tema_period", 200)), step=10)
-        htf_mode = st.radio("HTF Alignment Mode", ["Price Level", "TEMA Slope"], index=0 if config.get("htf_alignment_mode", "Price Level") == "Price Level" else 1)
+        htf_period = st.slider("HTF TEMA Period", 10, 200, int(config.get("htf_tema_period", 50)), step=10)
+        htf_mode = st.radio("HTF Alignment Mode", ["Price Level", "TEMA Slope"], index=1 if config.get("htf_alignment_mode", "TEMA Slope") == "TEMA Slope" else 0)
 
         st.markdown("---")
         use_atr_trail = st.checkbox("Enable Dynamic ATR Trailing Stop", value=config.get("use_adaptive_atr_trail", True))
-        atr_trail_mult = st.slider("ATR Trailing Multiplier", 1.0, 4.0, float(config.get("atr_trail_mult", 1.5)), step=0.1)
+        atr_trail_mult = st.slider("ATR Trailing Multiplier", 1.0, 4.0, float(config.get("atr_trail_mult", 2.0)), step=0.1)
 
         st.markdown("---")
         use_equity_filter = st.checkbox("Enable Equity Curve Drawdown Filter", value=config.get("use_equity_curve_filter", True))
         eq_ma = st.number_input("Equity MA Period", value=int(config.get("eq_ma_period", 10)), step=1)
-        reduced_risk = st.slider("Drawdown Risk Factor", 0.1, 0.9, float(config.get("reduced_risk_factor", 0.5)), step=0.05)
+        reduced_risk = st.slider("Drawdown Risk Factor", 0.1, 0.9, float(config.get("reduced_risk_factor", 0.3)), step=0.05)
 
         st.markdown("---")
         alert_cooldown = st.number_input("Alert Cooldown (hours)", value=int(config.get("alert_cooldown_hours", 4)), min_value=1, max_value=48, step=1)
         scan_interval = st.number_input("Scan Interval (mins)", value=int(config.get("scan_interval_minutes", 15)), step=1)
         
-        current_watchlist = config.get("watchlist", [])
-        all_options = list(dict.fromkeys(AVAILABLE_PAIRS + current_watchlist))
-        selected_watchlist = st.multiselect("Watchlist Assets:", options=all_options, default=current_watchlist)
+        # Watchlist Configuration with Option to Add New Assets
+        st.markdown("---")
+        st.subheader("📊 Watchlist Management")
+        new_asset = st.text_input("➕ Add Custom Symbol (e.g., BTC/USDT):").strip().upper()
+        
+        current_watchlist = config.get("watchlist", ["ADA/USDT", "SOL/USDT", "XRP/USDT"])
+        all_options = list(dict.fromkeys(AVAILABLE_PAIRS + current_watchlist + ([new_asset] if new_asset else [])))
+        
+        default_selected = current_watchlist.copy()
+        if new_asset and new_asset not in default_selected:
+            default_selected.append(new_asset)
+            
+        selected_watchlist = st.multiselect("Active Watchlist Assets:", options=all_options, default=default_selected)
         
         submitted = st.form_submit_button("Save Configuration")
         if submitted:
@@ -1184,13 +1208,13 @@ if not df_journal.empty:
     m2.metric("Active Trades", open_trades)
     m3.metric("Net Realized PnL", f"${net_pnl:.2f}", delta=f"{total_r:.2f}R")
     m4.metric("Win Rate", f"{win_rate:.1f}%")
-    m5.metric("Live Execution", "ENABLED" if config.get("enable_live_trading") else "SIMULATION")
+    m5.metric("Execution Mode", "LIVE (MAKER)" if config.get("enable_live_trading") else "SIMULATION")
 else:
     m1.metric("Total Signals", "0")
     m2.metric("Active Trades", "0")
     m3.metric("Net Realized PnL", "$0.00")
     m4.metric("Win Rate", "0.0%")
-    m5.metric("Live Execution", "ENABLED" if config.get("enable_live_trading") else "SIMULATION")
+    m5.metric("Execution Mode", "LIVE (MAKER)" if config.get("enable_live_trading") else "SIMULATION")
 
 st.divider()
 
@@ -1233,11 +1257,11 @@ with tab_history:
 with tab_charts:
     col_sym, col_tf = st.columns([2, 1])
     with col_sym:
-        selected_symbol = st.selectbox("Select Asset", config.get("watchlist", ["NEAR/USDT"]))
+        selected_symbol = st.selectbox("Select Asset", config.get("watchlist", ["SOL/USDT"]))
     with col_tf:
         selected_tf = st.selectbox("Timeframe", ["15m", "1h", "4h"], index=1)
         
-    df_chart = fetch_market_data(selected_symbol, timeframe=selected_tf, limit=350, tema_length=int(config.get("htf_tema_period", 200)))
+    df_chart = fetch_market_data(selected_symbol, timeframe=selected_tf, limit=350, tema_length=int(config.get("htf_tema_period", 50)))
     if not df_chart.empty:
         render_tradingview_chart(df_chart, selected_symbol, df_journal)
     else:
@@ -1248,30 +1272,30 @@ with tab_backtest:
     st.subheader("🧪 Upgraded Backtesting Engine")
     b_col1, b_col2, b_col3 = st.columns([2, 1, 1])
     with b_col1:
-        bt_symbol = st.selectbox("Backtest Asset", config.get("watchlist", ["NEAR/USDT"]), key="bt_sym")
+        bt_symbol = st.selectbox("Backtest Asset", config.get("watchlist", ["SOL/USDT"]), key="bt_sym")
     with b_col2:
         bt_tf = st.selectbox("Timeframe", ["15m", "1h", "4h"], index=1, key="bt_tf")
     with b_col3:
         bt_limit = st.select_slider("Bars Limit", options=[300, 350, 500, 1000], value=350)
         
     if st.button("🚀 Run Backtest", type="primary", use_container_width=True):
-        df_bt = fetch_market_data(bt_symbol, timeframe=bt_tf, limit=bt_limit, tema_length=int(config.get("htf_tema_period", 200)))
+        df_bt = fetch_market_data(bt_symbol, timeframe=bt_tf, limit=bt_limit, tema_length=int(config.get("htf_tema_period", 50)))
         if not df_bt.empty:
             params = {
-                'initial_balance': config.get("account_balance", 1000.0),
+                'initial_balance': config.get("account_balance", 100.0),
                 'risk_pct': config.get("risk_pct", 1.0),
-                'target_rr': config.get("min_rr_ratio", 1.5),
-                'min_adx': config.get("min_adx", 20.0),
-                'min_atr_pct': config.get("min_atr_pct", 0.4),
+                'target_rr': config.get("min_rr_ratio", 2.0),
+                'min_adx': config.get("min_adx", 15.0),
+                'min_atr_pct': config.get("min_atr_pct", 0.2),
                 'proximity_pct': config.get("proximity_threshold_pct", 2.0),
                 'atr_mult_sl': config.get("atr_mult_sl", 1.5),
                 'use_mtf': config.get("use_mtf_tema_alignment", True),
-                'htf_mode': config.get("htf_alignment_mode", "Price Level"),
+                'htf_mode': config.get("htf_alignment_mode", "TEMA Slope"),
                 'use_atr_trail': config.get("use_adaptive_atr_trail", True),
-                'atr_trail_mult': config.get("atr_trail_mult", 1.5),
+                'atr_trail_mult': config.get("atr_trail_mult", 2.0),
                 'use_equity_filter': config.get("use_equity_curve_filter", True),
                 'eq_ma_period': int(config.get("eq_ma_period", 10)),
-                'reduced_risk_factor': config.get("reduced_risk_factor", 0.5)
+                'reduced_risk_factor': config.get("reduced_risk_factor", 0.3)
             }
             sim_trades, equity_series, sim_metrics = run_backtest_upgraded(df_bt, params)
             st.json(sim_metrics)
