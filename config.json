@@ -1,6 +1,10 @@
 {
   "account_balance": 100.0,
   "risk_pct": 1.0,
+  "leverage": 100,
+  "margin_mode": "isolated",
+  "long_risk_multiplier": 1.0,
+  "short_risk_multiplier": 1.0,
   "proximity_threshold_pct": 2.0,
   "min_adx": 15.0,
   "min_atr_pct": 0.2,
@@ -8,6 +12,7 @@
   "min_rr_ratio": 2.0,
   "scan_interval_minutes": 15,
   "alert_cooldown_hours": 4,
+  "enable_live_trading": false,
   "watchlist": [
     "ADA/USDT",
     "SOL/USDT",
@@ -26,11 +31,10 @@
       "atr_mult_sl": 2.0,
       "proximity_threshold_pct": 0.5,
       "atr_trail_mult": 2.2
-    }
+    },
     "XRP/USDT": {
       "atr_mult_sl": 2.0,
       "proximity_threshold_pct": 1.5,
-      "atr_mult_sl": 2.0,
       "min_atr_pct": 0.4,
       "atr_trail_mult": 2.2
     }
