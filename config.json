@@ -1,32 +1,38 @@
 {
-    "account_balance": 100.0,
-    "risk_pct": 1.0,
-    "proximity_threshold_pct": 2.0,
-    "min_adx": 20.0,
-    "min_atr_pct": 0.0,
-    "atr_mult_sl": 1.5,
-    "min_rr_ratio": 1.4,
-    "scan_interval_minutes": 15,
-    "alert_cooldown_hours": 4,
-    "watchlist": [
-        "SEI/USDT", "ONDO/USDT", "TAO/USDT", "XRP/USDT"
-    ],
-    "use_mtf_tema_alignment": true,
-    "htf_tema_period": 200,
-    "htf_alignment_mode": "TEMA Slope",
-    "use_adaptive_atr_trail": true,
-    "atr_trail_mult": 2.8,
-    "use_equity_curve_filter": true,
-    "eq_ma_period": 10,
-    "reduced_risk_factor": 0.5,
-
-    "asset_overrides": {
-        "ONDO/USDT": {
-            "min_adx": 25.0,
-            "atr_mult_sl": 1.5,
-	    "min_rr_ratio": 1.5,
-            "proximity_threshold_pct": 2.0,
-	    "htf_alignment_mode": "Price Level"
-        } 
+  "account_balance": 100.0,
+  "risk_pct": 1.0,
+  "proximity_threshold_pct": 2.0,
+  "min_adx": 15.0,
+  "min_atr_pct": 0.2,
+  "atr_mult_sl": 1.5,
+  "min_rr_ratio": 2.0,
+  "scan_interval_minutes": 15,
+  "alert_cooldown_hours": 4,
+  "watchlist": [
+    "ADA/USDT",
+    "SOL/USDT",
+    "XRP/USDT"
+  ],
+  "use_mtf_tema_alignment": true,
+  "htf_tema_period": 50,
+  "htf_alignment_mode": "TEMA Slope",
+  "use_adaptive_atr_trail": true,
+  "atr_trail_mult": 2.0,
+  "use_equity_curve_filter": true,
+  "eq_ma_period": 10,
+  "reduced_risk_factor": 0.3,
+  "asset_overrides": {
+    "SOL/USDT": {
+      "atr_mult_sl": 2.0,
+      "proximity_threshold_pct": 0.5,
+      "atr_trail_mult": 2.2
     }
+    "XRP/USDT": {
+      "atr_mult_sl": 2.0,
+      "proximity_threshold_pct": 1.5,
+      "atr_mult_sl": 2.0,
+      "min_atr_pct": 0.4,
+      "atr_trail_mult": 2.2
+    }
+  }
 }

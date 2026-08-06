@@ -26,6 +26,8 @@ def load_config():
     default_config = {
         "account_balance": 1000.0,
         "risk_pct": 1.0,
+        "long_risk_multiplier": 1.0,
+        "short_risk_multiplier": 1.0,
         "proximity_threshold_pct": 2.0,
         "min_adx": 20.0,
         "min_atr_pct": 0.4,
@@ -33,6 +35,7 @@ def load_config():
         "min_rr_ratio": 1.5,
         "scan_interval_minutes": 15,
         "alert_cooldown_hours": 4,
+        "enable_live_trading": False,  # Toggle True to dispatch real exchange limit orders
         "watchlist": [
             "ONDO/USDT", "PENDLE/USDT", "LINK/USDT", "TIA/USDT", "NEAR/USDT",
             "SOL/USDT", "AR/USDT", "FET/USDT", "RENDER/USDT", "TAO/USDT",
@@ -48,8 +51,7 @@ def load_config():
         "eq_ma_period": 10,
         "reduced_risk_factor": 0.5,
         
-        # Recommendation 2: Asset-Specific Parameter Overrides Map
-        # Format: "SYMBOL": { override_key: override_value }
+        # Asset-Specific Parameter Overrides Map
         "asset_overrides": {
             "GBP/JPY": {
                 "min_adx": 25.0,
@@ -78,10 +80,7 @@ def load_config():
         return default_config
 
 def get_symbol_config(symbol: str, global_config: dict) -> dict:
-    """
-    Combines global configurations with symbol-specific overrides.
-    Allows tailored risk and parameters per asset while using a single codebase.
-    """
+    """Combines global configurations with symbol-specific overrides."""
     symbol_config = global_config.copy()
     overrides_map = global_config.get("asset_overrides", {})
     
@@ -93,16 +92,54 @@ def get_symbol_config(symbol: str, global_config: dict) -> dict:
 def get_exchange():
     try:
         print("Connecting to MEXC...")
-        exchange = ccxt.mexc({'enableRateLimit': True, 'timeout': 20000})
+        exchange = ccxt.mexc({
+            'enableRateLimit': True,
+            'timeout': 20000,
+            'apiKey': os.getenv("EXCHANGE_API_KEY", ""),
+            'secret': os.getenv("EXCHANGE_API_SECRET", "")
+        })
         exchange.load_markets()
         print("Connected to MEXC successfully.")
         return exchange
     except Exception as e:
         print(f"MEXC failed ({e}), falling back to Gate.io...")
-        exchange = ccxt.gateio({'enableRateLimit': True, 'timeout': 20000})
+        exchange = ccxt.gateio({
+            'enableRateLimit': True,
+            'timeout': 20000,
+            'apiKey': os.getenv("EXCHANGE_API_KEY", ""),
+            'secret': os.getenv("EXCHANGE_API_SECRET", "")
+        })
         return exchange
 
 exchange = get_exchange()
+
+# =====================================================================
+# MAKER POST-ONLY LIMIT ORDER EXECUTION ENGINE
+# =====================================================================
+def place_maker_limit_order(symbol, side, amount, price):
+    """
+    Places a post-only limit order to guarantee maker liquidity and prevent taker fees.
+    """
+    params = {
+        'postOnly': True,  # Rejects the order if it would execute immediately as a taker
+    }
+    try:
+        order = exchange.create_order(
+            symbol=symbol,
+            type='limit',
+            side=side,
+            amount=amount,
+            price=price,
+            params=params
+        )
+        print(f"✅ Maker Post-Only Limit Order successfully placed for {symbol}: ID {order.get('id')}")
+        return order
+    except ccxt.OrderImmediatelyFillable as e:
+        print(f"⚠️ Post-Only order rejected (would cross spread): {e}")
+        return None
+    except Exception as e:
+        print(f"❌ Error placing Maker Limit Order for {symbol}: {e}")
+        return None
 
 def init_db():
     if not supabase:
@@ -111,7 +148,7 @@ def init_db():
     print("⚡ Connected to Supabase external database.")
 
 def calculate_native_tema(series: pd.Series, length: int = 200) -> pd.Series:
-    """Pure Pandas fallback calculation for TEMA 200."""
+    """Pure Pandas fallback calculation for TEMA."""
     ema1 = series.ewm(span=length, adjust=False).mean()
     ema2 = ema1.ewm(span=length, adjust=False).mean()
     ema3 = ema2.ewm(span=length, adjust=False).mean()
@@ -120,7 +157,7 @@ def calculate_native_tema(series: pd.Series, length: int = 200) -> pd.Series:
     return res
 
 def fetch_market_data(symbol, timeframe='1h', limit=350, tema_length=200):
-    """Fetches market data with float32 downcasting to optimize RAM."""
+    """Fetches market data with float32 downcasting and full technical indicator computations."""
     try:
         ohlcv = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
     except Exception as e:
@@ -162,7 +199,7 @@ def fetch_market_data(symbol, timeframe='1h', limit=350, tema_length=200):
     except Exception:
         df['adx'] = np.float32(0.0)
 
-    # 3. ATR % Calculation
+    # 3. ATR & ATR % Calculation
     try:
         raw_atr = ta.atr(df['high'], df['low'], df['close'], length=14)
         df['atr'] = pd.to_numeric(raw_atr, errors='coerce').astype(np.float32)
@@ -171,6 +208,14 @@ def fetch_market_data(symbol, timeframe='1h', limit=350, tema_length=200):
     except Exception:
         df['atr'] = np.float32(0.0)
         df['atr_pct'] = np.float32(0.0)
+
+    # 4. VWAP / POC Proxy Calculation
+    try:
+        tp = (df['high'] + df['low'] + df['close']) / 3.0
+        df['vwap_poc'] = (df['volume'] * tp).rolling(50).sum() / df['volume'].rolling(50).sum()
+        df['vwap_poc'] = pd.to_numeric(df['vwap_poc'], errors='coerce').astype(np.float32)
+    except Exception:
+        df['vwap_poc'] = df['close']
 
     return df
 
@@ -199,32 +244,36 @@ def calculate_volume_profile(df, num_bins=30):
     del volume_profile, hvn_nodes
     return poc_price, hvn_list
 
-def calculate_effective_risk(base_risk_pct, config):
-    """Calculates position risk factor based on equity curve drawdown filter."""
-    if not config.get("use_equity_curve_filter", False) or not supabase:
-        return base_risk_pct
+def calculate_effective_risk(base_risk_pct, direction, config):
+    """
+    Calculates effective risk per trade applying:
+    1. Directional Risk Multipliers (Long vs Short)
+    2. Equity Curve Drawdown Reduction Filter
+    """
+    dir_mult = float(config.get("long_risk_multiplier", 1.0)) if direction == "LONG" else float(config.get("short_risk_multiplier", 1.0))
+    effective_risk = base_risk_pct * dir_mult
 
-    try:
-        res = supabase.table("trade_journal").select("realized_pnl_usd").in_("status", ["CLOSED_TP2", "STOPPED_OUT"]).order("id", desc=True).limit(50).execute()
-        closed_trades = res.data
-        if len(closed_trades) >= config.get("eq_ma_period", 10):
-            initial_balance = float(config.get("account_balance", 1000.0))
-            pnl_list = [float(t.get("realized_pnl_usd", 0.0)) for t in reversed(closed_trades)]
-            equity_series = np.cumsum([initial_balance] + pnl_list)
-            
-            eq_ma_period = int(config.get("eq_ma_period", 10))
-            recent_ma = np.mean(equity_series[-eq_ma_period:])
-            current_eq = equity_series[-1]
-            
-            if current_eq < recent_ma:
-                reduced_factor = float(config.get("reduced_risk_factor", 0.5))
-                effective_risk = base_risk_pct * reduced_factor
-                print(f"📉 Equity Curve Filter Active: Current (${current_eq:.2f}) < MA (${recent_ma:.2f}). Risk reduced to {effective_risk:.2f}%")
-                return effective_risk
-    except Exception as e:
-        print(f"Error checking equity curve filter: {e}")
+    if config.get("use_equity_curve_filter", False) and supabase:
+        try:
+            res = supabase.table("trade_journal").select("realized_pnl_usd").in_("status", ["CLOSED_TP2", "STOPPED_OUT"]).order("id", desc=True).limit(50).execute()
+            closed_trades = res.data
+            eq_period = int(config.get("eq_ma_period", 10))
+            if len(closed_trades) >= eq_period:
+                initial_balance = float(config.get("account_balance", 1000.0))
+                pnl_list = [float(t.get("realized_pnl_usd", 0.0)) for t in reversed(closed_trades)]
+                equity_series = np.cumsum([initial_balance] + pnl_list)
+                
+                recent_ma = np.mean(equity_series[-eq_period:])
+                current_eq = equity_series[-1]
+                
+                if current_eq < recent_ma:
+                    reduced_factor = float(config.get("reduced_risk_factor", 0.5))
+                    effective_risk *= reduced_factor
+                    print(f"📉 Equity Curve Filter Active: Balance (${current_eq:.2f}) < MA (${recent_ma:.2f}). Risk scaled to {effective_risk:.2f}%")
+        except Exception as e:
+            print(f"Error checking equity curve filter: {e}")
 
-    return base_risk_pct
+    return effective_risk
 
 def calculate_fixed_risk_position(account_balance, entry_price, stop_loss_price, risk_pct=1.0):
     risk_amount = float(account_balance) * (float(risk_pct) / 100.0)
@@ -237,7 +286,7 @@ def calculate_fixed_risk_position(account_balance, entry_price, stop_loss_price,
     position_size_usdt = units * float(entry_price)
     return float(units), float(position_size_usdt), float(risk_amount)
 
-def log_trade_signal(symbol, reasons, entry, sl, tp1, tp2, position_usdt, risk_usd):
+def log_trade_signal(symbol, reasons, entry, sl, tp1, tp2, position_usdt, risk_usd, order_id=None):
     if not supabase:
         print("⚠️ Cannot log trade: Supabase connection unavailable.")
         return
@@ -255,7 +304,8 @@ def log_trade_signal(symbol, reasons, entry, sl, tp1, tp2, position_usdt, risk_u
         "take_profit_2": float(tp2),
         "position_usdt": float(position_usdt),
         "max_risk_usd": float(risk_usd),
-        "status": "OPEN"
+        "status": "OPEN",
+        "order_id": str(order_id) if order_id else None
     }
 
     try:
@@ -270,7 +320,7 @@ def safe_format(value):
     return f"${float(value):.4f}"
 
 # =====================================================================
-# ACTIVE TRADE EVALUATOR ENGINE (WITH HARD BREAKEVEN PROTECTION)
+# ACTIVE TRADE EVALUATOR ENGINE (WITH HARD BREAKEVEN & ADAPTIVE ATR TRAIL)
 # =====================================================================
 async def evaluate_active_trades(bot, chat_id, global_config):
     if not supabase:
@@ -290,8 +340,6 @@ async def evaluate_active_trades(bot, chat_id, global_config):
 
     for trade in open_trades:
         symbol = str(trade.get('symbol', 'UNKNOWN'))
-        
-        # Load asset-specific overrides for trade management
         config = get_symbol_config(symbol, global_config)
         
         try:
@@ -322,12 +370,11 @@ async def evaluate_active_trades(bot, chat_id, global_config):
 
             is_long = sl < entry
 
-            # Dynamic Adaptive ATR Trailing Stop Update (With Hard Breakeven Protection)
+            # Dynamic Adaptive ATR Trailing Stop Update
             if config.get("use_adaptive_atr_trail", True) and latest_atr > 0:
-                trail_mult = float(config.get("atr_trail_mult", config.get("atr_trail_multiplier", 1.5)))
+                trail_mult = float(config.get("atr_trail_mult", 1.5))
                 if is_long:
                     new_trail_sl = latest_close - (latest_atr * trail_mult)
-                    # Option A Clamping: Clamp stop loss so it never drops below entry if TP1 was reached
                     if current_status == "TP1_HIT":
                         new_trail_sl = max(new_trail_sl, entry)
                     
@@ -337,7 +384,6 @@ async def evaluate_active_trades(bot, chat_id, global_config):
                         print(f"🛡️ Dynamic Trailing Stop updated for {symbol} (LONG) to ${sl:.4f}")
                 else:
                     new_trail_sl = latest_close + (latest_atr * trail_mult)
-                    # Option A Clamping: Clamp stop loss so it never rises above entry if TP1 was reached
                     if current_status == "TP1_HIT":
                         new_trail_sl = min(new_trail_sl, entry)
                         
@@ -346,10 +392,9 @@ async def evaluate_active_trades(bot, chat_id, global_config):
                         supabase.table("trade_journal").update({"stop_loss": float(sl)}).eq("id", trade_id).execute()
                         print(f"🛡️ Dynamic Trailing Stop updated for {symbol} (SHORT) to ${sl:.4f}")
 
-            # 1. Check Stop Loss
+            # 1. Check Stop Loss Hit
             sl_hit = (latest_low <= sl) if is_long else (latest_high >= sl)
             if sl_hit:
-                # If stopped out after TP1 was hit, realized loss is capped at 0R / Breakeven
                 if current_status == "TP1_HIT":
                     pnl_usd = 0.0
                     realized_r = 0.0
@@ -376,7 +421,7 @@ async def evaluate_active_trades(bot, chat_id, global_config):
                     )
                     await bot.send_message(chat_id=chat_id, text=msg, parse_mode="Markdown")
 
-            # 2. Check Take Profit 2
+            # 2. Check Take Profit 2 Hit
             tp2_hit = (latest_high >= tp2) if is_long else (latest_low <= tp2)
             if tp2_hit:
                 r_multiple = abs(tp2 - entry) / abs(entry - sl) if abs(entry - sl) > 0 else 0
@@ -400,12 +445,12 @@ async def evaluate_active_trades(bot, chat_id, global_config):
                     )
                     await bot.send_message(chat_id=chat_id, text=msg, parse_mode="Markdown")
 
-            # 3. Check Take Profit 1
+            # 3. Check Take Profit 1 Hit
             tp1_hit = (latest_high >= tp1) if is_long else (latest_low <= tp1)
             if tp1_hit and current_status == 'OPEN':
                 r_multiple = abs(tp1 - entry) / abs(entry - sl) if abs(entry - sl) > 0 else 0
 
-                # Enforce Hard Breakeven Protection immediately on TP1 Hit
+                # Set hard breakeven protection
                 new_sl = entry
                 if is_long:
                     if sl < entry:
@@ -434,12 +479,10 @@ async def evaluate_active_trades(bot, chat_id, global_config):
             print(f"Error evaluating trade ID {trade.get('id')} for {symbol}: {e}")
 
 # =====================================================================
-# ANALYSIS & SCANNER LOOP (ASSET-SPECIFIC OVERRIDES INTEGRATED)
+# ANALYSIS & SCANNER LOOP
 # =====================================================================
 async def analyze_symbol(symbol, bot, chat_id, global_config):
     current_time = time.time()
-
-    # Load symbol parameters with individual overrides applied
     config = get_symbol_config(symbol, global_config)
 
     account_balance = float(config.get("account_balance", 1000.0))
@@ -450,6 +493,7 @@ async def analyze_symbol(symbol, bot, chat_id, global_config):
     min_adx = float(config.get("min_adx", 20.0))
     min_atr_pct = float(config.get("min_atr_pct", 0.4))
     atr_mult_sl = float(config.get("atr_mult_sl", 1.5))
+    enable_live_trading = config.get("enable_live_trading", False)
 
     if symbol in last_alert_time:
         elapsed_hours = (current_time - last_alert_time[symbol]) / 3600
@@ -458,7 +502,6 @@ async def analyze_symbol(symbol, bot, chat_id, global_config):
             return
 
     df_1h = fetch_market_data(symbol, timeframe='1h', limit=350)
-    
     htf_lookback = int(config.get("htf_tema_period", 200))
     df_4h = fetch_market_data(symbol, timeframe='4h', limit=350, tema_length=htf_lookback)
 
@@ -468,6 +511,7 @@ async def analyze_symbol(symbol, bot, chat_id, global_config):
     current_price = float(df_1h['close'].iloc[-1])
     val_1h = float(df_1h['tema_200'].dropna().iloc[-1]) if 'tema_200' in df_1h and not df_1h['tema_200'].dropna().empty else None
     val_4h = float(df_4h['tema_200'].dropna().iloc[-1]) if 'tema_200' in df_4h and not df_4h['tema_200'].dropna().empty else None
+    vwap_poc_price = float(df_1h['vwap_poc'].dropna().iloc[-1]) if 'vwap_poc' in df_1h and not df_1h['vwap_poc'].dropna().empty else None
     poc_price, hvn_prices = calculate_volume_profile(df_1h, num_bins=30)
 
     # Proximity Triggers
@@ -483,10 +527,15 @@ async def analyze_symbol(symbol, bot, chat_id, global_config):
         if dist_4h <= proximity_threshold:
             triggered_reasons.append(f"Near 4H HTF TEMA ({dist_4h:.2f}% away)")
 
+    if vwap_poc_price is not None:
+        dist_vwap = abs(current_price - vwap_poc_price) / vwap_poc_price * 100
+        if dist_vwap <= proximity_threshold:
+            triggered_reasons.append(f"Near VWAP/POC Proxy ({dist_vwap:.2f}% away)")
+
     if poc_price is not None:
         dist_poc = abs(current_price - poc_price) / poc_price * 100
         if dist_poc <= proximity_threshold:
-            triggered_reasons.append(f"Near Volume POC ({dist_poc:.2f}% away)")
+            triggered_reasons.append(f"Near Volume Profile POC ({dist_poc:.2f}% away)")
 
     if not triggered_reasons:
         print(f"[{symbol}] Price (${current_price:.4f}) outside proximity threshold ({proximity_threshold}%). No trigger.")
@@ -494,12 +543,12 @@ async def analyze_symbol(symbol, bot, chat_id, global_config):
         return
 
     # Multi-Timeframe TEMA Trend Alignment Filter
-    if config.get("use_mtf_tema_alignment", config.get("use_mtf_alignment", True)) and val_1h is not None and val_4h is not None:
+    if config.get("use_mtf_tema_alignment", True) and val_1h is not None and val_4h is not None:
         alignment_mode = config.get("htf_alignment_mode", "Price Level")
         base_long = current_price >= val_1h
         base_short = current_price < val_1h
 
-        if alignment_mode == "Price Level":
+        if alignment_mode in ["Price Level", "Price Level (Price > HTF TEMA)"]:
             htf_long = current_price >= val_4h
             htf_short = current_price < val_4h
         else:  # Slope Mode
@@ -519,18 +568,18 @@ async def analyze_symbol(symbol, bot, chat_id, global_config):
     current_atr_pct = float(df_1h['atr_pct'].dropna().iloc[-1]) if 'atr_pct' in df_1h else 0.0
 
     if current_adx < min_adx:
-        print(f"[{symbol}] ❌ Filter Skipped: ADX ({current_adx:.2f}) below symbol threshold ({min_adx}).")
+        print(f"[{symbol}] ❌ Filter Skipped: ADX ({current_adx:.2f}) below threshold ({min_adx}).")
         del df_1h, df_4h
         return
 
     if current_atr_pct < min_atr_pct:
-        print(f"[{symbol}] ❌ Filter Skipped: ATR% ({current_atr_pct:.2f}%) below symbol threshold ({min_atr_pct}%).")
+        print(f"[{symbol}] ❌ Filter Skipped: ATR% ({current_atr_pct:.2f}%) below threshold ({min_atr_pct}%).")
         del df_1h, df_4h
         return
 
     print(f"🎯 TRIGGER & FILTERS MATCH for {symbol}: {', '.join(triggered_reasons)} (ADX: {current_adx:.2f}, ATR%: {current_atr_pct:.2f}%)")
 
-    # Direction & Trade Sizing Calculations (Applying Symbol-Specific ATR Multiplier)
+    # Trade Execution Parameters Calculation
     tema_ref = val_1h if val_1h is not None else current_price
     direction = "LONG" if current_price >= tema_ref else "SHORT"
     entry_price = current_price
@@ -548,26 +597,33 @@ async def analyze_symbol(symbol, bot, chat_id, global_config):
         tp1 = valid_hvns[-1] if valid_hvns else entry_price - (atr_mult_sl * atr_val * min_rr_threshold)
         tp2 = poc_price if (poc_price and poc_price < entry_price) else entry_price - (atr_mult_sl * atr_val * min_rr_threshold * 1.5)
 
-    risk_amount_per_unit = abs(entry_price - stop_loss)
-    reward_amount_per_unit = abs(tp1 - entry_price)
-
-    rr_ratio = reward_amount_per_unit / risk_amount_per_unit if risk_amount_per_unit > 0 else 0.0
+    risk_per_unit = abs(entry_price - stop_loss)
+    reward_per_unit = abs(tp1 - entry_price)
+    rr_ratio = reward_per_unit / risk_per_unit if risk_per_unit > 0 else 0.0
 
     if rr_ratio < min_rr_threshold:
-        print(f"[{symbol}] 🛑 SIGNAL REJECTED: Risk/Reward ({rr_ratio:.2f}R) is below threshold ({min_rr_threshold:.2f}R).")
+        print(f"[{symbol}] 🛑 SIGNAL REJECTED: R/R ({rr_ratio:.2f}R) is below threshold ({min_rr_threshold:.2f}R).")
         del df_1h, df_4h
         return
 
-    # Apply Equity Curve Filter Adjustments
-    effective_risk_pct = calculate_effective_risk(base_risk_pct, config)
+    # Calculate Position Risk with Directional Multiplier & Equity Curve Scaling
+    effective_risk_pct = calculate_effective_risk(base_risk_pct, direction, config)
 
     units, position_usdt, risk_usd = calculate_fixed_risk_position(
         account_balance, entry_price, stop_loss, risk_pct=effective_risk_pct
     )
 
+    # Dispatch Post-Only Maker Limit Order if live trading is enabled
+    order_id = None
+    if enable_live_trading:
+        order_side = "buy" if direction == "LONG" else "sell"
+        order_res = place_maker_limit_order(symbol, side=order_side, amount=units, price=entry_price)
+        if order_res:
+            order_id = order_res.get("id")
+
     log_trade_signal(
         symbol, triggered_reasons, entry_price, 
-        stop_loss, tp1, tp2, position_usdt, risk_usd
+        stop_loss, tp1, tp2, position_usdt, risk_usd, order_id=order_id
     )
 
     last_alert_time[symbol] = current_time
@@ -580,6 +636,7 @@ async def analyze_symbol(symbol, bot, chat_id, global_config):
         f"📈 **Technical Confluence:**\n"
         f"• 1H 200 TEMA: {safe_format(val_1h)}\n"
         f"• 4H HTF TEMA: {safe_format(val_4h)}\n"
+        f"• VWAP/POC Proxy: {safe_format(vwap_poc_price)}\n"
         f"• Point of Control (POC): {safe_format(poc_price)}\n"
         f"• ADX (14): `{current_adx:.2f}` (Min: {min_adx})\n"
         f"• ATR %: `{current_atr_pct:.2f}%` (Min: {min_atr_pct}%)\n"
@@ -590,9 +647,10 @@ async def analyze_symbol(symbol, bot, chat_id, global_config):
         f"• Stop Loss: `${stop_loss:.4f}` (Risk: `${risk_usd:.2f}`)\n"
         f"• Target 1 (HVN): `${tp1:.4f}`\n"
         f"• Target 2 (Macro): `${tp2:.4f}`\n\n"
-        f"💰 **Position Sizing:**\n"
+        f"💰 **Position Sizing & Order Execution:**\n"
         f"• Position Value: `${position_usdt:.2f}` ({units:.2f} units)\n"
-        f"• Risk/Reward Ratio: `{rr_ratio:.2f}R`\n\n"
+        f"• Risk/Reward Ratio: `{rr_ratio:.2f}R`\n"
+        f"• Maker Order Status: `{'DISPATCHED (ID: ' + str(order_id) + ')' if order_id else 'SIGNAL LOGGED (POST-ONLY / SIMULATION)'}`\n\n"
         f"📄 Signal logged to Supabase Database"
     )
 
@@ -611,7 +669,7 @@ async def run_scanner():
     bot = Bot(token=telegram_bot_token) if telegram_bot_token else None
 
     if bot and telegram_chat_id:
-        startup_msg = "🟢 **Upgraded Structural Trading Agent Initialized & Active.** Hard Breakeven Protection active..."
+        startup_msg = "🟢 **Upgraded Structural Trading Agent Initialized & Active.** Multi-Timeframe Alignment, Maker Post-Only Order Support & Hard Breakeven Protection active..."
         await bot.send_message(chat_id=telegram_chat_id, text=startup_msg, parse_mode="Markdown")
 
     while True:
