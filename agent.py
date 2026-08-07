@@ -35,20 +35,23 @@ def load_config():
         "min_rr_ratio": 1.5,
         "scan_interval_minutes": 15,
         "alert_cooldown_hours": 4,
-        "enable_live_trading": False,
+        "enable_live_trading": False,  # Toggle True to dispatch real exchange limit orders
         "watchlist": [
             "ONDO/USDT", "PENDLE/USDT", "LINK/USDT", "TIA/USDT", "NEAR/USDT",
             "SOL/USDT", "AR/USDT", "FET/USDT", "RENDER/USDT", "TAO/USDT",
             "SYRUP/USDT", "SEI/USDT", "CFG/USDT", "HNT/USDT", "XRP/USDT", "DOGE/USDT"
         ],
+        # Strategy Upgrades Configurations
         "use_mtf_tema_alignment": True,
         "htf_tema_period": 200,
-        "htf_alignment_mode": "Price Level",  # Options: "Price Level" or "Price Level + Slope"
+        "htf_alignment_mode": "Price Level",  # "Price Level" or "TEMA Slope"
         "use_adaptive_atr_trail": True,
         "atr_trail_mult": 1.5,
         "use_equity_curve_filter": True,
         "eq_ma_period": 10,
         "reduced_risk_factor": 0.5,
+        
+        # Asset-Specific Parameter Overrides Map
         "asset_overrides": {
             "GBP/JPY": {
                 "min_adx": 25.0,
@@ -77,10 +80,13 @@ def load_config():
         return default_config
 
 def get_symbol_config(symbol: str, global_config: dict) -> dict:
+    """Combines global configurations with symbol-specific overrides."""
     symbol_config = global_config.copy()
     overrides_map = global_config.get("asset_overrides", {})
+    
     if symbol in overrides_map and isinstance(overrides_map[symbol], dict):
         symbol_config.update(overrides_map[symbol])
+        
     return symbol_config
 
 def get_exchange():
@@ -107,8 +113,16 @@ def get_exchange():
 
 exchange = get_exchange()
 
+# =====================================================================
+# MAKER POST-ONLY LIMIT ORDER EXECUTION ENGINE
+# =====================================================================
 def place_maker_limit_order(symbol, side, amount, price):
-    params = {'postOnly': True}
+    """
+    Places a post-only limit order to guarantee maker liquidity and prevent taker fees.
+    """
+    params = {
+        'postOnly': True,  # Rejects the order if it would execute immediately as a taker
+    }
     try:
         order = exchange.create_order(
             symbol=symbol,
@@ -134,6 +148,7 @@ def init_db():
     print("⚡ Connected to Supabase external database.")
 
 def calculate_native_tema(series: pd.Series, length: int = 200) -> pd.Series:
+    """Pure Pandas fallback calculation for TEMA."""
     ema1 = series.ewm(span=length, adjust=False).mean()
     ema2 = ema1.ewm(span=length, adjust=False).mean()
     ema3 = ema2.ewm(span=length, adjust=False).mean()
@@ -142,6 +157,7 @@ def calculate_native_tema(series: pd.Series, length: int = 200) -> pd.Series:
     return res
 
 def fetch_market_data(symbol, timeframe='1h', limit=350, tema_length=200):
+    """Fetches market data with float32 downcasting and full technical indicator computations."""
     try:
         ohlcv = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
     except Exception as e:
@@ -154,10 +170,11 @@ def fetch_market_data(symbol, timeframe='1h', limit=350, tema_length=200):
     df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
     del ohlcv
     
-    for col in ['open', 'high', 'low', 'close', 'volume']:
+    float_cols = ['open', 'high', 'low', 'close', 'volume']
+    for col in float_cols:
         df[col] = pd.to_numeric(df[col], errors='coerce').astype(np.float32)
 
-    df['datetime'] = pd.to_datetime(df['timestamp'], unit='ms')
+    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
 
     # 1. TEMA Calculation
     if len(df) >= tema_length:
@@ -167,6 +184,7 @@ def fetch_market_data(symbol, timeframe='1h', limit=350, tema_length=200):
                 df['tema_200'] = calculate_native_tema(df['close'], length=tema_length)
         except Exception:
             df['tema_200'] = calculate_native_tema(df['close'], length=tema_length)
+            
         df['tema_200'] = pd.to_numeric(df['tema_200'], errors='coerce').astype(np.float32)
 
     # 2. ADX (14) Calculation
@@ -201,12 +219,19 @@ def fetch_market_data(symbol, timeframe='1h', limit=350, tema_length=200):
 
     return df
 
-def calculate_volume_profile(df, num_bins=30):
+# =====================================================================
+# UPGRADE 1: VALUE AREA & VOLUME PROFILE ENGINE
+# =====================================================================
+def calculate_value_area(df, num_bins=30, va_pct=0.70):
+    """
+    Computes Point of Control (POC), Value Area High (VAH), Value Area Low (VAL),
+    and High Volume Nodes (HVNs) based on the 70% volume distribution rule.
+    """
     price_min = float(df['low'].min())
     price_max = float(df['high'].max())
 
     if price_min == price_max or pd.isna(price_min) or pd.isna(price_max):
-        return None, []
+        return None, None, None, []
 
     bins = np.linspace(price_min, price_max, num_bins)
     df['bin'] = pd.cut(df['close'], bins=bins)
@@ -214,19 +239,35 @@ def calculate_volume_profile(df, num_bins=30):
     volume_profile = df.groupby('bin', observed=False)['volume'].sum().reset_index()
     volume_profile['price_mid'] = volume_profile['bin'].apply(lambda x: float(x.mid))
 
-    if volume_profile['volume'].sum() == 0:
-        return None, []
+    total_volume = volume_profile['volume'].sum()
+    if total_volume == 0:
+        return None, None, None, []
 
-    poc_row = volume_profile.loc[volume_profile['volume'].idxmax()]
-    poc_price = float(poc_row['price_mid'])
-
-    hvn_nodes = volume_profile.sort_values(by='volume', ascending=False).head(3)
-    hvn_list = [float(x) for x in hvn_nodes['price_mid'].tolist()]
+    # Sort descending by volume to extract cumulative 70% Value Area
+    sorted_vp = volume_profile.sort_values(by='volume', ascending=False)
+    sorted_vp['cum_vol'] = sorted_vp['volume'].cumsum()
     
-    del volume_profile, hvn_nodes
-    return poc_price, hvn_list
+    target_vol = total_volume * va_pct
+    va_bins = sorted_vp[sorted_vp['cum_vol'] <= target_vol]
+    
+    if va_bins.empty:
+        va_bins = sorted_vp.head(1)
+
+    poc_price = float(sorted_vp.iloc[0]['price_mid'])
+    vah = float(va_bins['price_mid'].max())
+    val = float(va_bins['price_mid'].min())
+    
+    hvn_nodes = sorted_vp.head(3)['price_mid'].tolist()
+    
+    del volume_profile, sorted_vp, va_bins
+    return poc_price, vah, val, hvn_nodes
 
 def calculate_effective_risk(base_risk_pct, direction, config):
+    """
+    Calculates effective risk per trade applying:
+    1. Directional Risk Multipliers (Long vs Short)
+    2. Equity Curve Drawdown Reduction Filter
+    """
     dir_mult = float(config.get("long_risk_multiplier", 1.0)) if direction == "LONG" else float(config.get("short_risk_multiplier", 1.0))
     effective_risk = base_risk_pct * dir_mult
 
@@ -263,7 +304,10 @@ def calculate_fixed_risk_position(account_balance, entry_price, stop_loss_price,
     position_size_usdt = units * float(entry_price)
     return float(units), float(position_size_usdt), float(risk_amount)
 
-def log_trade_signal(symbol, reasons, entry, sl, tp1, tp2, position_usdt, risk_usd, order_id=None):
+# =====================================================================
+# UPGRADE 3: DATABASE SIGNAL LOGGING WITH VAH/VAL METRICS
+# =====================================================================
+def log_trade_signal(symbol, reasons, entry, sl, tp1, tp2, position_usdt, risk_usd, vah=None, val=None, poc=None, order_id=None):
     if not supabase:
         print("⚠️ Cannot log trade: Supabase connection unavailable.")
         return
@@ -282,6 +326,9 @@ def log_trade_signal(symbol, reasons, entry, sl, tp1, tp2, position_usdt, risk_u
         "position_usdt": float(position_usdt),
         "max_risk_usd": float(risk_usd),
         "status": "OPEN",
+        "vah": float(vah) if vah is not None else None,
+        "val": float(val) if val is not None else None,
+        "poc": float(poc) if poc is not None else None,
         "order_id": str(order_id) if order_id else None
     }
 
@@ -297,7 +344,7 @@ def safe_format(value):
     return f"${float(value):.4f}"
 
 # =====================================================================
-# ACTIVE TRADE EVALUATOR ENGINE (FIXED CHRONOLOGICAL EVALUATION)
+# ACTIVE TRADE EVALUATOR ENGINE (WITH HARD BREAKEVEN & ADAPTIVE ATR TRAIL)
 # =====================================================================
 async def evaluate_active_trades(bot, chat_id, global_config):
     if not supabase:
@@ -332,127 +379,131 @@ async def evaluate_active_trades(bot, chat_id, global_config):
             trade_dt = datetime.strptime(trade_time_str, "%Y-%m-%d %H:%M:%S")
             hours_elapsed = (datetime.now() - trade_dt).total_seconds() / 3600
 
-            candles_needed = min(max(50, int(hours_elapsed * 4) + 10), 350)
+            candles_needed = max(50, int(hours_elapsed * 4) + 10)
+            candles_needed = min(candles_needed, 350)
 
             df_candles = fetch_market_data(symbol, timeframe='15m', limit=candles_needed)
             if df_candles is None or df_candles.empty:
                 continue
 
-            # Filter candles chronologically after trade entry time
-            df_after = df_candles[df_candles['datetime'] >= trade_dt].sort_values('datetime')
-            if df_after.empty:
-                df_after = df_candles.iloc[-1:]
+            latest_close = float(df_candles['close'].iloc[-1])
+            latest_low = float(df_candles['low'].min())
+            latest_high = float(df_candles['high'].max())
+            latest_atr = float(df_candles['atr'].iloc[-1]) if 'atr' in df_candles else 0.0
+            close_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
             is_long = sl < entry
-            trade_closed = False
 
-            # Sequential evaluation bar-by-bar
-            for _, candle in df_after.iterrows():
-                high = float(candle['high'])
-                low = float(candle['low'])
-                close = float(candle['close'])
-                atr = float(candle.get('atr', 0.0))
-                close_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            # Dynamic Adaptive ATR Trailing Stop Update
+            if config.get("use_adaptive_atr_trail", True) and latest_atr > 0:
+                trail_mult = float(config.get("atr_trail_mult", 1.5))
+                if is_long:
+                    new_trail_sl = latest_close - (latest_atr * trail_mult)
+                    if current_status == "TP1_HIT":
+                        new_trail_sl = max(new_trail_sl, entry)
+                    
+                    if new_trail_sl > sl:
+                        sl = new_trail_sl
+                        supabase.table("trade_journal").update({"stop_loss": float(sl)}).eq("id", trade_id).execute()
+                        print(f"🛡️ Dynamic Trailing Stop updated for {symbol} (LONG) to ${sl:.4f}")
+                else:
+                    new_trail_sl = latest_close + (latest_atr * trail_mult)
+                    if current_status == "TP1_HIT":
+                        new_trail_sl = min(new_trail_sl, entry)
+                        
+                    if new_trail_sl < sl:
+                        sl = new_trail_sl
+                        supabase.table("trade_journal").update({"stop_loss": float(sl)}).eq("id", trade_id).execute()
+                        print(f"🛡️ Dynamic Trailing Stop updated for {symbol} (SHORT) to ${sl:.4f}")
 
-                # Dynamic Adaptive ATR Trailing Stop
-                if config.get("use_adaptive_atr_trail", True) and atr > 0:
-                    trail_mult = float(config.get("atr_trail_mult", 1.5))
-                    if is_long:
-                        new_trail_sl = close - (atr * trail_mult)
-                        if current_status == "TP1_HIT":
-                            new_trail_sl = max(new_trail_sl, entry)
-                        if new_trail_sl > sl:
-                            sl = new_trail_sl
-                            supabase.table("trade_journal").update({"stop_loss": float(sl)}).eq("id", trade_id).execute()
-                    else:
-                        new_trail_sl = close + (atr * trail_mult)
-                        if current_status == "TP1_HIT":
-                            new_trail_sl = min(new_trail_sl, entry)
-                        if new_trail_sl < sl:
-                            sl = new_trail_sl
-                            supabase.table("trade_journal").update({"stop_loss": float(sl)}).eq("id", trade_id).execute()
+            # 1. Check Stop Loss Hit
+            sl_hit = (latest_low <= sl) if is_long else (latest_high >= sl)
+            if sl_hit:
+                if current_status == "TP1_HIT":
+                    pnl_usd = 0.0
+                    realized_r = 0.0
+                else:
+                    pnl_usd = -risk_usd
+                    realized_r = -1.0
 
-                # 1. Stop Loss Hit Check
-                sl_hit = (low <= sl) if is_long else (high >= sl)
-                if sl_hit:
-                    pnl_usd = 0.0 if current_status == "TP1_HIT" else -risk_usd
-                    realized_r = 0.0 if current_status == "TP1_HIT" else -1.0
+                update_data = {
+                    "status": "STOPPED_OUT",
+                    "exit_price": float(sl),
+                    "closed_timestamp": str(close_time),
+                    "realized_pnl_usd": float(pnl_usd),
+                    "realized_r": float(realized_r)
+                }
+                supabase.table("trade_journal").update(update_data).eq("id", trade_id).execute()
 
-                    supabase.table("trade_journal").update({
-                        "status": "STOPPED_OUT",
-                        "exit_price": float(sl),
-                        "closed_timestamp": str(close_time),
-                        "realized_pnl_usd": float(pnl_usd),
-                        "realized_r": float(realized_r)
-                    }).eq("id", trade_id).execute()
+                if bot and chat_id:
+                    status_title = "🛡️ **TRADE CLOSED AT BREAKEVEN / TRAILING STOP: " if current_status == "TP1_HIT" else "🛑 **TRADE STOPPED OUT: "
+                    msg = (
+                        f"{status_title}{symbol}**\n\n"
+                        f"• Exit Price: `${sl:.4f}`\n"
+                        f"• Realized PnL: `${pnl_usd:.2f}` ({realized_r:.2f}R)\n"
+                        f"• Timestamp: `{close_time}`"
+                    )
+                    await bot.send_message(chat_id=chat_id, text=msg, parse_mode="Markdown")
 
-                    if bot and chat_id:
-                        status_title = "🛡️ **TRADE CLOSED AT BREAKEVEN / TRAILING STOP: " if current_status == "TP1_HIT" else "🛑 **TRADE STOPPED OUT: "
-                        msg = (
-                            f"{status_title}{symbol}**\n\n"
-                            f"• Exit Price: `${sl:.4f}`\n"
-                            f"• Realized PnL: `${pnl_usd:.2f}` ({realized_r:.2f}R)\n"
-                            f"• Timestamp: `{close_time}`"
-                        )
-                        await bot.send_message(chat_id=chat_id, text=msg, parse_mode="Markdown")
+            # 2. Check Take Profit 2 Hit
+            tp2_hit = (latest_high >= tp2) if is_long else (latest_low <= tp2)
+            if tp2_hit:
+                r_multiple = abs(tp2 - entry) / abs(entry - sl) if abs(entry - sl) > 0 else 0
+                pnl_usd = risk_usd * r_multiple
 
-                    trade_closed = True
-                    break
+                update_data = {
+                    "status": "CLOSED_TP2",
+                    "exit_price": float(tp2),
+                    "closed_timestamp": str(close_time),
+                    "realized_pnl_usd": float(pnl_usd),
+                    "realized_r": float(r_multiple)
+                }
+                supabase.table("trade_journal").update(update_data).eq("id", trade_id).execute()
 
-                # 2. Take Profit 2 Hit Check
-                tp2_hit = (high >= tp2) if is_long else (low <= tp2)
-                if tp2_hit:
-                    r_multiple = abs(tp2 - entry) / abs(entry - sl) if abs(entry - sl) > 0 else 0
-                    pnl_usd = risk_usd * r_multiple
+                if bot and chat_id:
+                    msg = (
+                        f"🎯 **FULL TARGET HIT (TP2): {symbol}** 🎯\n\n"
+                        f"• Target Price: `${tp2:.4f}`\n"
+                        f"• Realized PnL: `+${pnl_usd:.2f}` (+{r_multiple:.2f}R)\n"
+                        f"• Timestamp: `{close_time}`"
+                    )
+                    await bot.send_message(chat_id=chat_id, text=msg, parse_mode="Markdown")
 
-                    supabase.table("trade_journal").update({
-                        "status": "CLOSED_TP2",
-                        "exit_price": float(tp2),
-                        "closed_timestamp": str(close_time),
-                        "realized_pnl_usd": float(pnl_usd),
-                        "realized_r": float(r_multiple)
-                    }).eq("id", trade_id).execute()
+            # 3. Check Take Profit 1 Hit
+            tp1_hit = (latest_high >= tp1) if is_long else (latest_low <= tp1)
+            if tp1_hit and current_status == 'OPEN':
+                r_multiple = abs(tp1 - entry) / abs(entry - sl) if abs(entry - sl) > 0 else 0
 
-                    if bot and chat_id:
-                        msg = (
-                            f"🎯 **FULL TARGET HIT (TP2): {symbol}** 🎯\n\n"
-                            f"• Target Price: `${tp2:.4f}`\n"
-                            f"• Realized PnL: `+${pnl_usd:.2f}` (+{r_multiple:.2f}R)\n"
-                            f"• Timestamp: `{close_time}`"
-                        )
-                        await bot.send_message(chat_id=chat_id, text=msg, parse_mode="Markdown")
+                # Set hard breakeven protection
+                new_sl = entry
+                if is_long:
+                    if sl < entry:
+                        sl = new_sl
+                else:
+                    if sl > entry:
+                        sl = new_sl
 
-                    trade_closed = True
-                    break
+                supabase.table("trade_journal").update({
+                    "status": "TP1_HIT",
+                    "stop_loss": float(sl)
+                }).eq("id", trade_id).execute()
 
-                # 3. Take Profit 1 Hit Check
-                tp1_hit = (high >= tp1) if is_long else (low <= tp1)
-                if tp1_hit and current_status == 'OPEN':
-                    r_multiple = abs(tp1 - entry) / abs(entry - sl) if abs(entry - sl) > 0 else 0
-                    sl = entry  # Enforce Breakeven
-                    current_status = 'TP1_HIT'
+                if bot and chat_id:
+                    msg = (
+                        f"✅ **FIRST TARGET REACHED (TP1): {symbol}** ✅\n\n"
+                        f"• Milestone Price: `${tp1:.4f}`\n"
+                        f"• Un-realized Gain: `+{r_multiple:.2f}R`\n"
+                        f"• Hard Breakeven Protected: Stop Loss set to `${sl:.4f}`"
+                    )
+                    await bot.send_message(chat_id=chat_id, text=msg, parse_mode="Markdown")
 
-                    supabase.table("trade_journal").update({
-                        "status": "TP1_HIT",
-                        "stop_loss": float(sl)
-                    }).eq("id", trade_id).execute()
-
-                    if bot and chat_id:
-                        msg = (
-                            f"✅ **FIRST TARGET REACHED (TP1): {symbol}** ✅\n\n"
-                            f"• Milestone Price: `${tp1:.4f}`\n"
-                            f"• Un-realized Gain: `+{r_multiple:.2f}R`\n"
-                            f"• Hard Breakeven Protected: Stop Loss set to `${sl:.4f}`"
-                        )
-                        await bot.send_message(chat_id=chat_id, text=msg, parse_mode="Markdown")
-
-            del df_candles, df_after
+            del df_candles
 
         except Exception as e:
             print(f"Error evaluating trade ID {trade.get('id')} for {symbol}: {e}")
 
 # =====================================================================
-# ANALYSIS & SCANNER LOOP
+# ANALYSIS & SCANNER LOOP (UPGRADED WITH VAH / VAL CONFLUENCE)
 # =====================================================================
 async def analyze_symbol(symbol, bot, chat_id, global_config):
     current_time = time.time()
@@ -485,7 +536,9 @@ async def analyze_symbol(symbol, bot, chat_id, global_config):
     val_1h = float(df_1h['tema_200'].dropna().iloc[-1]) if 'tema_200' in df_1h and not df_1h['tema_200'].dropna().empty else None
     val_4h = float(df_4h['tema_200'].dropna().iloc[-1]) if 'tema_200' in df_4h and not df_4h['tema_200'].dropna().empty else None
     vwap_poc_price = float(df_1h['vwap_poc'].dropna().iloc[-1]) if 'vwap_poc' in df_1h and not df_1h['vwap_poc'].dropna().empty else None
-    poc_price, hvn_prices = calculate_volume_profile(df_1h, num_bins=30)
+    
+    # UPGRADE 1 & 2: Calculate Value Area High/Low & POC
+    poc_price, vah, val, hvn_prices = calculate_value_area(df_1h, num_bins=30)
 
     # Proximity Triggers
     triggered_reasons = []
@@ -510,33 +563,35 @@ async def analyze_symbol(symbol, bot, chat_id, global_config):
         if dist_poc <= proximity_threshold:
             triggered_reasons.append(f"Near Volume Profile POC ({dist_poc:.2f}% away)")
 
+    # UPGRADE 2: VAH and VAL Proximity Probing
+    if vah is not None:
+        dist_vah = abs(current_price - vah) / vah * 100
+        if dist_vah <= proximity_threshold:
+            triggered_reasons.append(f"Near Value Area High (VAH) Rejection Zone ({dist_vah:.2f}% away)")
+
+    if val is not None:
+        dist_val = abs(current_price - val) / val * 100
+        if dist_val <= proximity_threshold:
+            triggered_reasons.append(f"Near Value Area Low (VAL) Support Zone ({dist_val:.2f}% away)")
+
     if not triggered_reasons:
         print(f"[{symbol}] Price (${current_price:.4f}) outside proximity threshold ({proximity_threshold}%). No trigger.")
         del df_1h, df_4h
         return
 
-    # Multi-Timeframe TEMA Trend Alignment Filter (Enforces Price Below HTF TEMA for Shorts)
+    # Multi-Timeframe TEMA Trend Alignment Filter
     if config.get("use_mtf_tema_alignment", True) and val_1h is not None and val_4h is not None:
         alignment_mode = config.get("htf_alignment_mode", "Price Level")
-        
-        # Determine 1H direction
         base_long = current_price >= val_1h
         base_short = current_price < val_1h
 
-        # Enforce HTF Price Level Alignment for Shorts and Longs
-        htf_price_long = current_price >= val_4h
-        htf_price_short = current_price < val_4h
-
-        if "Slope" in alignment_mode:
+        if alignment_mode in ["Price Level", "Price Level (Price > HTF TEMA)"]:
+            htf_long = current_price >= val_4h
+            htf_short = current_price < val_4h
+        else:  # Slope Mode
             prev_val_4h = float(df_4h['tema_200'].dropna().iloc[-2]) if len(df_4h['tema_200'].dropna()) > 1 else val_4h
-            htf_slope_long = val_4h > prev_val_4h
-            htf_slope_short = val_4h < prev_val_4h
-            
-            htf_long = htf_price_long and htf_slope_long
-            htf_short = htf_price_short and htf_slope_short
-        else:
-            htf_long = htf_price_long
-            htf_short = htf_price_short
+            htf_long = val_4h > prev_val_4h
+            htf_short = val_4h < prev_val_4h
 
         if (base_long and not htf_long) or (base_short and not htf_short):
             print(f"[{symbol}] ❌ Filter Skipped: 1H and 4H HTF TEMA trend alignment failed ({alignment_mode}).")
@@ -561,7 +616,7 @@ async def analyze_symbol(symbol, bot, chat_id, global_config):
 
     print(f"🎯 TRIGGER & FILTERS MATCH for {symbol}: {', '.join(triggered_reasons)} (ADX: {current_adx:.2f}, ATR%: {current_atr_pct:.2f}%)")
 
-    # Trade Execution Parameters Calculation
+    # Trade Execution Parameters Calculation with Value Area Targets
     tema_ref = val_1h if val_1h is not None else current_price
     direction = "LONG" if current_price >= tema_ref else "SHORT"
     entry_price = current_price
@@ -571,13 +626,13 @@ async def analyze_symbol(symbol, bot, chat_id, global_config):
     if direction == "LONG":
         stop_loss = entry_price - (atr_mult_sl * atr_val) if atr_val > 0 else entry_price * 0.985
         valid_hvns = [h for h in hvn_prices if h > entry_price] if hvn_prices else []
-        tp1 = valid_hvns[0] if valid_hvns else entry_price + (atr_mult_sl * atr_val * min_rr_threshold)
-        tp2 = poc_price if (poc_price and poc_price > entry_price) else entry_price + (atr_mult_sl * atr_val * min_rr_threshold * 1.5)
+        tp1 = poc_price if (poc_price and poc_price > entry_price) else (valid_hvns[0] if valid_hvns else entry_price + (atr_mult_sl * atr_val * min_rr_threshold))
+        tp2 = vah if (vah and vah > tp1) else entry_price + (atr_mult_sl * atr_val * min_rr_threshold * 2.0)
     else:
         stop_loss = entry_price + (atr_mult_sl * atr_val) if atr_val > 0 else entry_price * 1.015
         valid_hvns = [h for h in hvn_prices if h < entry_price] if hvn_prices else []
-        tp1 = valid_hvns[-1] if valid_hvns else entry_price - (atr_mult_sl * atr_val * min_rr_threshold)
-        tp2 = poc_price if (poc_price and poc_price < entry_price) else entry_price - (atr_mult_sl * atr_val * min_rr_threshold * 1.5)
+        tp1 = poc_price if (poc_price and poc_price < entry_price) else (valid_hvns[-1] if valid_hvns else entry_price - (atr_mult_sl * atr_val * min_rr_threshold))
+        tp2 = val if (val and val < tp1) else entry_price - (atr_mult_sl * atr_val * min_rr_threshold * 2.0)
 
     risk_per_unit = abs(entry_price - stop_loss)
     reward_per_unit = abs(tp1 - entry_price)
@@ -603,23 +658,29 @@ async def analyze_symbol(symbol, bot, chat_id, global_config):
         if order_res:
             order_id = order_res.get("id")
 
+    # UPGRADE 3: Log VAH/VAL/POC to Database
     log_trade_signal(
         symbol, triggered_reasons, entry_price, 
-        stop_loss, tp1, tp2, position_usdt, risk_usd, order_id=order_id
+        stop_loss, tp1, tp2, position_usdt, risk_usd, 
+        vah=vah, val=val, poc=poc_price, order_id=order_id
     )
 
     last_alert_time[symbol] = current_time
 
     reasons_text = "\n".join([f"• {r}" for r in triggered_reasons])
+    
+    # UPGRADE 3: Telegram Payload Formatting with Value Area Structure
     message = (
         f"🎯 **PROXIMITY ALERT: {symbol}** 🎯\n\n"
         f"**Trigger Conditions Met:**\n{reasons_text}\n\n"
         f"**Current Price:** `${current_price:.4f}`\n\n"
-        f"📈 **Technical Confluence:**\n"
+        f"📈 **Technical & Volume Profile Confluence:**\n"
+        f"• Value Area High (VAH): {safe_format(vah)}\n"
+        f"• Point of Control (POC): {safe_format(poc_price)}\n"
+        f"• Value Area Low (VAL): {safe_format(val)}\n"
         f"• 1H 200 TEMA: {safe_format(val_1h)}\n"
         f"• 4H HTF TEMA: {safe_format(val_4h)}\n"
         f"• VWAP/POC Proxy: {safe_format(vwap_poc_price)}\n"
-        f"• Point of Control (POC): {safe_format(poc_price)}\n"
         f"• ADX (14): `{current_adx:.2f}` (Min: {min_adx})\n"
         f"• ATR %: `{current_atr_pct:.2f}%` (Min: {min_atr_pct}%)\n"
         f"• ATR Multiplier (SL): `{atr_mult_sl}x`\n\n"
@@ -627,8 +688,8 @@ async def analyze_symbol(symbol, bot, chat_id, global_config):
         f"• Direction: `{direction}`\n"
         f"• Entry Zone: `${entry_price:.4f}`\n"
         f"• Stop Loss: `${stop_loss:.4f}` (Risk: `${risk_usd:.2f}`)\n"
-        f"• Target 1 (HVN): `${tp1:.4f}`\n"
-        f"• Target 2 (Macro): `${tp2:.4f}`\n\n"
+        f"• Target 1 (POC/HVN): `${tp1:.4f}`\n"
+        f"• Target 2 (Value Area Extreme): `${tp2:.4f}`\n\n"
         f"💰 **Position Sizing & Order Execution:**\n"
         f"• Position Value: `${position_usdt:.2f}` ({units:.2f} units)\n"
         f"• Risk/Reward Ratio: `{rr_ratio:.2f}R`\n"
@@ -651,7 +712,7 @@ async def run_scanner():
     bot = Bot(token=telegram_bot_token) if telegram_bot_token else None
 
     if bot and telegram_chat_id:
-        startup_msg = "🟢 **Upgraded Structural Trading Agent Initialized & Active.** Multi-Timeframe Alignment, Maker Post-Only Order Support & Hard Breakeven Protection active..."
+        startup_msg = "🟢 **Upgraded Structural Trading Agent Initialized & Active.** Value Area Analysis (VAH/VAL/POC), Multi-Timeframe Alignment & Hard Protection Active..."
         await bot.send_message(chat_id=telegram_chat_id, text=startup_msg, parse_mode="Markdown")
 
     while True:
