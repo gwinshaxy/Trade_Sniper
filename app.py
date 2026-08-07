@@ -59,41 +59,42 @@ AVAILABLE_PAIRS = [
 
 def load_config():
     default_config = {
-        "account_balance": 1000.0,
+        "account_balance": 100.0,
         "risk_pct": 1.0,
         "long_risk_multiplier": 1.0,
         "short_risk_multiplier": 1.0,
         "proximity_threshold_pct": 2.0,
-        "min_adx": 20.0,
-        "min_atr_pct": 0.4,
+        "min_adx": 15.0,
+        "min_atr_pct": 0.2,
         "atr_mult_sl": 1.5,
-        "min_rr_ratio": 1.5,
+        "min_rr_ratio": 2.0,
         "scan_interval_minutes": 15,
         "alert_cooldown_hours": 4,
         "enable_live_trading": False,
         "watchlist": [
-            "ONDO/USDT", "PENDLE/USDT", "LINK/USDT", "TIA/USDT", "NEAR/USDT",
-            "SOL/USDT", "AR/USDT", "FET/USDT", "RENDER/USDT", "TAO/USDT",
-            "SYRUP/USDT", "SEI/USDT", "CFG/USDT", "HNT/USDT", "XRP/USDT", "DOGE/USDT"
+            "ADA/USDT",
+            "SOL/USDT",
+            "XRP/USDT"
         ],
         "use_mtf_tema_alignment": True,
-        "htf_tema_period": 200,
-        "htf_alignment_mode": "Price Level",
+        "htf_tema_period": 50,
+        "htf_alignment_mode": "TEMA Slope",
         "use_adaptive_atr_trail": True,
-        "atr_trail_mult": 1.5,
+        "atr_trail_mult": 2.0,
         "use_equity_curve_filter": True,
         "eq_ma_period": 10,
-        "reduced_risk_factor": 0.5,
+        "reduced_risk_factor": 0.3,
         "asset_overrides": {
-            "GBP/JPY": {
-                "min_adx": 25.0,
-                "atr_mult_sl": 2.0,
-                "proximity_threshold_pct": 2.5
-            },
             "SOL/USDT": {
-                "min_adx": 22.0,
-                "atr_mult_sl": 1.8,
-                "proximity_threshold_pct": 2.2
+                "atr_mult_sl": 2.0,
+                "proximity_threshold_pct": 0.5,
+                "atr_trail_mult": 2.2
+            },
+            "XRP/USDT": {
+                "proximity_threshold_pct": 1.5,
+                "atr_mult_sl": 2.0,
+                "min_atr_pct": 0.4,
+                "atr_trail_mult": 2.2
             }
         }
     }
@@ -270,19 +271,15 @@ def fetch_market_data(symbol: str, timeframe: str = '1h', limit: int = 350, tema
 
     return df
 
-def calculate_value_area(df, num_bins=30, va_pct=0.70):
-    """
-    Computes Point of Control (POC), Value Area High (VAH), Value Area Low (VAL),
-    High Volume Nodes (HVNs), and VP bins for chart rendering.
-    """
+def calculate_volume_profile(df, num_bins=30):
     if df.empty or 'volume' not in df.columns:
-        return None, None, None, [], []
+        return None, [], []
 
     price_min = float(df['low'].min())
     price_max = float(df['high'].max())
 
     if price_min == price_max or pd.isna(price_min) or pd.isna(price_max):
-        return None, None, None, [], []
+        return None, [], []
 
     bins = np.linspace(price_min, price_max, num_bins)
     df_temp = df.copy()
@@ -291,25 +288,16 @@ def calculate_value_area(df, num_bins=30, va_pct=0.70):
     volume_profile = df_temp.groupby('bin', observed=False)['volume'].sum().reset_index()
     volume_profile['price_mid'] = volume_profile['bin'].apply(lambda x: float(x.mid) if pd.notnull(x) else 0.0)
 
-    total_volume = volume_profile['volume'].sum()
-    if total_volume == 0:
-        return None, None, None, [], []
-
-    sorted_vp = volume_profile.sort_values(by='volume', ascending=False)
-    sorted_vp['cum_vol'] = sorted_vp['volume'].cumsum()
-
-    target_vol = total_volume * va_pct
-    va_bins = sorted_vp[sorted_vp['cum_vol'] <= target_vol]
-
-    if va_bins.empty:
-        va_bins = sorted_vp.head(1)
-
-    poc_price = float(sorted_vp.iloc[0]['price_mid'])
-    vah = float(va_bins['price_mid'].max())
-    val = float(va_bins['price_mid'].min())
-    hvn_nodes = sorted_vp.head(3)['price_mid'].tolist()
+    if volume_profile['volume'].sum() == 0:
+        return None, [], []
 
     max_vol = float(volume_profile['volume'].max())
+    poc_row = volume_profile.loc[volume_profile['volume'].idxmax()]
+    poc_price = float(poc_row['price_mid'])
+
+    hvn_nodes = volume_profile.sort_values(by='volume', ascending=False).head(3)
+    hvn_list = [float(x) for x in hvn_nodes['price_mid'].tolist()]
+    
     vp_bins = []
     for _, r in volume_profile.iterrows():
         if r['bin'] is not None and pd.notnull(r['bin']):
@@ -320,14 +308,9 @@ def calculate_value_area(df, num_bins=30, va_pct=0.70):
                 'volume': float(r['volume']),
                 'vol_ratio': float(r['volume'] / max_vol) if max_vol > 0 else 0.0
             })
-
-    del df_temp, volume_profile, sorted_vp, va_bins
-    return poc_price, vah, val, hvn_nodes, vp_bins
-
-def safe_format(value):
-    if value is None or pd.isna(value):
-        return "N/A"
-    return f"${float(value):.4f}"
+            
+    del df_temp, volume_profile, hvn_nodes
+    return poc_price, hvn_list, vp_bins
 
 # =====================================================================
 # RISK & POSITION MANAGEMENT ENGINE
@@ -342,7 +325,7 @@ def calculate_effective_risk(base_risk_pct, direction, config):
             closed_trades = res.data
             eq_period = int(config.get("eq_ma_period", 10))
             if closed_trades and len(closed_trades) >= eq_period:
-                initial_balance = float(config.get("account_balance", 1000.0))
+                initial_balance = float(config.get("account_balance", 100.0))
                 pnl_list = [float(t.get("realized_pnl_usd", 0.0)) for t in reversed(closed_trades)]
                 equity_series = np.cumsum([initial_balance] + pnl_list)
                 
@@ -350,7 +333,7 @@ def calculate_effective_risk(base_risk_pct, direction, config):
                 current_eq = equity_series[-1]
                 
                 if current_eq < recent_ma:
-                    reduced_factor = float(config.get("reduced_risk_factor", 0.5))
+                    reduced_factor = float(config.get("reduced_risk_factor", 0.3))
                     effective_risk *= reduced_factor
         except Exception:
             pass
@@ -368,7 +351,7 @@ def calculate_fixed_risk_position(account_balance, entry_price, stop_loss_price,
     position_size_usdt = units * float(entry_price)
     return float(units), float(position_size_usdt), float(risk_amount)
 
-def log_trade_signal(symbol, reasons, entry, sl, tp1, tp2, position_usdt, risk_usd, vah=None, val=None, poc=None, order_id=None):
+def log_trade_signal(symbol, reasons, entry, sl, tp1, tp2, position_usdt, risk_usd, order_id=None):
     if not supabase:
         return
 
@@ -386,9 +369,6 @@ def log_trade_signal(symbol, reasons, entry, sl, tp1, tp2, position_usdt, risk_u
         "position_usdt": float(position_usdt),
         "max_risk_usd": float(risk_usd),
         "status": "OPEN",
-        "vah": float(vah) if vah is not None else None,
-        "val": float(val) if val is not None else None,
-        "poc": float(poc) if poc is not None else None,
         "order_id": str(order_id) if order_id else None
     }
 
@@ -445,7 +425,7 @@ async def evaluate_active_trades(bot, chat_id, global_config):
 
             # Dynamic ATR Trailing Stop
             if config.get("use_adaptive_atr_trail", True) and latest_atr > 0:
-                trail_mult = float(config.get("atr_trail_mult", 1.5))
+                trail_mult = float(config.get("atr_trail_mult", 2.0))
                 if is_long:
                     new_trail_sl = latest_close - (latest_atr * trail_mult)
                     if current_status == "TP1_HIT":
@@ -477,7 +457,7 @@ async def evaluate_active_trades(bot, chat_id, global_config):
                 supabase.table("trade_journal").update(update_data).eq("id", trade_id).execute()
 
                 if bot and chat_id:
-                    status_title = "🛡️ **TRADE CLOSED AT BREAKEVEN / TRAILING STOP: " if current_status == "TP1_HIT" else "🛑 **TRADE STOPPED OUT: "
+                    status_title = "🛡️ **TRADE CLOSED AT BREAKEVEN: " if current_status == "TP1_HIT" else "🛑 **TRADE STOPPED OUT: "
                     msg = (
                         f"{status_title}{symbol}**\n\n"
                         f"• Exit Price: `${sl:.4f}`\n"
@@ -503,7 +483,7 @@ async def evaluate_active_trades(bot, chat_id, global_config):
 
                 if bot and chat_id:
                     msg = (
-                        f"🎯 **FULL TARGET HIT (TP2): {symbol}** 🎯\n\n"
+                        f"🎯 **TARGET 2 HIT: {symbol}** 🎯\n\n"
                         f"• Target Price: `${tp2:.4f}`\n"
                         f"• Realized PnL: `+${pnl_usd:.2f}` (+{r_multiple:.2f}R)\n"
                         f"• Timestamp: `{close_time}`"
@@ -523,10 +503,10 @@ async def evaluate_active_trades(bot, chat_id, global_config):
 
                 if bot and chat_id:
                     msg = (
-                        f"✅ **FIRST TARGET REACHED (TP1): {symbol}** ✅\n\n"
+                        f"✅ **TARGET 1 HIT: {symbol}** ✅\n\n"
                         f"• Milestone Price: `${tp1:.4f}`\n"
-                        f"• Un-realized Gain: `+{r_multiple:.2f}R`\n"
-                        f"• Hard Breakeven Protected: Stop Loss set to `${sl:.4f}`"
+                        f"• Gain: `+{r_multiple:.2f}R`\n"
+                        f"• Breakeven Set: SL moved to `${sl:.4f}`"
                     )
                     await bot.send_message(chat_id=chat_id, text=msg, parse_mode="Markdown")
 
@@ -541,13 +521,13 @@ async def analyze_symbol(symbol, bot, chat_id, global_config):
     current_time = time.time()
     config = get_symbol_config(symbol, global_config)
 
-    account_balance = float(config.get("account_balance", 1000.0))
+    account_balance = float(config.get("account_balance", 100.0))
     base_risk_pct = float(config.get("risk_pct", 1.0))
-    min_rr_threshold = float(config.get("min_rr_ratio", 1.5))
+    min_rr_threshold = float(config.get("min_rr_ratio", 2.0))
     proximity_threshold = float(config.get("proximity_threshold_pct", 2.0))
     cooldown_hours = float(config.get("alert_cooldown_hours", 4))
-    min_adx = float(config.get("min_adx", 20.0))
-    min_atr_pct = float(config.get("min_atr_pct", 0.4))
+    min_adx = float(config.get("min_adx", 15.0))
+    min_atr_pct = float(config.get("min_atr_pct", 0.2))
     atr_mult_sl = float(config.get("atr_mult_sl", 1.5))
     enable_live_trading = config.get("enable_live_trading", False)
 
@@ -557,7 +537,7 @@ async def analyze_symbol(symbol, bot, chat_id, global_config):
             return
 
     df_1h = fetch_market_data(symbol, timeframe='1h', limit=350)
-    htf_lookback = int(config.get("htf_tema_period", 200))
+    htf_lookback = int(config.get("htf_tema_period", 50))
     df_4h = fetch_market_data(symbol, timeframe='4h', limit=350, tema_length=htf_lookback)
 
     if df_1h is None or df_4h is None or df_1h.empty or df_4h.empty:
@@ -567,8 +547,7 @@ async def analyze_symbol(symbol, bot, chat_id, global_config):
     val_1h = float(df_1h['tema_200'].dropna().iloc[-1]) if 'tema_200' in df_1h and not df_1h['tema_200'].dropna().empty else None
     val_4h = float(df_4h['tema_htf'].dropna().iloc[-1]) if 'tema_htf' in df_4h and not df_4h['tema_htf'].dropna().empty else None
     vwap_poc_price = float(df_1h['vwap_poc'].dropna().iloc[-1]) if 'vwap_poc' in df_1h and not df_1h['vwap_poc'].dropna().empty else None
-    
-    poc_price, vah, val, hvn_prices, _ = calculate_value_area(df_1h, num_bins=30)
+    poc_price, hvn_prices, _ = calculate_volume_profile(df_1h, num_bins=30)
 
     triggered_reasons = []
 
@@ -592,23 +571,13 @@ async def analyze_symbol(symbol, bot, chat_id, global_config):
         if dist_poc <= proximity_threshold:
             triggered_reasons.append(f"Near Volume Profile POC ({dist_poc:.2f}% away)")
 
-    if vah is not None:
-        dist_vah = abs(current_price - vah) / vah * 100
-        if dist_vah <= proximity_threshold:
-            triggered_reasons.append(f"Near Value Area High (VAH) Rejection Zone ({dist_vah:.2f}% away)")
-
-    if val is not None:
-        dist_val = abs(current_price - val) / val * 100
-        if dist_val <= proximity_threshold:
-            triggered_reasons.append(f"Near Value Area Low (VAL) Support Zone ({dist_val:.2f}% away)")
-
     if not triggered_reasons:
         del df_1h, df_4h
         return
 
     # Multi-Timeframe Alignment Filter
     if config.get("use_mtf_tema_alignment", True) and val_1h is not None and val_4h is not None:
-        alignment_mode = config.get("htf_alignment_mode", "Price Level")
+        alignment_mode = config.get("htf_alignment_mode", "TEMA Slope")
         base_long = current_price >= val_1h
         base_short = current_price < val_1h
 
@@ -624,7 +593,7 @@ async def analyze_symbol(symbol, bot, chat_id, global_config):
             del df_1h, df_4h
             return
         else:
-            triggered_reasons.append(f"Aligned with 4H HTF Trend ({alignment_mode})")
+            triggered_reasons.append(f"Aligned with 4H Trend ({alignment_mode})")
 
     current_adx = float(df_1h['adx'].dropna().iloc[-1]) if 'adx' in df_1h else 0.0
     current_atr_pct = float(df_1h['atr_pct'].dropna().iloc[-1]) if 'atr_pct' in df_1h else 0.0
@@ -642,13 +611,13 @@ async def analyze_symbol(symbol, bot, chat_id, global_config):
     if direction == "LONG":
         stop_loss = entry_price - (atr_mult_sl * atr_val) if atr_val > 0 else entry_price * 0.985
         valid_hvns = [h for h in hvn_prices if h > entry_price] if hvn_prices else []
-        tp1 = poc_price if (poc_price and poc_price > entry_price) else (valid_hvns[0] if valid_hvns else entry_price + (atr_mult_sl * atr_val * min_rr_threshold))
-        tp2 = vah if (vah and vah > tp1) else entry_price + (atr_mult_sl * atr_val * min_rr_threshold * 2.0)
+        tp1 = valid_hvns[0] if valid_hvns else entry_price + (atr_mult_sl * atr_val * min_rr_threshold)
+        tp2 = poc_price if (poc_price and poc_price > entry_price) else entry_price + (atr_mult_sl * atr_val * min_rr_threshold * 1.5)
     else:
         stop_loss = entry_price + (atr_mult_sl * atr_val) if atr_val > 0 else entry_price * 1.015
         valid_hvns = [h for h in hvn_prices if h < entry_price] if hvn_prices else []
-        tp1 = poc_price if (poc_price and poc_price < entry_price) else (valid_hvns[-1] if valid_hvns else entry_price - (atr_mult_sl * atr_val * min_rr_threshold))
-        tp2 = val if (val and val < tp1) else entry_price - (atr_mult_sl * atr_val * min_rr_threshold * 2.0)
+        tp1 = valid_hvns[-1] if valid_hvns else entry_price - (atr_mult_sl * atr_val * min_rr_threshold)
+        tp2 = poc_price if (poc_price and poc_price < entry_price) else entry_price - (atr_mult_sl * atr_val * min_rr_threshold * 1.5)
 
     risk_per_unit = abs(entry_price - stop_loss)
     reward_per_unit = abs(tp1 - entry_price)
@@ -672,38 +641,27 @@ async def analyze_symbol(symbol, bot, chat_id, global_config):
 
     log_trade_signal(
         symbol, triggered_reasons, entry_price, 
-        stop_loss, tp1, tp2, position_usdt, risk_usd, 
-        vah=vah, val=val, poc=poc_price, order_id=order_id
+        stop_loss, tp1, tp2, position_usdt, risk_usd, order_id=order_id
     )
 
     last_alert_time[symbol] = current_time
 
     reasons_text = "\n".join([f"• {r}" for r in triggered_reasons])
     message = (
-        f"🎯 **PROXIMITY ALERT: {symbol}** 🎯\n\n"
-        f"**Trigger Conditions Met:**\n{reasons_text}\n\n"
-        f"**Current Price:** `${current_price:.4f}`\n\n"
-        f"📈 **Technical & Volume Profile Confluence:**\n"
-        f"• Value Area High (VAH): {safe_format(vah)}\n"
-        f"• Point of Control (POC): {safe_format(poc_price)}\n"
-        f"• Value Area Low (VAL): {safe_format(val)}\n"
-        f"• 1H 200 TEMA: {safe_format(val_1h)}\n"
-        f"• 4H HTF TEMA: {safe_format(val_4h)}\n"
-        f"• VWAP/POC Proxy: {safe_format(vwap_poc_price)}\n"
-        f"• ADX (14): `{current_adx:.2f}` (Min: {min_adx})\n"
-        f"• ATR %: `{current_atr_pct:.2f}%` (Min: {min_atr_pct}%)\n"
-        f"• ATR Multiplier (SL): `{atr_mult_sl}x`\n\n"
-        f"🎯 **Trade Parameters ({effective_risk_pct:.2f}% Risk Model):**\n"
+        f"🎯 **SIGNAL DETECTED: {symbol}** 🎯\n\n"
+        f"**Triggers:**\n{reasons_text}\n\n"
+        f"**Price:** `${current_price:.4f}`\n\n"
+        f"📈 **Technical Parameters:**\n"
+        f"• 1H TEMA: `${val_1h:.4f}`\n"
+        f"• 4H TEMA: `${val_4h:.4f}`\n"
+        f"• ADX: `{current_adx:.2f}` | ATR%: `{current_atr_pct:.2f}%`\n\n"
+        f"🎯 **Trade Execution ({effective_risk_pct:.2f}% Risk):**\n"
         f"• Direction: `{direction}`\n"
-        f"• Entry Zone: `${entry_price:.4f}`\n"
-        f"• Stop Loss: `${stop_loss:.4f}` (Risk: `${risk_usd:.2f}`)\n"
-        f"• Target 1 (POC/HVN): `${tp1:.4f}`\n"
-        f"• Target 2 (Value Area Extreme): `${tp2:.4f}`\n\n"
-        f"💰 **Position Sizing & Order Execution:**\n"
-        f"• Position Value: `${position_usdt:.2f}` ({units:.2f} units)\n"
-        f"• Risk/Reward Ratio: `{rr_ratio:.2f}R`\n"
-        f"• Maker Order Status: `{'DISPATCHED (ID: ' + str(order_id) + ')' if order_id else 'SIGNAL LOGGED (POST-ONLY / SIMULATION)'}`\n\n"
-        f"📄 Signal logged to Supabase Database"
+        f"• Entry: `${entry_price:.4f}`\n"
+        f"• Stop Loss: `${stop_loss:.4f}` (${risk_usd:.2f})\n"
+        f"• TP1: `${tp1:.4f}` | TP2: `${tp2:.4f}`\n"
+        f"• R/R: `{rr_ratio:.2f}R`\n"
+        f"• Order: `{'DISPATCHED (ID: ' + str(order_id) + ')' if order_id else 'SIMULATED'}`"
     )
 
     if bot and chat_id:
@@ -736,12 +694,12 @@ def run_backtest_upgraded(df: pd.DataFrame, params: dict):
     atr_mult_sl = params.get('atr_mult_sl', 1.5)
     
     use_mtf = params.get('use_mtf', True)
-    htf_mode = params.get('htf_mode', 'Price Level')
+    htf_mode = params.get('htf_mode', 'TEMA Slope')
     use_atr_trail = params.get('use_atr_trail', True)
-    atr_trail_mult = params.get('atr_trail_mult', 1.5)
+    atr_trail_mult = params.get('atr_trail_mult', 2.0)
     use_equity_filter = params.get('use_equity_filter', True)
     eq_ma_period = params.get('eq_ma_period', 10)
-    reduced_risk_factor = params.get('reduced_risk_factor', 0.5)
+    reduced_risk_factor = params.get('reduced_risk_factor', 0.3)
 
     balance = float(initial_balance)
     equity_curve = [balance]
@@ -878,8 +836,9 @@ def render_tradingview_chart(df: pd.DataFrame, symbol: str, df_journal: pd.DataF
                 tema_records.append({'time': int(r['time']), 'value': round(val, 6)})
         del valid_tema
 
-    _, _, _, _, vp_bins = calculate_value_area(df, num_bins=24)
+    _, _, vp_bins = calculate_volume_profile(df, num_bins=24)
     max_vol = max([b['volume'] for b in vp_bins]) if vp_bins else 1.0
+    avg_vol = np.mean([b['volume'] for b in vp_bins]) if vp_bins else 0.0
 
     price_lines_js = ""
     if df_journal is not None and not df_journal.empty and 'symbol' in df_journal.columns:
@@ -1093,7 +1052,7 @@ def load_trade_journal() -> pd.DataFrame:
         numeric_cols = [
             'entry_price', 'stop_loss', 'take_profit_1', 'take_profit_2', 
             'position_usdt', 'max_risk_usd', 'exit_price', 
-            'realized_pnl_usd', 'realized_r', 'vah', 'val', 'poc'
+            'realized_pnl_usd', 'realized_r'
         ]
         for col in numeric_cols:
             if col in df.columns:
@@ -1142,7 +1101,7 @@ with st.sidebar:
         st.markdown("---")
         account_balance = st.number_input(
             "Account Balance ($)", 
-            value=float(config.get("account_balance", 1000.0)), 
+            value=float(config.get("account_balance", 100.0)), 
             step=50.0
         )
         risk_pct = st.slider(
@@ -1163,12 +1122,12 @@ with st.sidebar:
         min_adx = st.slider(
             "ADX Cutoff", 
             10.0, 50.0, 
-            float(config.get("min_adx", 20.0)), 
+            float(config.get("min_adx", 15.0)), 
             step=1.0
         )
         min_atr = st.number_input(
             "Min ATR %", 
-            value=float(config.get("min_atr_pct", 0.4)), 
+            value=float(config.get("min_atr_pct", 0.2)), 
             step=0.05
         )
         atr_mult_sl = st.slider(
@@ -1180,24 +1139,24 @@ with st.sidebar:
         min_rr_ratio = st.slider(
             "Minimum R/R Ratio", 
             1.0, 5.0, 
-            float(config.get("min_rr_ratio", 1.5)), 
+            float(config.get("min_rr_ratio", 2.0)), 
             step=0.1
         )
 
         st.markdown("---")
         st.subheader("🚀 Upgrades & Execution Panel")
         use_mtf = st.checkbox("Enable 1H + HTF Trend Alignment", value=config.get("use_mtf_tema_alignment", True))
-        htf_period = st.slider("HTF TEMA Period", 10, 200, int(config.get("htf_tema_period", 200)), step=10)
-        htf_mode = st.radio("HTF Alignment Mode", ["Price Level", "TEMA Slope"], index=0 if config.get("htf_alignment_mode", "Price Level") == "Price Level" else 1)
+        htf_period = st.slider("HTF TEMA Period", 10, 200, int(config.get("htf_tema_period", 50)), step=10)
+        htf_mode = st.radio("HTF Alignment Mode", ["Price Level", "TEMA Slope"], index=1 if config.get("htf_alignment_mode", "TEMA Slope") == "TEMA Slope" else 0)
 
         st.markdown("---")
         use_atr_trail = st.checkbox("Enable Dynamic ATR Trailing Stop", value=config.get("use_adaptive_atr_trail", True))
-        atr_trail_mult = st.slider("ATR Trailing Multiplier", 1.0, 4.0, float(config.get("atr_trail_mult", 1.5)), step=0.1)
+        atr_trail_mult = st.slider("ATR Trailing Multiplier", 1.0, 4.0, float(config.get("atr_trail_mult", 2.0)), step=0.1)
 
         st.markdown("---")
         use_equity_filter = st.checkbox("Enable Equity Curve Drawdown Filter", value=config.get("use_equity_curve_filter", True))
         eq_ma = st.number_input("Equity MA Period", value=int(config.get("eq_ma_period", 10)), step=1)
-        reduced_risk = st.slider("Drawdown Risk Factor", 0.1, 0.9, float(config.get("reduced_risk_factor", 0.5)), step=0.05)
+        reduced_risk = st.slider("Drawdown Risk Factor", 0.1, 0.9, float(config.get("reduced_risk_factor", 0.3)), step=0.05)
 
         st.markdown("---")
         alert_cooldown = st.number_input("Alert Cooldown (hours)", value=int(config.get("alert_cooldown_hours", 4)), min_value=1, max_value=48, step=1)
@@ -1207,11 +1166,7 @@ with st.sidebar:
         st.subheader("📊 Watchlist Management")
         new_asset = st.text_input("➕ Add Custom Symbol (e.g., BTC/USDT):").strip().upper()
         
-        current_watchlist = config.get("watchlist", [
-            "ONDO/USDT", "PENDLE/USDT", "LINK/USDT", "TIA/USDT", "NEAR/USDT",
-            "SOL/USDT", "AR/USDT", "FET/USDT", "RENDER/USDT", "TAO/USDT",
-            "SYRUP/USDT", "SEI/USDT", "CFG/USDT", "HNT/USDT", "XRP/USDT", "DOGE/USDT"
-        ])
+        current_watchlist = config.get("watchlist", ["ADA/USDT", "SOL/USDT", "XRP/USDT"])
         all_options = list(dict.fromkeys(AVAILABLE_PAIRS + current_watchlist + ([new_asset] if new_asset else [])))
         
         default_selected = current_watchlist.copy()
@@ -1297,7 +1252,7 @@ with tab_active:
     if not df_journal.empty:
         active_df = df_journal[df_journal['status'].isin(['OPEN', 'TP1_HIT'])].copy()
         if not active_df.empty:
-            display_cols = ['id', 'timestamp', 'symbol', 'status', 'entry_price', 'stop_loss', 'take_profit_1', 'take_profit_2', 'vah', 'val', 'poc', 'position_usdt', 'max_risk_usd', 'order_id', 'trigger_reason']
+            display_cols = ['id', 'timestamp', 'symbol', 'status', 'entry_price', 'stop_loss', 'take_profit_1', 'take_profit_2', 'position_usdt', 'max_risk_usd', 'order_id', 'trigger_reason']
             st.dataframe(active_df[[c for c in display_cols if c in active_df.columns]], use_container_width=True, hide_index=True)
         else:
             st.info("No active signals currently open.")
@@ -1325,7 +1280,7 @@ with tab_charts:
     with col_tf:
         selected_tf = st.selectbox("Timeframe", ["15m", "1h", "4h"], index=1)
         
-    df_chart = fetch_market_data(selected_symbol, timeframe=selected_tf, limit=350, tema_length=int(config.get("htf_tema_period", 200)))
+    df_chart = fetch_market_data(selected_symbol, timeframe=selected_tf, limit=350, tema_length=int(config.get("htf_tema_period", 50)))
     if not df_chart.empty:
         render_tradingview_chart(df_chart, selected_symbol, df_journal)
     else:
@@ -1343,23 +1298,23 @@ with tab_backtest:
         bt_limit = st.select_slider("Bars Limit", options=[300, 350, 500, 1000], value=350)
         
     if st.button("🚀 Run Backtest", type="primary", use_container_width=True):
-        df_bt = fetch_market_data(bt_symbol, timeframe=bt_tf, limit=bt_limit, tema_length=int(config.get("htf_tema_period", 200)))
+        df_bt = fetch_market_data(bt_symbol, timeframe=bt_tf, limit=bt_limit, tema_length=int(config.get("htf_tema_period", 50)))
         if not df_bt.empty:
             params = {
-                'initial_balance': config.get("account_balance", 1000.0),
+                'initial_balance': config.get("account_balance", 100.0),
                 'risk_pct': config.get("risk_pct", 1.0),
-                'target_rr': config.get("min_rr_ratio", 1.5),
-                'min_adx': config.get("min_adx", 20.0),
-                'min_atr_pct': config.get("min_atr_pct", 0.4),
+                'target_rr': config.get("min_rr_ratio", 2.0),
+                'min_adx': config.get("min_adx", 15.0),
+                'min_atr_pct': config.get("min_atr_pct", 0.2),
                 'proximity_pct': config.get("proximity_threshold_pct", 2.0),
                 'atr_mult_sl': config.get("atr_mult_sl", 1.5),
                 'use_mtf': config.get("use_mtf_tema_alignment", True),
-                'htf_mode': config.get("htf_alignment_mode", "Price Level"),
+                'htf_mode': config.get("htf_alignment_mode", "TEMA Slope"),
                 'use_atr_trail': config.get("use_adaptive_atr_trail", True),
-                'atr_trail_mult': config.get("atr_trail_mult", 1.5),
+                'atr_trail_mult': config.get("atr_trail_mult", 2.0),
                 'use_equity_filter': config.get("use_equity_curve_filter", True),
                 'eq_ma_period': int(config.get("eq_ma_period", 10)),
-                'reduced_risk_factor': config.get("reduced_risk_factor", 0.5)
+                'reduced_risk_factor': config.get("reduced_risk_factor", 0.3)
             }
             sim_trades, equity_series, sim_metrics = run_backtest_upgraded(df_bt, params)
             st.json(sim_metrics)
