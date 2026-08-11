@@ -417,4 +417,8 @@ def start_reoptimization_loop(symbols=["BTCUSDT", "ETHUSDT", "SOLUSDT"], interva
         time.sleep(sleep_seconds)
 
 if __name__ == "__main__":
+<<<<<<< HEAD
     start_reoptimization_loop(symbols=["BNBUSDT", "ETHUSDT", "SOLUSDT"], interval_hours=24)
+=======
+    start_reoptimization_loop(symbols=["BTCUSDT", "ETHUSDT", "SOLUSDT"], interval_hours=24)
+>>>>>>> 123e5b182a4c4d4316c4c03193d8101790ab8501
