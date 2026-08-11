@@ -8,7 +8,7 @@ import numpy as np
 from google import genai
 
 from dotenv import load_dotenv
-load_dotenv()  # Loads environment variables automatically
+load_dotenv()
 
 # ==========================================
 # PROXY & NETWORK CONFIGURATION ROUTING
@@ -21,7 +21,6 @@ if HTTP_PROXY or HTTPS_PROXY:
     os.environ["HTTPS_PROXY"] = HTTPS_PROXY or HTTP_PROXY
     os.environ["NO_PROXY"] = "localhost,127.0.0.1,.supabase.co"
 
-# Database import for Supabase integration
 try:
     import psycopg2
     from psycopg2.extras import RealDictCursor
@@ -32,15 +31,22 @@ except ImportError:
 
 CONFIG_FILE = os.path.join(os.path.dirname(__file__), "strategy_config.json")
 
+def normalize_symbol(symbol: str) -> str:
+    """Ensures uniform slash-separated formatting (e.g., 'ETH/USDT')."""
+    s = symbol.strip().upper()
+    if "/" in s:
+        return s
+    if s.endswith("USDT") and len(s) > 4:
+        return f"{s[:-4]}/{s[-4:]}"
+    return s
+
 def load_optimized_config() -> dict:
-    """Fallback loader for local strategy_config.json file."""
     if os.path.exists(CONFIG_FILE):
         try:
             with open(CONFIG_FILE, "r") as f:
                 return json.load(f)
         except Exception as e:
             logging.warning(f"Could not read {CONFIG_FILE}, using defaults: {e}")
-            pass
     return {
         "tema_period": 200,
         "rsi_period": 14,
@@ -54,13 +60,12 @@ def load_optimized_config() -> dict:
 def load_symbol_config(symbol: str) -> dict:
     """
     Fetches asset-specific optimized parameters dynamically from Supabase database
-    based on the exact trading symbol (e.g. 'BNBUSDT', 'ETHUSDT', 'SOLUSDT').
-    Falls back to strategy_config.json or static defaults if missing.
+    using slash-free uppercase symbols (e.g. 'BNBUSDT') to match database constraints.
     """
     clean_symbol = symbol.replace("/", "").replace("-", "").upper()
     db_url = os.getenv("DATABASE_URL")
     if db_url:
-        db_url = db_url.strip('"').strip("'")  # Removes accidental quotes
+        db_url = db_url.strip('"').strip("'")
     
     if PSYCOPG2_AVAILABLE and db_url:
         try:
@@ -81,7 +86,6 @@ def load_symbol_config(symbol: str) -> dict:
         except Exception as e:
             logging.warning(f"Could not load Supabase config for {clean_symbol}: {e}")
 
-    # Fallback to local config file / default values
     return load_optimized_config()
 
 def get_ai_sentiment_score(text: str) -> float:
@@ -126,21 +130,24 @@ def fetch_fundamental_sentiment(news_headlines: list) -> float:
     except Exception:
         return 0.0
 
-def fetch_klines(symbol: str = "BNBUSDT", interval: str = "1h", limit: int = 1000) -> pd.DataFrame:
-    clean_symbol = symbol.replace("/", "").replace("usdt", "").replace("USDT", "").upper()
-    if not clean_symbol:
-        clean_symbol = "BITCOIN"
+def fetch_klines(symbol: str = "BNB/USDT", interval: str = "1h", limit: int = 1000) -> pd.DataFrame:
+    norm_sym = normalize_symbol(symbol)
+    clean_base = norm_sym.split("/")[0] if "/" in norm_sym else norm_sym.replace("USDT", "")
     
     symbol_map = {
         "BTC": "bitcoin",
         "ETH": "ethereum",
         "BNB": "binancecoin",
         "ADA": "cardano",
-        "SOL": "solana"
+        "SOL": "solana",
+        "XRP": "ripple",
+        "DOGE": "dogecoin",
+        "DOT": "polkadot",
+        "AVAX": "avalanche-2"
     }
     
-    coin_id = symbol_map.get(clean_symbol, "bitcoin")
-    days = max(1, min(90, int(limit / 24))) if interval == "1h" else 30
+    coin_id = symbol_map.get(clean_base, "bitcoin")
+    days = max(1, min(365, int(limit / 24))) if interval in ["1h", "4h", "1d"] else 30
     url = f"https://api.coingecko.com/api/v3/coins/{coin_id}/ohlc?vs_currency=usd&days={days}"
     
     try:
@@ -151,7 +158,8 @@ def fetch_klines(symbol: str = "BNBUSDT", interval: str = "1h", limit: int = 100
         if not data:
             return pd.DataFrame()
             
-        df = pd.DataFrame(data, columns=['open_time', 'open', 'high', 'low', 'close'])
+        df = pd.DataFrame(data, columns=['time', 'open', 'high', 'low', 'close'])
+        df['time'] = pd.to_datetime(df['time'], unit='ms').dt.strftime('%Y-%m-%d %H:%M:%S')
         df['volume'] = 1000.0
         
         df['open'] = df['open'].astype(float)
@@ -160,7 +168,7 @@ def fetch_klines(symbol: str = "BNBUSDT", interval: str = "1h", limit: int = 100
         df['close'] = df['close'].astype(float)
         df['volume'] = df['volume'].astype(float)
         
-        return df
+        return df[['time', 'open', 'high', 'low', 'close', 'volume']]
     except Exception as e:
         logging.error(f"Public Market Data API error for {symbol}: {e}")
         return pd.DataFrame()
@@ -183,10 +191,6 @@ def calc_rsi(series: pd.Series, period: int = 14) -> pd.Series:
     return rsi.fillna(50)
 
 def calculate_volume_profile_gaps(df: pd.DataFrame, num_bins: int = 100, detection_pct: float = 0.07) -> list:
-    """
-    Python translation of DGT's Volume Profile Gap detection logic from Pine Script v6.
-    Uses precise row volume proportioning and an N-neighbor comparative window scan.
-    """
     if df.empty or 'volume' not in df.columns:
         return []
 
@@ -197,8 +201,6 @@ def calculate_volume_profile_gaps(df: pd.DataFrame, num_bins: int = 100, detecti
         return []
 
     pSTP = (pHST - pLST) / num_bins
-
-    # 1. Build Volume Profile Bins matching Pine Script area distribution
     vD_vt = np.zeros(num_bins)
     
     for _, row in df.iterrows():
@@ -222,39 +224,32 @@ def calculate_volume_profile_gaps(df: pd.DataFrame, num_bins: int = 100, detecti
 
             vD_vt[pLI] += lV * vPOR
 
-    # 2. Compute Neighbor Window Size (noN = int(vpNR * vgNoN))
     noN = int(num_bins * detection_pct)
     if noN < 1:
-        noN = 1  # Minimum 1 neighbor check
+        noN = 1
 
     max_vol = float(vD_vt.max()) if len(vD_vt) > 0 else 0.0
     if max_vol == 0.0:
         return []
 
-    # 3. Create Padded Array (matches tVT.unshift(max) and tVT.push(max))
     tVT = np.concatenate([np.full(noN, max_vol), vD_vt, np.full(noN, max_vol)])
-
     detected_gap_prices = []
 
-    # 4. Scanning Loop with Dual-Window Validation
     for vn in range(2 * noN, num_bins + 2 * noN):
         current_val = tVT[vn - noN]
         
-        # Check Upper Neighbor Window
         uNth = True
         for cVN in range(vn - 2 * noN, vn - noN):
             if current_val >= tVT[cVN]:
                 uNth = False
                 break
                 
-        # Check Lower Neighbor Window
         lNth = True
         for cVN in range(vn - noN + 1, vn + 1):
             if current_val >= tVT[cVN]:
                 lNth = False
                 break
 
-        # Node is a profile gap if strictly smaller than all neighbors
         if uNth and lNth:
             bin_idx = vn - 2 * noN
             gap_price = pLST + (bin_idx + 0.5) * pSTP
@@ -311,7 +306,7 @@ def compute_volume_profile(df: pd.DataFrame, num_bins: int = 70):
 
     return poc_price, vah_price, val_price
 
-def is_bullish_pinbar(candle: pd.Series) -> False:
+def is_bullish_pinbar(candle: pd.Series) -> bool:
     total_range = candle['high'] - candle['low']
     if total_range == 0:
         return False
@@ -319,7 +314,7 @@ def is_bullish_pinbar(candle: pd.Series) -> False:
     lower_wick = min(candle['open'], candle['close']) - candle['low']
     return (lower_wick >= 1.5 * body_size) and ((candle['close'] - candle['low']) >= 0.50 * total_range)
 
-def is_bearish_pinbar(candle: pd.Series) -> False:
+def is_bearish_pinbar(candle: pd.Series) -> bool:
     total_range = candle['high'] - candle['low']
     if total_range == 0:
         return False
@@ -339,7 +334,7 @@ def is_bearish_engulfing(prev: pd.Series, curr: pd.Series) -> bool:
     engulfs = (curr['close'] <= prev['open']) and (curr['open'] >= prev['close'])
     return curr_bearish and engulfs
 
-def evaluate_signals(df: pd.DataFrame, symbol: str = "BTC/USDT", account_balance: float = 10000.0, 
+def evaluate_signals(df: pd.DataFrame, symbol: str = "ETH/USDT", account_balance: float = 10000.0, 
                      tema_period: int = None, rsi_period: int = None, 
                      zone_tolerance: float = None, risk_pct: float = None, 
                      min_rr: float = None,  
@@ -347,8 +342,8 @@ def evaluate_signals(df: pd.DataFrame, symbol: str = "BTC/USDT", account_balance
                      use_sentiment_filter: bool = False, min_sentiment: float = None,
                      vp_detection_pct: float = None) -> dict:
     
-    # Dynamically pull asset-specific parameters from Supabase or Config fallback
-    dynamic_cfg = load_symbol_config(symbol)
+    normalized_symbol = normalize_symbol(symbol)
+    dynamic_cfg = load_symbol_config(normalized_symbol)
     
     tema_period = int(tema_period) if tema_period is not None else int(dynamic_cfg.get("tema_period", 200))
     rsi_period = int(rsi_period) if rsi_period is not None else int(dynamic_cfg.get("rsi_period", 14))
@@ -375,23 +370,19 @@ def evaluate_signals(df: pd.DataFrame, symbol: str = "BTC/USDT", account_balance
     if use_sentiment_filter and 'sentiment_score' in latest:
         sentiment_score = latest['sentiment_score']
 
-    # Proximity check for detected Volume Profile Gap levels
     in_gap_zone = False
     if gap_levels:
         min_gap_dist = min([abs(price - gap) / gap for gap in gap_levels])
         in_gap_zone = min_gap_dist <= zone_tolerance
 
-    # Separate gap levels into structural liquidity targets above and below current market price
     above_gaps = [g for g in gap_levels if g > price]
     below_gaps = [g for g in gap_levels if g < price]
 
-    # 1. EVALUATE LONG SETUP
     is_uptrend = (price >= tema) and (latest['TEMA_slope'] > 0)
     in_poc_zone_long = abs(price - poc) / poc <= zone_tolerance if poc > 0 else True
     in_val_zone_long = abs(price - val) / val <= zone_tolerance if val > 0 else True
 
     in_structural_support = in_poc_zone_long or in_val_zone_long or in_gap_zone
-
     rsi_turning_long = (latest['RSI'] > latest['RSI_SMA']) if use_rsi_filter else True
     
     has_bullish_confirm = (
@@ -402,15 +393,11 @@ def evaluate_signals(df: pd.DataFrame, symbol: str = "BTC/USDT", account_balance
     sentiment_pass_long = (sentiment_score >= min_sentiment) if use_sentiment_filter else True
 
     if is_uptrend and in_structural_support and rsi_turning_long and has_bullish_confirm and sentiment_pass_long:
-        # Dynamic Take Profit: Nearest Volume Gap above price -> VAH -> 2% default fallback
         tp_price = min(above_gaps) if above_gaps else (vah if vah > price else price * 1.02)
-        
-        # Dynamic Stop Loss: Nearest Volume Gap below price -> VAL fallback -> Anchor to latest low with 0.5% buffer
         nearest_support_gap = max(below_gaps) if below_gaps else val
         sl_price = min(latest['low'], nearest_support_gap) * 0.9950
         
         risk = price - sl_price
-        
         if risk > 0:
             rr_ratio = (tp_price - price) / risk
             if rr_ratio >= min_rr:
@@ -419,7 +406,7 @@ def evaluate_signals(df: pd.DataFrame, symbol: str = "BTC/USDT", account_balance
                 
                 return {
                     "action": "BUY",
-                    "pair": symbol,
+                    "pair": normalized_symbol,
                     "direction": "LONG",
                     "entry": float(price),
                     "sl": float(round(sl_price, 2)),
@@ -430,13 +417,11 @@ def evaluate_signals(df: pd.DataFrame, symbol: str = "BTC/USDT", account_balance
                     "detected_gaps": gap_levels
                 }
 
-    # 2. EVALUATE SHORT SETUP
     is_downtrend = (price <= tema) and (latest['TEMA_slope'] < 0)
     in_poc_zone_short = abs(price - poc) / poc <= zone_tolerance if poc > 0 else True
     in_vah_zone_short = abs(price - vah) / vah <= zone_tolerance if vah > 0 else True
 
     in_structural_resistance = in_poc_zone_short or in_vah_zone_short or in_gap_zone
-
     rsi_turning_short = (latest['RSI'] < latest['RSI_SMA']) if use_rsi_filter else True
     
     has_bearish_confirm = (
@@ -447,15 +432,11 @@ def evaluate_signals(df: pd.DataFrame, symbol: str = "BTC/USDT", account_balance
     sentiment_pass_short = (sentiment_score <= -min_sentiment) if use_sentiment_filter else True
 
     if is_downtrend and in_structural_resistance and rsi_turning_short and has_bearish_confirm and sentiment_pass_short:
-        # Dynamic Take Profit: Nearest Volume Gap below price -> VAL -> 2% default fallback
         tp_price = max(below_gaps) if below_gaps else (val if val < price else price * 0.98)
-        
-        # Dynamic Stop Loss: Nearest Volume Gap above price -> VAH fallback -> Anchor to latest high with 0.5% buffer
         nearest_resistance_gap = min(above_gaps) if above_gaps else vah
         sl_price = max(latest['high'], nearest_resistance_gap) * 1.0050
         
         risk = sl_price - price
-        
         if risk > 0:
             rr_ratio = (price - tp_price) / risk
             if rr_ratio >= min_rr:
@@ -464,7 +445,7 @@ def evaluate_signals(df: pd.DataFrame, symbol: str = "BTC/USDT", account_balance
                 
                 return {
                     "action": "SELL",
-                    "pair": symbol,
+                    "pair": normalized_symbol,
                     "direction": "SHORT",
                     "entry": float(price),
                     "sl": float(round(sl_price, 2)),

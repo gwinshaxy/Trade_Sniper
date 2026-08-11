@@ -4,6 +4,8 @@ warnings.filterwarnings('ignore', category=UserWarning)
 import time
 import logging
 import os
+import urllib.request
+import json
 import pandas as pd
 from dotenv import load_dotenv
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -21,7 +23,7 @@ if HTTP_PROXY or HTTPS_PROXY:
     os.environ["HTTPS_PROXY"] = HTTPS_PROXY or HTTP_PROXY
     os.environ["NO_PROXY"] = "localhost,127.0.0.1,.supabase.co"
 
-from strategy import fetch_klines, calc_tema, evaluate_signals, load_symbol_config
+from strategy import calc_tema, evaluate_signals, load_symbol_config
 from agent import DynamicTradeManager
 import optimizer
 from common import get_db_connection, ensure_schema_updated, send_telegram_notification, calculate_pnl
@@ -43,11 +45,73 @@ MAX_TOTAL_PORTFOLIO_RISK_PCT = float(os.getenv("MAX_TOTAL_PORTFOLIO_RISK_PCT", 3
 SYMBOL_COOLDOWN = {}
 COOLDOWN_PERIOD_SECONDS = int(os.getenv("COOLDOWN_PERIOD_SECONDS", 1800))
 
+def normalize_symbol(symbol: str) -> str:
+    """
+    Ensures uniform formatting for symbols (e.g., 'ETH/USDT').
+    """
+    s = symbol.strip().upper()
+    if "/" in s:
+        return s
+    # Convert compact formatting like ETHUSDT -> ETH/USDT
+    if s.endswith("USDT") and len(s) > 4:
+        return f"{s[:-4]}/{s[-4:]}"
+    return s
+
+def get_cache_key(symbol: str) -> str:
+    """
+    Generates a uniform, slash-free uppercase key for candle dictionary mapping.
+    """
+    return normalize_symbol(symbol).replace("/", "").upper()
+
+def fetch_market_data(symbol: str, interval_str: str):
+    """
+    Alternative public market data fetcher using CoinGecko REST API
+    to bypass Yahoo Finance cloud IP rate-limiting (HTTP 429).
+    Synchronized with dashboard.py implementation.
+    """
+    try:
+        normalized = normalize_symbol(symbol)
+        clean_base = normalized.split("/")[0] if "/" in normalized else normalized.replace("USDT", "")
+        
+        symbol_map = {
+            "BTC": "bitcoin",
+            "ETH": "ethereum",
+            "BNB": "binancecoin",
+            "ADA": "cardano",
+            "SOL": "solana",
+            "XRP": "ripple",
+            "DOGE": "dogecoin",
+            "DOT": "polkadot",
+            "AVAX": "avalanche-2"
+        }
+        coin_id = symbol_map.get(clean_base, "bitcoin")
+        
+        days_map = {"5m": 1, "15m": 7, "30m": 14, "1h": 30, "4h": 90, "1d": 365}
+        days = days_map.get(interval_str, 30)
+        
+        url = f"https://api.coingecko.com/api/v3/coins/{coin_id}/ohlc?vs_currency=usd&days={days}"
+        
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode('utf-8'))
+            
+        if not data:
+            return None
+            
+        df = pd.DataFrame(data, columns=['time', 'open', 'high', 'low', 'close'])
+        df['time'] = pd.to_datetime(df['time'], unit='ms').dt.strftime('%Y-%m-%d %H:%M:%S')
+        df['volume'] = 1000.0  # Synthetic placeholder volume for profile alignment if omitted
+        
+        return df[['time', 'open', 'high', 'low', 'close', 'volume']]
+    except Exception as e:
+        logging.error(f"Error fetching alternative market data for {symbol}: {e}")
+        return None
+
 def run_all_optimizations():
     """Executes the DEAP Genetic Optimizer sequentially across all configured symbols."""
     logging.info("🧬 Starting weekly scheduled DEAP Genetic Optimization for all symbols...")
     for sym in SYMBOLS:
-        clean_sym = sym.replace("/", "").upper()
+        clean_sym = normalize_symbol(sym).replace("/", "").upper()
         try:
             logging.info(f"⏳ Optimizing parameters for {clean_sym}...")
             optimizer.run_optimization(symbol=clean_sym)
@@ -183,8 +247,8 @@ def main():
             candle_cache = {}
 
             for symbol in SYMBOLS:
-                logging.info(f"🔍 Polling {symbol} ({TIMEFRAME})...")
-                formatted_symbol = symbol if "/" in symbol else f"{symbol[:-4]}/{symbol[-4:]}"
+                formatted_symbol = normalize_symbol(symbol)
+                logging.info(f"🔍 Polling {formatted_symbol} ({TIMEFRAME})...")
 
                 if has_active_trade_for_symbol(formatted_symbol):
                     logging.info(f"🛡️ Skipping {formatted_symbol}: Active trade already open.")
@@ -198,13 +262,13 @@ def main():
                     continue
 
                 try:
-                    df = fetch_klines(symbol=symbol, interval=TIMEFRAME, limit=500)
-                    if df.empty:
-                        logging.warning(f"Received empty dataframe for {symbol}. Skipping...")
+                    df = fetch_market_data(symbol=formatted_symbol, interval_str=TIMEFRAME)
+                    if df is None or df.empty:
+                        logging.warning(f"Received empty dataframe for {formatted_symbol}. Skipping...")
                         time.sleep(20.0)
                         continue
                 except Exception as e:
-                    logging.error(f"Network error fetching klines for {symbol}: {e}. Skipping...")
+                    logging.error(f"Network error fetching klines for {formatted_symbol}: {e}. Skipping...")
                     time.sleep(20.0)
                     continue
 
@@ -213,14 +277,15 @@ def main():
 
                 df['200_TEMA'] = calc_tema(df['close'], tema_period)
                 latest_candle = df.iloc[-1]
-                logging.info(f"📊 {symbol} Close: ${latest_candle['close']:,.2f} (TEMA: ${latest_candle['200_TEMA']:,.2f})")
+                logging.info(f"📊 {formatted_symbol} Close: ${latest_candle['close']:,.2f} (TEMA: ${latest_candle['200_TEMA']:,.2f})")
 
-                candle_cache[symbol.upper()] = latest_candle
+                cache_key = get_cache_key(formatted_symbol)
+                candle_cache[cache_key] = latest_candle
 
                 signal = evaluate_signals(df, symbol=formatted_symbol, account_balance=DEFAULT_ACCOUNT_BALANCE)
                 
                 if signal.get("action") in ["BUY", "SELL"]:
-                    pair_name = signal.get("pair", formatted_symbol)
+                    pair_name = normalize_symbol(signal.get("pair", formatted_symbol))
                     signal_risk = float(signal.get("risk_pct", 1.0))
                     
                     current_portfolio_risk = get_total_open_risk_pct()
@@ -253,33 +318,33 @@ def main():
                         logging.info(f"New Signal Executed: Trade #{trade_id} ({pair_name})")
                         send_telegram_notification(alert_txt)
                 else:
-                    logging.info(f"Status for {symbol}: HOLD")
+                    logging.info(f"Status for {formatted_symbol}: HOLD")
                 time.sleep(20.0)
 
             active_trades = fetch_active_trades()
             if not active_trades.empty:
                 for _, trade in active_trades.iterrows():
                     trade_pair_raw = str(trade['pair'])
-                    cache_key = trade_pair_raw.replace("/", "").upper()
+                    normalized_trade_pair = normalize_symbol(trade_pair_raw)
+                    cache_key = get_cache_key(normalized_trade_pair)
                     
                     if cache_key not in candle_cache:
                         try:
-                            clean_symbol = trade_pair_raw.replace("/", "")
-                            fallback_df = fetch_klines(symbol=clean_symbol, interval=TIMEFRAME, limit=1000)
-                            if not fallback_df.empty:
-                                cfg = load_symbol_config(trade_pair_raw)
+                            fallback_df = fetch_market_data(symbol=normalized_trade_pair, interval_str=TIMEFRAME)
+                            if fallback_df is not None and not fallback_df.empty:
+                                cfg = load_symbol_config(normalized_trade_pair)
                                 tema_period = int(cfg.get("tema_period", 200))
                                 fallback_df['200_TEMA'] = calc_tema(fallback_df['close'], tema_period)
                                 candle_cache[cache_key] = fallback_df.iloc[-1]
                             time.sleep(20.0)
                         except Exception as fe:
-                            logging.error(f"Failed fallback candle fetch for {trade_pair_raw}: {fe}")
+                            logging.error(f"Failed fallback candle fetch for {normalized_trade_pair}: {fe}")
 
                 executed_trades = active_trades[active_trades['status'] == 'EXECUTED']
                 if not executed_trades.empty:
                     for _, trade in executed_trades.iterrows():
-                        trade_pair = str(trade['pair']).replace("/", "").upper()
-                        matched_candle = candle_cache.get(trade_pair)
+                        trade_pair = normalize_symbol(str(trade['pair']))
+                        matched_candle = candle_cache.get(get_cache_key(trade_pair))
                         
                         if matched_candle is not None:
                             curr_low = float(matched_candle['low'])

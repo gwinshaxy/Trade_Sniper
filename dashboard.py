@@ -52,10 +52,10 @@ def check_password():
     return False
 
 if not check_password():
-    st.stop()  # Halts rendering of the rest of the dashboard until authenticated
+    st.stop()
 
 # ==========================================
-# REST OF DASHBOARD INITIALIZATION & LOGIC
+# IMPORTS & INITIALIZATION
 # ==========================================
 from common import (
     calculate_pnl,
@@ -67,17 +67,20 @@ import strategy
 
 ensure_schema_updated()
 
+def normalize_symbol(symbol: str) -> str:
+    """Ensures uniform slash-separated formatting (e.g., 'ETH/USDT')."""
+    s = symbol.strip().upper()
+    if "/" in s:
+        return s
+    if s.endswith("USDT") and len(s) > 4:
+        return f"{s[:-4]}/{s[-4:]}"
+    return s
+
 # ==========================================
 # UNIFIED SYMBOL CONFIGURATION
 # ==========================================
-symbols_env = os.getenv("SYMBOLS") or os.getenv(
-    "SYMBOL", "ETH/USDT,BNB/USDT,SOL/USDT"
-)
-env_symbols = [s.strip().upper() for s in symbols_env.split(",")]
-env_symbols = [
-    s if "/" in s else f"{s[:-4]}/{s[-4:]}" if s.endswith("USDT") else s
-    for s in env_symbols
-]
+symbols_env = os.getenv("SYMBOLS") or os.getenv("SYMBOL", "ETH/USDT,BNB/USDT,SOL/USDT")
+env_symbols = [normalize_symbol(s) for s in symbols_env.split(",")]
 
 # ==========================================
 # FETCH DATABASE RECORDS FOR FILTERS
@@ -86,9 +89,7 @@ conn = get_db_connection()
 df_all_trades = pd.read_sql("SELECT * FROM trade_setups ORDER BY id DESC;", conn)
 conn.close()
 
-db_pairs = (
-    df_all_trades['pair'].unique().tolist() if not df_all_trades.empty else []
-)
+db_pairs = [normalize_symbol(p) for p in df_all_trades['pair'].unique().tolist()] if not df_all_trades.empty else []
 available_pairs = list(dict.fromkeys(env_symbols + db_pairs))
 for default_pair in ["ETH/USDT", "BNB/USDT", "SOL/USDT"]:
     if default_pair not in available_pairs:
@@ -104,9 +105,7 @@ select_all_pairs = st.sidebar.checkbox("Select All", value=True)
 if select_all_pairs:
     selected_pairs = available_pairs
 else:
-    selected_pairs = st.sidebar.multiselect(
-        "Filter Pairs", available_pairs, default=available_pairs
-    )
+    selected_pairs = st.sidebar.multiselect("Filter Pairs", available_pairs, default=available_pairs)
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("🎯 Strategy Parameters (Harmonized)")
@@ -114,15 +113,9 @@ st.sidebar.subheader("🎯 Strategy Parameters (Harmonized)")
 config_target_pair = st.sidebar.selectbox("Load Dynamic Config For:", available_pairs, index=0)
 dyn_cfg = strategy.load_symbol_config(config_target_pair)
 
-tema_period = st.sidebar.number_input(
-    "TEMA Period", value=int(dyn_cfg.get("tema_period", 200)), min_value=10, max_value=500
-)
-rsi_period = st.sidebar.number_input(
-    "RSI Period", value=int(dyn_cfg.get("rsi_period", 14)), min_value=2, max_value=50
-)
-rsi_thresh = st.sidebar.slider(
-    "RSI Threshold", min_value=20, max_value=80, value=int(dyn_cfg.get("rsi_thresh", 42))
-)
+tema_period = st.sidebar.number_input("TEMA Period", value=int(dyn_cfg.get("tema_period", 200)), min_value=10, max_value=500)
+rsi_period = st.sidebar.number_input("RSI Period", value=int(dyn_cfg.get("rsi_period", 14)), min_value=2, max_value=50)
+rsi_thresh = st.sidebar.slider("RSI Threshold", min_value=20, max_value=80, value=int(dyn_cfg.get("rsi_thresh", 42)))
 zone_tolerance_pct = st.sidebar.slider(
     "Volume Zone Proximity (%)",
     min_value=0.1,
@@ -140,40 +133,24 @@ vp_detection_pct = st.sidebar.slider(
 ) / 100.0
 
 use_rsi_filter = st.sidebar.checkbox("Enable RSI Momentum Filter", value=bool(dyn_cfg.get("use_rsi_filter", True)))
-use_candlestick_confirm = st.sidebar.checkbox(
-    "Require Candlestick Confirmation", value=bool(dyn_cfg.get("use_candlestick_confirm", True))
-)
+use_candlestick_confirm = st.sidebar.checkbox("Require Candlestick Confirmation", value=bool(dyn_cfg.get("use_candlestick_confirm", True)))
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("🧠 AI Fundamental Layer")
-use_sentiment_filter = st.sidebar.checkbox(
-    "Enable AI Sentiment Filter", value=False
-)
-min_sentiment_thresh = st.sidebar.slider(
-    "Min Sentiment Threshold", min_value=0.0, max_value=0.8, value=0.2, step=0.05
-)
+use_sentiment_filter = st.sidebar.checkbox("Enable AI Sentiment Filter", value=False)
+min_sentiment_thresh = st.sidebar.slider("Min Sentiment Threshold", min_value=0.0, max_value=0.8, value=0.2, step=0.05)
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("📝 Manual Trade Setup")
 
 pair = st.sidebar.text_input("Execution Pair", "BTC/USDT").upper()
 direction = st.sidebar.selectbox("Order Type / Direction", ["LONG", "SHORT"])
-overlay_chart = st.sidebar.checkbox(
-    "Overlay Trade Positions on Chart", value=True
-)
-overlay_gaps = st.sidebar.checkbox(
-    "Overlay Volume Profile Gaps", value=True
-)
+overlay_chart = st.sidebar.checkbox("Overlay Trade Positions on Chart", value=True)
+overlay_gaps = st.sidebar.checkbox("Overlay Volume Profile Gaps", value=True)
 
-entry_price = st.sidebar.number_input(
-    "Entry Price ($)", min_value=0.0, format="%.5f"
-)
-stop_loss = st.sidebar.number_input(
-    "Stop Loss ($)", min_value=0.0, format="%.5f"
-)
-take_profit = st.sidebar.number_input(
-    "Take Profit ($)", min_value=0.0, format="%.5f"
-)
+entry_price = st.sidebar.number_input("Entry Price ($)", min_value=0.0, format="%.5f")
+stop_loss = st.sidebar.number_input("Stop Loss ($)", min_value=0.0, format="%.5f")
+take_profit = st.sidebar.number_input("Take Profit ($)", min_value=0.0, format="%.5f")
 
 risk = abs(entry_price - stop_loss) if (entry_price and stop_loss) else 0.0
 reward = abs(take_profit - entry_price) if (take_profit and entry_price) else 0.0
@@ -182,16 +159,10 @@ st.sidebar.markdown(f"**Risk : Reward Ratio:** `1:{rr_ratio}`")
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("⚙️ Account Parameters")
-account_balance = st.sidebar.number_input(
-    "Account Balance ($)", min_value=1.0, value=float(os.getenv("ACCOUNT_BALANCE", 10000.0))
-)
-risk_pct = st.sidebar.number_input(
-    "Risk Per Trade (%)", min_value=0.01, max_value=100.0, value=1.0
-)
+account_balance = st.sidebar.number_input("Account Balance ($)", min_value=1.0, value=float(os.getenv("ACCOUNT_BALANCE", 10000.0)))
+risk_pct = st.sidebar.number_input("Risk Per Trade (%)", min_value=0.01, max_value=100.0, value=1.0)
 
-calc_position_size = (
-    round((account_balance * (risk_pct / 100.0)) / risk, 4) if risk > 0 else 0.0
-)
+calc_position_size = round((account_balance * (risk_pct / 100.0)) / risk, 4) if risk > 0 else 0.0
 st.sidebar.caption(f"Calculated Position Size: `{calc_position_size}` units")
 
 submitted = st.sidebar.button("🚀 Execute Order")
@@ -205,7 +176,7 @@ if submitted:
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 'EXECUTED', 'OPEN');
         """,
         (
-            pair,
+            normalize_symbol(pair),
             direction,
             entry_price,
             stop_loss,
@@ -233,31 +204,20 @@ if submitted:
 # ==========================================
 st.title("📊 Forex & Crypto Trading Terminal")
 
-closed_trades = (
-    df_all_trades[df_all_trades['status'] == 'CLOSED']
-    if not df_all_trades.empty
-    else pd.DataFrame()
-)
-net_realized_pnl = (
-    closed_trades['pnl_usd'].sum() if not closed_trades.empty else 0.0
-)
+closed_trades = df_all_trades[df_all_trades['status'] == 'CLOSED'] if not df_all_trades.empty else pd.DataFrame()
+net_realized_pnl = closed_trades['pnl_usd'].sum() if not closed_trades.empty else 0.0
 max_dd = 0.0
 profit_factor_val = 0.0
 if not closed_trades.empty:
     wins_sum = closed_trades[closed_trades['outcome'] == 'WIN']['pnl_usd'].sum()
-    loss_sum = abs(
-        closed_trades[closed_trades['outcome'] == 'LOSS']['pnl_usd'].sum()
-    )
+    loss_sum = abs(closed_trades[closed_trades['outcome'] == 'LOSS']['pnl_usd'].sum())
     profit_factor_val = round(wins_sum / loss_sum, 2) if loss_sum > 0 else 0.0
 
 col_m1, col_m2, col_m3, col_m4 = st.columns(4)
 col_m1.metric("Net Realized PnL", f"${net_realized_pnl:,.2f}")
 col_m2.metric("Max DD", f"{max_dd:.2f}%")
 col_m3.metric("Profit Factor", f"{profit_factor_val:.2f}")
-col_m4.metric(
-    "Total Closed Trades",
-    f"{len(closed_trades):,.0f}" if not closed_trades.empty else "0",
-)
+col_m4.metric("Total Closed Trades", f"{len(closed_trades):,.0f}" if not closed_trades.empty else "0")
 
 st.markdown("---")
 
@@ -277,77 +237,23 @@ with col_tf:
 
 col_chart_sel, _ = st.columns([1, 3])
 with col_chart_sel:
-    chart_symbol = st.selectbox(
-        "Select Chart Asset", available_pairs, key="independent_chart_symbol"
-    )
+    chart_symbol = st.selectbox("Select Chart Asset", available_pairs, key="independent_chart_symbol")
 
-def fetch_market_data(symbol: str, interval_str: str):
-    """
-    Alternative public market data fetcher using CoinGecko REST API
-    to bypass Yahoo Finance cloud IP rate-limiting (HTTP 429).
-    """
-    try:
-        clean_symbol = symbol.upper().replace("/", "").replace("USDT", "").strip()
-        symbol_map = {
-            "BTC": "bitcoin",
-            "ETH": "ethereum",
-            "BNB": "binancecoin",
-            "ADA": "cardano",
-            "SOL": "solana",
-            "XRP": "ripple"
-        }
-        coin_id = symbol_map.get(clean_symbol, "bitcoin")
-        
-        # Map dashboard timeframes to CoinGecko days parameter
-        days_map = {"5m": 1, "15m": 7, "30m": 14, "1h": 30, "4h": 90, "1d": 365}
-        days = days_map.get(interval_str, 30)
-        
-        url = f"https://api.coingecko.com/api/v3/coins/{coin_id}/ohlc?vs_currency=usd&days={days}"
-        
-        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            data = json.loads(resp.read().decode('utf-8'))
-            
-        if not data:
-            return None
-            
-        df = pd.DataFrame(data, columns=['time', 'open', 'high', 'low', 'close'])
-        # CoinGecko returns milliseconds timestamps
-        df['time'] = pd.to_datetime(df['time'], unit='ms').dt.strftime('%Y-%m-%d %H:%M:%S')
-        df['volume'] = 1000.0  # Synthetic placeholder volume for profile alignment if omitted
-        
-        return df[['time', 'open', 'high', 'low', 'close', 'volume']]
-    except Exception as e:
-        st.error(f"Error fetching alternative market data for {symbol}: {e}")
-        return None
-
-df_ohlc = fetch_market_data(chart_symbol, selected_timeframe)
+df_ohlc = strategy.fetch_klines(symbol=chart_symbol, interval=selected_timeframe)
 
 if df_ohlc is not None and not df_ohlc.empty:
-    df_ohlc['tema_custom'] = strategy.calc_tema(
-        df_ohlc['close'], period=min(tema_period, len(df_ohlc))
-    )
+    df_ohlc['tema_custom'] = strategy.calc_tema(df_ohlc['close'], period=min(tema_period, len(df_ohlc)))
     poc, vah, val = strategy.compute_volume_profile(df_ohlc)
-    detected_gaps = strategy.calculate_volume_profile_gaps(
-        df_ohlc, num_bins=100, detection_pct=vp_detection_pct
-    )
+    detected_gaps = strategy.calculate_volume_profile_gaps(df_ohlc, num_bins=100, detection_pct=vp_detection_pct)
 
     chart = StreamlitChart(width=1100, height=500)
     chart.layout(background_color='#131722', text_color='#d1d4dc')
-    chart.volume_config(
-        scale_margin_top=0.75, up_color='#26a69a', down_color='#ef5350'
-    )
+    chart.volume_config(scale_margin_top=0.85, scale_margin_bottom=0.0, up_color='#26a69a', down_color='#ef5350')
     chart.set(df_ohlc[['time', 'open', 'high', 'low', 'close', 'volume']])
 
-    tema_df = (
-        df_ohlc[['time', 'tema_custom']]
-        .dropna()
-        .rename(columns={'tema_custom': f'{tema_period} TEMA'})
-    )
+    tema_df = df_ohlc[['time', 'tema_custom']].dropna().rename(columns={'tema_custom': f'{tema_period} TEMA'})
     if not tema_df.empty:
-        tema_line = chart.create_line(
-            name=f"{tema_period} TEMA", color="orange", width=2
-        )
+        tema_line = chart.create_line(name=f"{tema_period} TEMA", color="orange", width=2)
         tema_line.set(tema_df)
 
     chart.horizontal_line(vah, color="green", text=f"VAH: {vah:.2f}")
@@ -356,32 +262,19 @@ if df_ohlc is not None and not df_ohlc.empty:
 
     if overlay_gaps and detected_gaps:
         for gap_price in detected_gaps:
-            chart.horizontal_line(
-                gap_price,
-                color="purple",
-                style="dashed",
-                text=f"GAP: {gap_price:.2f}",
-            )
+            chart.horizontal_line(gap_price, color="purple", style="dashed", text=f"GAP: {gap_price:.2f}")
 
     if overlay_chart and not df_all_trades.empty:
         symbol_trades = df_all_trades[
-            (df_all_trades['pair'] == chart_symbol)
+            (df_all_trades['pair'].apply(normalize_symbol) == normalize_symbol(chart_symbol))
             & (df_all_trades['status'].isin(['EXECUTED', 'PENDING']))
         ]
         for _, tr in symbol_trades.iterrows():
-            chart.horizontal_line(
-                float(tr['entry_price']),
-                color="blue",
-                text=f"ENTRY ({tr['direction']})",
-            )
+            chart.horizontal_line(float(tr['entry_price']), color="blue", text=f"ENTRY ({tr['direction']})")
             if pd.notnull(tr['stop_loss']) and tr['stop_loss'] > 0:
-                chart.horizontal_line(
-                    float(tr['stop_loss']), color="red", text="SL"
-                )
+                chart.horizontal_line(float(tr['stop_loss']), color="red", text="SL")
             if pd.notnull(tr['take_profit']) and tr['take_profit'] > 0:
-                chart.horizontal_line(
-                    float(tr['take_profit']), color="green", text="TP"
-                )
+                chart.horizontal_line(float(tr['take_profit']), color="green", text="TP")
 
     chart.load()
 else:
@@ -392,9 +285,7 @@ st.markdown("---")
 # ==========================================
 # SECTION: TRADE SETUPS & HISTORY TABLES
 # ==========================================
-tab_pending, tab_history = st.tabs(
-    ["⏳ Pending / Setups", "📜 Cumulative Trades History"]
-)
+tab_pending, tab_history = st.tabs(["⏳ Pending / Setups", "📜 Cumulative Trades History"])
 
 with tab_pending:
     conn = get_db_connection()
@@ -406,6 +297,7 @@ with tab_pending:
     )
     conn.close()
     if not df_active.empty:
+        df_active['pair'] = df_active['pair'].apply(normalize_symbol)
         st.dataframe(df_active, use_container_width=True)
     else:
         st.info("No active setups found.")
@@ -419,6 +311,7 @@ with tab_history:
     )
     conn.close()
     if not df_closed_log.empty:
+        df_closed_log['pair'] = df_closed_log['pair'].apply(normalize_symbol)
         st.dataframe(df_closed_log, use_container_width=True)
     else:
         st.info("No closed trade history available.")
@@ -450,13 +343,8 @@ with col_logs:
 # ==========================================
 # SECTION: LIVE AI SENTIMENT & NEWS TESTER
 # ==========================================
-with st.expander(
-    "🧠 Test Live AI Sentiment & News Headline Evaluation", expanded=False
-):
-    st.markdown(
-        "Enter any financial news headline below to instantly evaluate its"
-        " sentiment score using the Gemini API integration from `strategy.py`."
-    )
+with st.expander("🧠 Test Live AI Sentiment & News Headline Evaluation", expanded=False):
+    st.markdown("Enter any financial news headline below to instantly evaluate its sentiment score using the Gemini API integration from `strategy.py`.")
 
     test_headline_input = st.text_area(
         "Market Headline / Text",
