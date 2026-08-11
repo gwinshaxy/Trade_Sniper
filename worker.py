@@ -187,25 +187,25 @@ def main():
 
                 if has_active_trade_for_symbol(formatted_symbol):
                     logging.info(f"🛡️ Skipping {formatted_symbol}: Active trade already open or pending in database.")
-                    time.sleep(2.0)
+                    time.sleep(10.0)
                     continue
 
                 last_signal_time = SYMBOL_COOLDOWN.get(formatted_symbol, 0)
                 if time.time() - last_signal_time < COOLDOWN_PERIOD_SECONDS:
                     remaining_sec = int(COOLDOWN_PERIOD_SECONDS - (time.time() - last_signal_time))
                     logging.info(f"⏳ Skipping {formatted_symbol}: In cooldown for another {remaining_sec}s.")
-                    time.sleep(2.0)
+                    time.sleep(10.0)
                     continue
 
                 try:
                     df = fetch_klines(symbol=symbol, interval=TIMEFRAME, limit=500)
                     if df.empty:
                         logging.warning(f"Received empty dataframe for {symbol}. Skipping asset...")
-                        time.sleep(2.0)
+                        time.sleep(10.0)
                         continue
                 except Exception as e:
                     logging.error(f"Network error fetching klines for {symbol}: {e}. Skipping asset...")
-                    time.sleep(2.0)
+                    time.sleep(10.0)
                     continue
 
                 # Load asset-specific config to get optimized tema_period
@@ -231,7 +231,7 @@ def main():
                             f"🛡️ Portfolio Risk Exceeded for {pair_name}: Current Open Risk ({current_portfolio_risk:.2f}%) + "
                             f"New Trade Risk ({signal_risk:.2f}%) > Max Limit ({MAX_TOTAL_PORTFOLIO_RISK_PCT:.2f}%). Execution blocked."
                         )
-                        time.sleep(2.0)
+                        time.sleep(10.0)
                         continue
 
                     SYMBOL_COOLDOWN[formatted_symbol] = time.time()
@@ -269,7 +269,7 @@ def main():
                 else:
                     logging.info(f"Status for {symbol}: HOLD / No signal matched")
 
-                time.sleep(2.0)
+                time.sleep(10.0)
 
             active_trades = fetch_active_trades()
             if not active_trades.empty:
@@ -287,7 +287,7 @@ def main():
                                 tema_period = int(cfg.get("tema_period", 200))
                                 fallback_df['200_TEMA'] = calc_tema(fallback_df['close'], tema_period)
                                 candle_cache[cache_key] = fallback_df.iloc[-1]
-                            time.sleep(1.0)
+                            time.sleep(5.0)
                         except Exception as fe:
                             logging.error(f"Failed fallback candle fetch for {trade_pair_raw}: {fe}")
 
