@@ -1,8 +1,9 @@
 import os
+import urllib.request
+import json
 import numpy as np
 import pandas as pd
 import streamlit as st
-import yfinance as yf
 from dotenv import load_dotenv
 from lightweight_charts.widgets import StreamlitChart
 
@@ -70,11 +71,7 @@ ensure_schema_updated()
 # UNIFIED SYMBOL CONFIGURATION
 # ==========================================
 symbols_env = os.getenv("SYMBOLS") or os.getenv(
-<<<<<<< HEAD
-    "SYMBOL", "ETHUSDT,BNBUSDT,SOLUSDT"
-=======
     "SYMBOL", "ETH/USDT,BNB/USDT,SOL/USDT"
->>>>>>> 123e5b182a4c4d4316c4c03193d8101790ab8501
 )
 env_symbols = [s.strip().upper() for s in symbols_env.split(",")]
 env_symbols = [
@@ -93,11 +90,7 @@ db_pairs = (
     df_all_trades['pair'].unique().tolist() if not df_all_trades.empty else []
 )
 available_pairs = list(dict.fromkeys(env_symbols + db_pairs))
-<<<<<<< HEAD
-for default_pair in ["ETHUSDT","BNBUSDT","SOLUSDT"]:
-=======
 for default_pair in ["ETH/USDT", "BNB/USDT", "SOL/USDT"]:
->>>>>>> 123e5b182a4c4d4316c4c03193d8101790ab8501
     if default_pair not in available_pairs:
         available_pairs.append(default_pair)
 
@@ -289,77 +282,43 @@ with col_chart_sel:
     )
 
 def fetch_market_data(symbol: str, interval_str: str):
+    """
+    Alternative public market data fetcher using CoinGecko REST API
+    to bypass Yahoo Finance cloud IP rate-limiting (HTTP 429).
+    """
     try:
-        clean_symbol = symbol.upper().strip()
-        possible_symbols = []
-        if "/" in clean_symbol:
-            base, quote = clean_symbol.split("/", 1)
-            possible_symbols.append(f"{base}-{quote}")
-            if quote == "USDT":
-                possible_symbols.append(f"{base}-USD")
-        else:
-            possible_symbols.append(clean_symbol)
-            if not clean_symbol.endswith(("-USD", "=X")):
-                possible_symbols.append(f"{clean_symbol}-USD")
-
-        period_map = {
-            "5m": ("7d", "5m"),
-            "15m": ("14d", "15m"),
-            "30m": ("30d", "30m"),
-            "1h": ("60d", "1h"),
-            "4h": ("60d", "4h"),
-            "1d": ("1y", "1d"),
+        clean_symbol = symbol.upper().replace("/", "").replace("USDT", "").strip()
+        symbol_map = {
+            "BTC": "bitcoin",
+            "ETH": "ethereum",
+            "BNB": "binancecoin",
+            "ADA": "cardano",
+            "SOL": "solana",
+            "XRP": "ripple"
         }
-        period, yf_interval = period_map.get(interval_str, ("30d", "30m"))
-
-        df = pd.DataFrame()
-        for sym in possible_symbols:
-            ticker_obj = yf.Ticker(sym)
-            df = ticker_obj.history(period=period, interval=yf_interval)
-            if not df.empty:
-                break
-
-        if df.empty:
-            for sym in possible_symbols:
-                df = yf.download(
-                    sym, period=period, interval=yf_interval, progress=False
-                )
-                if not df.empty:
-                    break
-
-        if df.empty:
+        coin_id = symbol_map.get(clean_symbol, "bitcoin")
+        
+        # Map dashboard timeframes to CoinGecko days parameter
+        days_map = {"5m": 1, "15m": 7, "30m": 14, "1h": 30, "4h": 90, "1d": 365}
+        days = days_map.get(interval_str, 30)
+        
+        url = f"https://api.coingecko.com/api/v3/coins/{coin_id}/ohlc?vs_currency=usd&days={days}"
+        
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode('utf-8'))
+            
+        if not data:
             return None
-
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
-
-        df.reset_index(inplace=True)
-        col_map = {}
-        for col in df.columns:
-            c_lower = str(col).lower()
-            if 'date' in c_lower or 'time' in c_lower:
-                col_map[col] = 'time'
-            elif 'open' in c_lower:
-                col_map[col] = 'open'
-            elif 'high' in c_lower:
-                col_map[col] = 'high'
-            elif 'low' in c_lower:
-                col_map[col] = 'low'
-            elif 'close' in c_lower:
-                col_map[col] = 'close'
-            elif 'volume' in c_lower:
-                col_map[col] = 'volume'
-
-        df.rename(columns=col_map, inplace=True)
-        required_cols = ['time', 'open', 'high', 'low', 'close', 'volume']
-        if not all(col in df.columns for col in required_cols):
-            return None
-
-        df['time'] = pd.to_datetime(df['time']).dt.strftime('%Y-%m-%d %H:%M:%S')
-        df = df.dropna(subset=['time', 'open', 'high', 'low', 'close'])
-        return df[required_cols]
+            
+        df = pd.DataFrame(data, columns=['time', 'open', 'high', 'low', 'close'])
+        # CoinGecko returns milliseconds timestamps
+        df['time'] = pd.to_datetime(df['time'], unit='ms').dt.strftime('%Y-%m-%d %H:%M:%S')
+        df['volume'] = 1000.0  # Synthetic placeholder volume for profile alignment if omitted
+        
+        return df[['time', 'open', 'high', 'low', 'close', 'volume']]
     except Exception as e:
-        st.error(f"Error fetching market chart data for {symbol}: {e}")
+        st.error(f"Error fetching alternative market data for {symbol}: {e}")
         return None
 
 df_ohlc = fetch_market_data(chart_symbol, selected_timeframe)
