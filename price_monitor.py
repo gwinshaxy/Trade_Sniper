@@ -99,7 +99,7 @@ async def monitor_prices():
     while True:
         trades = fetch_active_trades()
         if not trades:
-            await asyncio.sleep(5)
+            await asyncio.sleep(10)
             continue
 
         crypto_trades = [
@@ -107,7 +107,7 @@ async def monitor_prices():
             if t["pair"].replace("/", "").upper().endswith("USDT")
         ]
         if not crypto_trades:
-            await asyncio.sleep(5)
+            await asyncio.sleep(10)
             continue
 
         active_pairs = list(
@@ -153,10 +153,10 @@ async def monitor_prices():
 
         except (asyncio.TimeoutError, websockets.ConnectionClosed):
             logging.warning("WebSocket connection reset. Reconnecting...")
-            await asyncio.sleep(2)
+            await asyncio.sleep(4)
         except Exception as e:
             logging.error(f"Stream error: {e}")
-            await asyncio.sleep(5)
+            await asyncio.sleep(10)
 
 if __name__ == "__main__":
     asyncio.run(monitor_prices())

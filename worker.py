@@ -10,6 +10,20 @@ from apscheduler.schedulers.background import BackgroundScheduler
 
 load_dotenv()
 
+# ==========================================
+# PROXY & NETWORK CONFIGURATION ROUTING
+# ==========================================
+# If a proxy URL is provided in your environment variables, inject it globally 
+# so that requests, yfinance, and underlying network libraries route traffic automatically.
+HTTP_PROXY = os.getenv("HTTP_PROXY") or os.getenv("PROXY_URL")
+HTTPS_PROXY = os.getenv("HTTPS_PROXY") or os.getenv("PROXY_URL")
+
+if HTTP_PROXY or HTTPS_PROXY:
+    os.environ["HTTP_PROXY"] = HTTP_PROXY or HTTPS_PROXY
+    os.environ["HTTPS_PROXY"] = HTTPS_PROXY or HTTP_PROXY
+    # Bypass local addresses if needed
+    os.environ["NO_PROXY"] = "localhost,127.0.0.1,.supabase.co"
+
 from strategy import fetch_klines, calc_tema, evaluate_signals, load_symbol_config
 from agent import DynamicTradeManager
 import optimizer
@@ -25,14 +39,14 @@ symbols_env = os.getenv("SYMBOLS") or os.getenv("SYMBOL", "ETHUSDT,BNBUSDT,SOLUS
 SYMBOLS = [s.strip().upper() for s in symbols_env.split(",")]
 
 TIMEFRAME = os.getenv("TIMEFRAME", "1h")
-POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", 300))
+POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", 600))
 DEFAULT_ACCOUNT_BALANCE = float(os.getenv("ACCOUNT_BALANCE", 100.0))
 
 # Maximum allowed total combined account risk across all active trades (%)
 MAX_TOTAL_PORTFOLIO_RISK_PCT = float(os.getenv("MAX_TOTAL_PORTFOLIO_RISK_PCT", 3.0))
 
 SYMBOL_COOLDOWN = {}
-COOLDOWN_PERIOD_SECONDS = int(os.getenv("COOLDOWN_PERIOD_SECONDS", 900))
+COOLDOWN_PERIOD_SECONDS = int(os.getenv("COOLDOWN_PERIOD_SECONDS", 1800))
 
 def run_all_optimizations():
     """
@@ -169,7 +183,8 @@ def insert_new_signal(pair, direction, entry, sl, tp, rr, balance, risk_pct, siz
         return None
 
 def main():
-    logging.info(f"⚡ Starting Multi-Asset Trading Bot Background Engine (Max Portfolio Risk Cap: {MAX_TOTAL_PORTFOLIO_RISK_PCT}%)...")
+    proxy_status = f"Active ({HTTP_PROXY or HTTPS_PROXY})" if (HTTP_PROXY or HTTPS_PROXY) else "Direct Connection (No Proxy)"
+    logging.info(f"⚡ Starting Multi-Asset Trading Bot Background Engine | Proxy: {proxy_status} | Max Portfolio Risk Cap: {MAX_TOTAL_PORTFOLIO_RISK_PCT}%...")
     ensure_schema_updated()
     
     # Initialize background cron optimizer
@@ -187,25 +202,25 @@ def main():
 
                 if has_active_trade_for_symbol(formatted_symbol):
                     logging.info(f"🛡️ Skipping {formatted_symbol}: Active trade already open or pending in database.")
-                    time.sleep(2.0)
+                    time.sleep(20.0)
                     continue
 
                 last_signal_time = SYMBOL_COOLDOWN.get(formatted_symbol, 0)
                 if time.time() - last_signal_time < COOLDOWN_PERIOD_SECONDS:
                     remaining_sec = int(COOLDOWN_PERIOD_SECONDS - (time.time() - last_signal_time))
                     logging.info(f"⏳ Skipping {formatted_symbol}: In cooldown for another {remaining_sec}s.")
-                    time.sleep(2.0)
+                    time.sleep(20.0)
                     continue
 
                 try:
                     df = fetch_klines(symbol=symbol, interval=TIMEFRAME, limit=500)
                     if df.empty:
                         logging.warning(f"Received empty dataframe for {symbol}. Skipping asset...")
-                        time.sleep(2.0)
+                        time.sleep(20.0)
                         continue
                 except Exception as e:
                     logging.error(f"Network error fetching klines for {symbol}: {e}. Skipping asset...")
-                    time.sleep(2.0)
+                    time.sleep(20.0)
                     continue
 
                 # Load asset-specific config to get optimized tema_period
@@ -231,7 +246,7 @@ def main():
                             f"🛡️ Portfolio Risk Exceeded for {pair_name}: Current Open Risk ({current_portfolio_risk:.2f}%) + "
                             f"New Trade Risk ({signal_risk:.2f}%) > Max Limit ({MAX_TOTAL_PORTFOLIO_RISK_PCT:.2f}%). Execution blocked."
                         )
-                        time.sleep(2.0)
+                        time.sleep(20.0)
                         continue
 
                     SYMBOL_COOLDOWN[formatted_symbol] = time.time()
@@ -269,7 +284,7 @@ def main():
                 else:
                     logging.info(f"Status for {symbol}: HOLD / No signal matched")
 
-                time.sleep(2.0)
+                time.sleep(20.0)
 
             active_trades = fetch_active_trades()
             if not active_trades.empty:
@@ -287,7 +302,7 @@ def main():
                                 tema_period = int(cfg.get("tema_period", 200))
                                 fallback_df['200_TEMA'] = calc_tema(fallback_df['close'], tema_period)
                                 candle_cache[cache_key] = fallback_df.iloc[-1]
-                            time.sleep(1.0)
+                            time.sleep(10.0)
                         except Exception as fe:
                             logging.error(f"Failed fallback candle fetch for {trade_pair_raw}: {fe}")
 

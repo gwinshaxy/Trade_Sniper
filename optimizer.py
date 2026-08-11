@@ -332,8 +332,8 @@ def run_optimization(symbol="BTCUSDT"):
     data_df = fetch_historical_candles(symbol=symbol, limit=3000)
     GLOBAL_DATA = data_df
 
-    POP_SIZE = 50
-    NGEN = 30
+    POP_SIZE = 20
+    NGEN = 10
     CXPB, MUTPB = 0.6, 0.35
 
     logging.info(f"Starting Multi-Parameter DEAP GA Optimization on {symbol} (Pop: {POP_SIZE}, Gen: {NGEN})")
@@ -417,4 +417,4 @@ def start_reoptimization_loop(symbols=["BTCUSDT", "ETHUSDT", "SOLUSDT"], interva
         time.sleep(sleep_seconds)
 
 if __name__ == "__main__":
-    start_reoptimization_loop(symbols=["BTCUSDT", "ETHUSDT", "SOLUSDT"], interval_hours=24)
+    start_reoptimization_loop(symbols=["BNBUSDT", "ETHUSDT", "SOLUSDT"], interval_hours=24)

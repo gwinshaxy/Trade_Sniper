@@ -12,14 +12,24 @@ from app_manager import start_background_tasks
 start_background_tasks()
 
 # ==========================================
-# AUTHENTICATION GATE
+# AUTHENTICATION GATE & CONFIGURATION
 # ==========================================
 st.set_page_config(page_title="Forex & Crypto Trading Terminal", layout="wide")
 load_dotenv()
 
+# ==========================================
+# PROXY & NETWORK CONFIGURATION ROUTING
+# ==========================================
+HTTP_PROXY = os.getenv("HTTP_PROXY") or os.getenv("PROXY_URL")
+HTTPS_PROXY = os.getenv("HTTPS_PROXY") or os.getenv("PROXY_URL")
+
+if HTTP_PROXY or HTTPS_PROXY:
+    os.environ["HTTP_PROXY"] = HTTP_PROXY or HTTPS_PROXY
+    os.environ["HTTPS_PROXY"] = HTTPS_PROXY or HTTP_PROXY
+    os.environ["NO_PROXY"] = "localhost,127.0.0.1,.supabase.co"
+
 def check_password():
     """Returns `True` if the user entered the correct password."""
-    # Retrieve password from environment variable (default to 'securepass123' if not set)
     expected_password = os.getenv("DASHBOARD_PASSWORD", "securepass123")
 
     if "password_correct" not in st.session_state:
@@ -28,7 +38,6 @@ def check_password():
     if st.session_state["password_correct"]:
         return True
 
-    # Show inputs for password
     st.markdown("## 🔒 Restricted Access")
     st.markdown("Please enter the password to access the Trading Terminal.")
     
@@ -61,7 +70,7 @@ ensure_schema_updated()
 # UNIFIED SYMBOL CONFIGURATION
 # ==========================================
 symbols_env = os.getenv("SYMBOLS") or os.getenv(
-    "SYMBOL", "BTC/USDT,ETH/USDT,BNB/USDT,ADA/USDT,SOL/USDT"
+    "SYMBOL", "ETHUSDT,BNBUSDT,SOLUSDT"
 )
 env_symbols = [s.strip().upper() for s in symbols_env.split(",")]
 env_symbols = [
@@ -80,7 +89,7 @@ db_pairs = (
     df_all_trades['pair'].unique().tolist() if not df_all_trades.empty else []
 )
 available_pairs = list(dict.fromkeys(env_symbols + db_pairs))
-for default_pair in ["BTC/USDT", "ETH/USDT", "EUR/USD", "GBP/USD", "XRP/USDT"]:
+for default_pair in ["ETHUSDT","BNBUSDT","SOLUSDT"]:
     if default_pair not in available_pairs:
         available_pairs.append(default_pair)
 
@@ -101,7 +110,6 @@ else:
 st.sidebar.markdown("---")
 st.sidebar.subheader("🎯 Strategy Parameters (Harmonized)")
 
-# Asset selection for loading DEAP parameters
 config_target_pair = st.sidebar.selectbox("Load Dynamic Config For:", available_pairs, index=0)
 dyn_cfg = strategy.load_symbol_config(config_target_pair)
 
@@ -379,7 +387,6 @@ if df_ohlc is not None and not df_ohlc.empty:
     chart.horizontal_line(val, color="green", text=f"VAL: {val:.2f}")
     chart.horizontal_line(poc, color="red", text=f"POC: {poc:.2f}")
 
-    # Overlay Volume Profile Gap Levels
     if overlay_gaps and detected_gaps:
         for gap_price in detected_gaps:
             chart.horizontal_line(

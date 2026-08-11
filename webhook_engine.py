@@ -53,7 +53,7 @@ def settle_trade(payload: SettlementPayload):
                 "message": f"Trade {trade_id} is already closed.",
             }
 
-        default_balance = float(os.getenv("ACCOUNT_BALANCE", 10000.0))
+        default_balance = float(os.getenv("ACCOUNT_BALANCE", 100.0))
         balance = float(account_balance) if account_balance else default_balance
 
         pnl_usd, pnl_pct, outcome = calculate_pnl(

@@ -8,7 +8,18 @@ import numpy as np
 from google import genai
 
 from dotenv import load_dotenv
-load_dotenv()  # Loads DATABASE_URL from .env file automatically
+load_dotenv()  # Loads environment variables automatically
+
+# ==========================================
+# PROXY & NETWORK CONFIGURATION ROUTING
+# ==========================================
+HTTP_PROXY = os.getenv("HTTP_PROXY") or os.getenv("PROXY_URL")
+HTTPS_PROXY = os.getenv("HTTPS_PROXY") or os.getenv("PROXY_URL")
+
+if HTTP_PROXY or HTTPS_PROXY:
+    os.environ["HTTP_PROXY"] = HTTP_PROXY or HTTPS_PROXY
+    os.environ["HTTPS_PROXY"] = HTTPS_PROXY or HTTP_PROXY
+    os.environ["NO_PROXY"] = "localhost,127.0.0.1,.supabase.co"
 
 # Database import for Supabase integration
 try:
@@ -43,7 +54,7 @@ def load_optimized_config() -> dict:
 def load_symbol_config(symbol: str) -> dict:
     """
     Fetches asset-specific optimized parameters dynamically from Supabase database
-    based on the exact trading symbol (e.g. 'BTCUSDT', 'ETHUSDT', 'SOLUSDT').
+    based on the exact trading symbol (e.g. 'BNBUSDT', 'ETHUSDT', 'SOLUSDT').
     Falls back to strategy_config.json or static defaults if missing.
     """
     clean_symbol = symbol.replace("/", "").replace("-", "").upper()
@@ -115,7 +126,7 @@ def fetch_fundamental_sentiment(news_headlines: list) -> float:
     except Exception:
         return 0.0
 
-def fetch_klines(symbol: str = "BTCUSDT", interval: str = "1h", limit: int = 1000) -> pd.DataFrame:
+def fetch_klines(symbol: str = "BNBUSDT", interval: str = "1h", limit: int = 1000) -> pd.DataFrame:
     clean_symbol = symbol.replace("/", "").replace("usdt", "").replace("USDT", "").upper()
     if not clean_symbol:
         clean_symbol = "BITCOIN"
