@@ -13,15 +13,12 @@ load_dotenv()
 # ==========================================
 # PROXY & NETWORK CONFIGURATION ROUTING
 # ==========================================
-# If a proxy URL is provided in your environment variables, inject it globally 
-# so that requests, yfinance, and underlying network libraries route traffic automatically.
 HTTP_PROXY = os.getenv("HTTP_PROXY") or os.getenv("PROXY_URL")
 HTTPS_PROXY = os.getenv("HTTPS_PROXY") or os.getenv("PROXY_URL")
 
 if HTTP_PROXY or HTTPS_PROXY:
     os.environ["HTTP_PROXY"] = HTTP_PROXY or HTTPS_PROXY
     os.environ["HTTPS_PROXY"] = HTTPS_PROXY or HTTP_PROXY
-    # Bypass local addresses if needed
     os.environ["NO_PROXY"] = "localhost,127.0.0.1,.supabase.co"
 
 from strategy import fetch_klines, calc_tema, evaluate_signals, load_symbol_config
@@ -41,17 +38,13 @@ SYMBOLS = [s.strip().upper() for s in symbols_env.split(",")]
 TIMEFRAME = os.getenv("TIMEFRAME", "1h")
 POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", 600))
 DEFAULT_ACCOUNT_BALANCE = float(os.getenv("ACCOUNT_BALANCE", 100.0))
-
-# Maximum allowed total combined account risk across all active trades (%)
 MAX_TOTAL_PORTFOLIO_RISK_PCT = float(os.getenv("MAX_TOTAL_PORTFOLIO_RISK_PCT", 3.0))
 
 SYMBOL_COOLDOWN = {}
 COOLDOWN_PERIOD_SECONDS = int(os.getenv("COOLDOWN_PERIOD_SECONDS", 1800))
 
 def run_all_optimizations():
-    """
-    Executes the DEAP Genetic Optimizer sequentially across all configured symbols.
-    """
+    """Executes the DEAP Genetic Optimizer sequentially across all configured symbols."""
     logging.info("🧬 Starting weekly scheduled DEAP Genetic Optimization for all symbols...")
     for sym in SYMBOLS:
         clean_sym = sym.replace("/", "").upper()
@@ -62,10 +55,7 @@ def run_all_optimizations():
             logging.error(f"Failed background optimization for {clean_sym}: {e}")
 
 def start_background_optimizer():
-    """
-    Schedules the DEAP Genetic Optimizer to run across all symbols every Sunday at 00:00 UTC 
-    in the background using APScheduler.
-    """
+    """Schedules the DEAP Genetic Optimizer to run every Sunday at 00:00 UTC."""
     scheduler = BackgroundScheduler(daemon=True)
     scheduler.add_job(
         func=run_all_optimizations,
@@ -77,13 +67,11 @@ def start_background_optimizer():
         replace_existing=True
     )
     scheduler.start()
-    logging.info("⏰ Background DEAP Optimizer Scheduler started (Runs every Sunday @ 00:00 UTC for all assets).")
+    logging.info("⏰ Background DEAP Optimizer Scheduler started.")
     return scheduler
 
 def get_total_open_risk_pct() -> float:
-    """
-    Calculates the aggregate percentage risk across all active/pending trades in the database.
-    """
+    """Calculates aggregate percentage risk across all active trades."""
     try:
         conn = get_db_connection()
         with conn.cursor() as cur:
@@ -183,13 +171,11 @@ def insert_new_signal(pair, direction, entry, sl, tp, rr, balance, risk_pct, siz
         return None
 
 def main():
-    proxy_status = f"Active ({HTTP_PROXY or HTTPS_PROXY})" if (HTTP_PROXY or HTTPS_PROXY) else "Direct Connection (No Proxy)"
-    logging.info(f"⚡ Starting Multi-Asset Trading Bot Background Engine | Proxy: {proxy_status} | Max Portfolio Risk Cap: {MAX_TOTAL_PORTFOLIO_RISK_PCT}%...")
+    proxy_status = f"Active ({HTTP_PROXY or HTTPS_PROXY})" if (HTTP_PROXY or HTTPS_PROXY) else "Direct Connection"
+    logging.info(f"⚡ Starting Multi-Asset Trading Bot Engine | Proxy: {proxy_status}")
     ensure_schema_updated()
     
-    # Initialize background cron optimizer
     scheduler = start_background_optimizer()
-    
     trade_manager = DynamicTradeManager()
 
     try:
@@ -201,51 +187,33 @@ def main():
                 formatted_symbol = symbol if "/" in symbol else f"{symbol[:-4]}/{symbol[-4:]}"
 
                 if has_active_trade_for_symbol(formatted_symbol):
-                    logging.info(f"🛡️ Skipping {formatted_symbol}: Active trade already open or pending in database.")
-<<<<<<< HEAD
+                    logging.info(f"🛡️ Skipping {formatted_symbol}: Active trade already open.")
                     time.sleep(20.0)
-=======
-                    time.sleep(10.0)
->>>>>>> 123e5b182a4c4d4316c4c03193d8101790ab8501
                     continue
 
                 last_signal_time = SYMBOL_COOLDOWN.get(formatted_symbol, 0)
                 if time.time() - last_signal_time < COOLDOWN_PERIOD_SECONDS:
-                    remaining_sec = int(COOLDOWN_PERIOD_SECONDS - (time.time() - last_signal_time))
-                    logging.info(f"⏳ Skipping {formatted_symbol}: In cooldown for another {remaining_sec}s.")
-<<<<<<< HEAD
+                    logging.info(f"⏳ Skipping {formatted_symbol}: In cooldown.")
                     time.sleep(20.0)
-=======
-                    time.sleep(10.0)
->>>>>>> 123e5b182a4c4d4316c4c03193d8101790ab8501
                     continue
 
                 try:
                     df = fetch_klines(symbol=symbol, interval=TIMEFRAME, limit=500)
                     if df.empty:
-                        logging.warning(f"Received empty dataframe for {symbol}. Skipping asset...")
-<<<<<<< HEAD
+                        logging.warning(f"Received empty dataframe for {symbol}. Skipping...")
                         time.sleep(20.0)
                         continue
                 except Exception as e:
-                    logging.error(f"Network error fetching klines for {symbol}: {e}. Skipping asset...")
+                    logging.error(f"Network error fetching klines for {symbol}: {e}. Skipping...")
                     time.sleep(20.0)
-=======
-                        time.sleep(10.0)
-                        continue
-                except Exception as e:
-                    logging.error(f"Network error fetching klines for {symbol}: {e}. Skipping asset...")
-                    time.sleep(10.0)
->>>>>>> 123e5b182a4c4d4316c4c03193d8101790ab8501
                     continue
 
-                # Load asset-specific config to get optimized tema_period
                 cfg = load_symbol_config(formatted_symbol)
                 tema_period = int(cfg.get("tema_period", 200))
 
                 df['200_TEMA'] = calc_tema(df['close'], tema_period)
                 latest_candle = df.iloc[-1]
-                logging.info(f"📊 {symbol} Latest Candle Close: ${latest_candle['close']:,.2f} (TEMA-{tema_period}: ${latest_candle['200_TEMA']:,.2f})")
+                logging.info(f"📊 {symbol} Close: ${latest_candle['close']:,.2f} (TEMA: ${latest_candle['200_TEMA']:,.2f})")
 
                 candle_cache[symbol.upper()] = latest_candle
 
@@ -255,18 +223,10 @@ def main():
                     pair_name = signal.get("pair", formatted_symbol)
                     signal_risk = float(signal.get("risk_pct", 1.0))
                     
-                    # Portfolio Risk Exposure Guardrail
                     current_portfolio_risk = get_total_open_risk_pct()
                     if (current_portfolio_risk + signal_risk) > MAX_TOTAL_PORTFOLIO_RISK_PCT:
-                        logging.warning(
-                            f"🛡️ Portfolio Risk Exceeded for {pair_name}: Current Open Risk ({current_portfolio_risk:.2f}%) + "
-                            f"New Trade Risk ({signal_risk:.2f}%) > Max Limit ({MAX_TOTAL_PORTFOLIO_RISK_PCT:.2f}%). Execution blocked."
-                        )
-<<<<<<< HEAD
+                        logging.warning(f"🛡️ Portfolio Risk Exceeded for {pair_name}. Execution blocked.")
                         time.sleep(20.0)
-=======
-                        time.sleep(10.0)
->>>>>>> 123e5b182a4c4d4316c4c03193d8101790ab8501
                         continue
 
                     SYMBOL_COOLDOWN[formatted_symbol] = time.time()
@@ -283,32 +243,18 @@ def main():
                         size=signal["size"]
                     )
                     if trade_id:
-                        alert_action = "BUY (LONG)" if signal["direction"] == "LONG" else "SELL (SHORT)"
-                        alert_emoji = "🚀" if signal["direction"] == "LONG" else "📉"
-
                         alert_txt = (
-                            f"<b>{alert_emoji} AUTOMATED {alert_action} SIGNAL EXECUTED</b>\n"
+                            f"<b>🚀 AUTOMATED SIGNAL EXECUTED</b>\n"
                             f"<b>Trade ID:</b> <code>#{trade_id}</code>\n"
                             f"<b>Pair:</b> <code>{pair_name}</code>\n"
                             f"<b>Direction:</b> <code>{signal['direction']}</code>\n"
-                            f"<b>Entry:</b> ${signal['entry']:,.2f}\n"
-                            f"<b>SL:</b> ${signal['sl']:,.2f}\n"
-                            f"<b>TP:</b> ${signal['tp']:,.2f}\n"
-                            f"<b>R:R:</b> 1:{signal['rr']}\n"
-                            f"<b>Risk:</b> {signal_risk}%\n"
-                            f"<b>Total Portfolio Risk:</b> {current_portfolio_risk + signal_risk:.2f}% / {MAX_TOTAL_PORTFOLIO_RISK_PCT}%\n"
-                            f"<b>Size:</b> {signal['size']} units"
+                            f"<b>Entry:</b> ${signal['entry']:,.2f}"
                         )
-                        logging.info(f"New Signal Executed: Trade #{trade_id} ({pair_name} - {signal['direction']})")
+                        logging.info(f"New Signal Executed: Trade #{trade_id} ({pair_name})")
                         send_telegram_notification(alert_txt)
                 else:
-                    logging.info(f"Status for {symbol}: HOLD / No signal matched")
-
-<<<<<<< HEAD
+                    logging.info(f"Status for {symbol}: HOLD")
                 time.sleep(20.0)
-=======
-                time.sleep(10.0)
->>>>>>> 123e5b182a4c4d4316c4c03193d8101790ab8501
 
             active_trades = fetch_active_trades()
             if not active_trades.empty:
@@ -318,7 +264,6 @@ def main():
                     
                     if cache_key not in candle_cache:
                         try:
-                            logging.info(f"🛡️ Fallback fetch: Retrieving missing candle data for active trade pair {trade_pair_raw}...")
                             clean_symbol = trade_pair_raw.replace("/", "")
                             fallback_df = fetch_klines(symbol=clean_symbol, interval=TIMEFRAME, limit=1000)
                             if not fallback_df.empty:
@@ -326,19 +271,12 @@ def main():
                                 tema_period = int(cfg.get("tema_period", 200))
                                 fallback_df['200_TEMA'] = calc_tema(fallback_df['close'], tema_period)
                                 candle_cache[cache_key] = fallback_df.iloc[-1]
-<<<<<<< HEAD
-                            time.sleep(10.0)
-=======
-                            time.sleep(5.0)
->>>>>>> 123e5b182a4c4d4316c4c03193d8101790ab8501
+                            time.sleep(20.0)
                         except Exception as fe:
                             logging.error(f"Failed fallback candle fetch for {trade_pair_raw}: {fe}")
 
                 executed_trades = active_trades[active_trades['status'] == 'EXECUTED']
-                
                 if not executed_trades.empty:
-                    logging.info(f"📈 Monitoring {len(executed_trades)} active open trade(s)...")
-
                     for _, trade in executed_trades.iterrows():
                         trade_pair = str(trade['pair']).replace("/", "").upper()
                         matched_candle = candle_cache.get(trade_pair)
@@ -346,7 +284,6 @@ def main():
                         if matched_candle is not None:
                             curr_low = float(matched_candle['low'])
                             curr_high = float(matched_candle['high'])
-                            
                             sl = float(trade['stop_loss'])
                             tp = float(trade['take_profit'])
                             direction = trade['direction']
@@ -361,37 +298,13 @@ def main():
                             if hit_sl or hit_tp:
                                 exit_price = sl if hit_sl else tp
                                 pnl_usd, pnl_pct, outcome = calculate_pnl(direction, entry, exit_price, size, balance)
-
-                                close_trade_in_db(
-                                    trade_id=trade_id,
-                                    exit_price=exit_price,
-                                    pnl_usd=pnl_usd,
-                                    pnl_pct=pnl_pct,
-                                    outcome=outcome
-                                )
-
-                                exit_label = "STOP LOSS (SL)" if hit_sl else "TAKE PROFIT (TP)"
-                                exit_emoji = "🔴" if hit_sl else "🟢"
-                                
-                                alert_msg = (
-                                    f"<b>{exit_emoji} TRADE #{trade_id} CLOSED BY {exit_label}</b>\n"
-                                    f"<b>Pair:</b> <code>{trade['pair']}</code>\n"
-                                    f"<b>Direction:</b> <code>{direction}</code>\n"
-                                    f"<b>Exit Price:</b> ${exit_price:,.2f}\n"
-                                    f"<b>PnL ($):</b> ${pnl_usd:,.2f}\n"
-                                    f"<b>PnL (%):</b> {pnl_pct:.2f}%"
-                                )
-                                logging.info(f"🔒 Trade #{trade_id} closed by {exit_label} at price {exit_price}.")
-                                send_telegram_notification(alert_msg)
+                                close_trade_in_db(trade_id, exit_price, pnl_usd, pnl_pct, outcome)
+                                exit_label = "SL" if hit_sl else "TP"
+                                send_telegram_notification(f"<b>🔒 TRADE #{trade_id} CLOSED BY {exit_label}</b>")
                             else:
                                 res = trade_manager.process_trade(trade, matched_candle)
                                 if res.get("action") == "UPDATE_SL":
-                                    update_trade_sl_and_state(
-                                        trade_id=res["trade_id"],
-                                        new_sl=res["new_sl"],
-                                        new_state=res["new_state"]
-                                    )
-                                    logging.info(res["msg"])
+                                    update_trade_sl_and_state(res["trade_id"], res["new_sl"], res["new_state"])
                                     send_telegram_notification(f"<b>⚙️ RISK MANAGER UPDATE</b>\n{res['msg']}")
 
             time.sleep(POLL_INTERVAL_SECONDS)
