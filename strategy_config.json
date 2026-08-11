@@ -1,0 +1,8 @@
+{
+  "tema_period": 200,
+  "rsi_period": 14,
+  "zone_tolerance": 0.015,
+  "min_sentiment": 0.0,
+  "risk_pct": 1.0,
+  "min_rr": 2.0
+}
