@@ -61,7 +61,7 @@ ensure_schema_updated()
 # UNIFIED SYMBOL CONFIGURATION
 # ==========================================
 symbols_env = os.getenv("SYMBOLS") or os.getenv(
-    "SYMBOL", "BTC/USDT,ETH/USDT,BNB/USDT,ADA/USDT,SOL/USDT"
+    "SYMBOL", "ETH/USDT,BNB/USDT,SOL/USDT"
 )
 env_symbols = [s.strip().upper() for s in symbols_env.split(",")]
 env_symbols = [
@@ -80,7 +80,7 @@ db_pairs = (
     df_all_trades['pair'].unique().tolist() if not df_all_trades.empty else []
 )
 available_pairs = list(dict.fromkeys(env_symbols + db_pairs))
-for default_pair in ["BTC/USDT", "ETH/USDT", "EUR/USD", "GBP/USD", "XRP/USDT"]:
+for default_pair in ["ETH/USDT", "BNB/USDT", "SOL/USDT"]:
     if default_pair not in available_pairs:
         available_pairs.append(default_pair)
 
