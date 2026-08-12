@@ -111,3 +111,5 @@ winloop==0.6.3
 yarl==1.24.2
 yfinance==1.5.2
 zlib-ng==1.0.0
+sqlalchemy>=2.0.36
+
