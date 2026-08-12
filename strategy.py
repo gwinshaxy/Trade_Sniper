@@ -2,6 +2,7 @@ import json
 import logging
 import urllib.request
 import os
+import re
 import pandas as pd
 import numpy as np
 from google import genai
@@ -82,21 +83,57 @@ def get_ai_sentiment_score(text: str) -> float:
         client = genai.Client(api_key=api_key)
         prompt = f"Analyze the financial sentiment of the following text and return ONLY a single float number between 0.0 (bearish) and 1.0 (bullish):\n\n'{text}'"
         response = client.models.generate_content(model='gemini-2.5-flash', contents=prompt)
-        score = float(response.text.strip().replace("`", ""))
-        return max(0.0, min(1.0, score))
+        
+        match = re.search(r"0\.\d+|1\.0|0|1", response.text.strip())
+        if match:
+            return max(0.0, min(1.0, float(match.group(0))))
+        return 0.5
     except Exception:
         return 0.5
 
 
+def fetch_cryptocompare_klines(symbol: str = "ETH/USDT", limit: int = 1000) -> pd.DataFrame:
+    """Fallback: CryptoCompare Historical Hourly Data API."""
+    try:
+        clean = symbol.replace("/", "").upper()
+        fsym = clean[:-4] if clean.endswith("USDT") else clean[:-3]
+        tsym = "USDT" if clean.endswith("USDT") else "USD"
+
+        url = f"https://min-api.cryptocompare.com/data/v2/histohour?fsym={fsym}&tsym={tsym}&limit={min(limit, 2000)}"
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            data = json.loads(resp.read().decode('utf-8'))
+
+        if data.get("Response") == "Success" and "Data" in data and "Data" in data["Data"]:
+            candles = data["Data"]["Data"]
+            df = pd.DataFrame(candles)
+            df.rename(columns={"time": "open_time", "volumeto": "volume"}, inplace=True)
+            df['time'] = pd.to_datetime(df['open_time'], unit='s').dt.strftime('%Y-%m-%d %H:%M:%S')
+            
+            for col in ['open', 'high', 'low', 'close', 'volume']:
+                df[col] = df[col].astype(float)
+                
+            return df[['time', 'open', 'high', 'low', 'close', 'volume']]
+    except Exception as e:
+        logging.debug(f"[CryptoCompare Fallback Error]: {e}")
+        
+    return pd.DataFrame()
+
+
 def fetch_klines(symbol: str = "BNB/USDT", interval: str = "1h", limit: int = 1000) -> pd.DataFrame:
-    """Fetches candlestick OHLC data with multi-endpoint fallback (Binance, Binance US, Bybit) to bypass IP geoblocks."""
     norm_sym = normalize_symbol(symbol)
     binance_symbol = norm_sym.replace("/", "")
     
+    # Bybit Interval Mapping
+    bybit_interval_map = {"1m": "1", "5m": "5", "15m": "15", "1h": "60", "4h": "240", "1d": "D"}
+    bybit_interval = bybit_interval_map.get(interval, "60")
+
+    # 1. Primary & Exchange Endpoints
     urls = [
         f"https://api.binance.com/api/v3/klines?symbol={binance_symbol}&interval={interval}&limit={min(limit, 1000)}",
         f"https://api.binance.us/api/v3/klines?symbol={binance_symbol}&interval={interval}&limit={min(limit, 1000)}",
-        f"https://api.bybit.com/v5/market/kline?category=spot&symbol={binance_symbol}&interval=60&limit={min(limit, 1000)}"
+        f"https://api.bybit.com/v5/market/kline?category=spot&symbol={binance_symbol}&interval={bybit_interval}&limit={min(limit, 1000)}"
     ]
 
     for url in urls:
@@ -105,7 +142,7 @@ def fetch_klines(symbol: str = "BNB/USDT", interval: str = "1h", limit: int = 10
             with urllib.request.urlopen(req, timeout=6) as resp:
                 data = json.loads(resp.read().decode('utf-8'))
             
-            # Standard Binance/Binance.US structure
+            # Binance / Binance US structure
             if isinstance(data, list) and len(data) > 0:
                 df = pd.DataFrame(data, columns=['open_time', 'open', 'high', 'low', 'close', 'volume', 'close_time', 'qav', 'not', 'tbba', 'tbqa', 'ignore'])
                 df['time'] = pd.to_datetime(df['open_time'], unit='ms').dt.strftime('%Y-%m-%d %H:%M:%S')
@@ -113,7 +150,7 @@ def fetch_klines(symbol: str = "BNB/USDT", interval: str = "1h", limit: int = 10
                     df[col] = df[col].astype(float)
                 return df[['time', 'open', 'high', 'low', 'close', 'volume']]
             
-            # Bybit response structure
+            # Bybit structure
             elif isinstance(data, dict) and 'result' in data and 'list' in data['result']:
                 raw_list = data['result']['list']
                 df = pd.DataFrame(raw_list, columns=['open_time', 'open', 'high', 'low', 'close', 'volume', 'turnover'])
@@ -124,10 +161,16 @@ def fetch_klines(symbol: str = "BNB/USDT", interval: str = "1h", limit: int = 10
                 return df[['time', 'open', 'high', 'low', 'close', 'volume']]
 
         except Exception as err:
-            logging.warning(f"[fetch_klines] Endpoint failed ({url}): {err}")
+            logging.debug(f"[fetch_klines] Endpoint bypassed ({url}): {err}")
             continue
 
-    logging.error(f"[fetch_klines] All data endpoints failed for symbol: {symbol}")
+    # 2. Third-Party Fallback (CryptoCompare)
+    df_fallback = fetch_cryptocompare_klines(symbol=norm_sym, limit=limit)
+    if not df_fallback.empty:
+        logging.info(f"[fetch_klines] Successfully retrieved fallback data from CryptoCompare for {norm_sym}")
+        return df_fallback
+
+    logging.error(f"[fetch_klines] All primary and third-party data endpoints failed for symbol: {symbol}")
     return pd.DataFrame()
 
 
