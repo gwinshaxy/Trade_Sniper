@@ -9,12 +9,15 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+
 try:
     import psycopg2
     from psycopg2.extras import RealDictCursor
     PSYCOPG2_AVAILABLE = True
 except ImportError:
     PSYCOPG2_AVAILABLE = False
+
 
 def normalize_symbol(symbol: str) -> str:
     if not symbol:
@@ -26,32 +29,50 @@ def normalize_symbol(symbol: str) -> str:
         return f"{s[:-4]}/{s[-4:]}"
     return s
 
+
 def load_symbol_config(symbol: str) -> dict:
+    """Loads optimized strategy parameters from PostgreSQL database stripping slashes for lookup."""
     clean_symbol = normalize_symbol(symbol).replace("/", "").upper()
     db_url = os.getenv("DATABASE_URL")
+    
     if db_url:
-        db_url = db_url.strip('"').strip("'")
+        db_url = db_url.strip('"').strip("'").strip()
     
     if PSYCOPG2_AVAILABLE and db_url:
         try:
             conn = psycopg2.connect(db_url)
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 cur.execute(
-                    "SELECT tema_period, rsi_period, rsi_thresh, zone_tolerance, min_sentiment, risk_pct, min_rr, vp_detection_pct, use_rsi_filter, use_candlestick_confirm FROM strategy_parameters WHERE REPLACE(REPLACE(symbol, '\"', ''), '''', '') = %s;", 
+                    """
+                    SELECT * 
+                    FROM strategy_parameters 
+                    WHERE UPPER(TRIM(REPLACE(REPLACE(symbol, '"', ''), '''', ''))) = %s
+                    ORDER BY updated_at DESC LIMIT 1;
+                    """, 
                     (clean_symbol,)
                 )
                 row = cur.fetchone()
                 conn.close()
                 if row:
-                    return dict(row)
-        except Exception:
-            pass
+                    config = dict(row)
+                    config.setdefault("rsi_thresh", 42.0)
+                    config.setdefault("use_rsi_filter", True)
+                    config.setdefault("use_candlestick_confirm", True)
+                    config.setdefault("max_sl_pct", 0.02)
+                    logging.info(f"[load_symbol_config] Loaded dynamic DEAP params for {clean_symbol}")
+                    return config
+                else:
+                    logging.warning(f"[load_symbol_config] Parameter row missing for {clean_symbol}, using defaults.")
+        except Exception as e:
+            logging.error(f"[load_symbol_config] DB query failed for {clean_symbol}: {e}")
 
     return {
         "tema_period": 200, "rsi_period": 14, "rsi_thresh": 42.0,
         "zone_tolerance": 0.0075, "min_sentiment": 0.0, "risk_pct": 1.0,
-        "min_rr": 2.0, "vp_detection_pct": 0.07, "use_rsi_filter": True, "use_candlestick_confirm": True
+        "min_rr": 2.0, "vp_detection_pct": 0.07, "use_rsi_filter": True,
+        "use_candlestick_confirm": True, "max_sl_pct": 0.02
     }
+
 
 def get_ai_sentiment_score(text: str) -> float:
     api_key = os.getenv("GEMINI_API_KEY")
@@ -66,33 +87,60 @@ def get_ai_sentiment_score(text: str) -> float:
     except Exception:
         return 0.5
 
+
 def fetch_klines(symbol: str = "BNB/USDT", interval: str = "1h", limit: int = 1000) -> pd.DataFrame:
+    """Fetches candlestick OHLC data with multi-endpoint fallback (Binance, Binance US, Bybit) to bypass IP geoblocks."""
     norm_sym = normalize_symbol(symbol)
     binance_symbol = norm_sym.replace("/", "")
-    binance_url = f"https://api.binance.com/api/v3/klines?symbol={binance_symbol}&interval={interval}&limit={min(limit, 1000)}"
     
-    try:
-        req = urllib.request.Request(binance_url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=8) as resp:
-            data = json.loads(resp.read().decode('utf-8'))
-        if data and isinstance(data, list):
-            df = pd.DataFrame(data, columns=['open_time', 'open', 'high', 'low', 'close', 'volume', 'close_time', 'qav', 'not', 'tbba', 'tbqa', 'ignore'])
-            df['time'] = pd.to_datetime(df['open_time'], unit='ms').dt.strftime('%Y-%m-%d %H:%M:%S')
-            for col in ['open', 'high', 'low', 'close', 'volume']:
-                df[col] = df[col].astype(float)
-            return df[['time', 'open', 'high', 'low', 'close', 'volume']]
-    except Exception:
-        pass
+    urls = [
+        f"https://api.binance.com/api/v3/klines?symbol={binance_symbol}&interval={interval}&limit={min(limit, 1000)}",
+        f"https://api.binance.us/api/v3/klines?symbol={binance_symbol}&interval={interval}&limit={min(limit, 1000)}",
+        f"https://api.bybit.com/v5/market/kline?category=spot&symbol={binance_symbol}&interval=60&limit={min(limit, 1000)}"
+    ]
+
+    for url in urls:
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=6) as resp:
+                data = json.loads(resp.read().decode('utf-8'))
+            
+            # Standard Binance/Binance.US structure
+            if isinstance(data, list) and len(data) > 0:
+                df = pd.DataFrame(data, columns=['open_time', 'open', 'high', 'low', 'close', 'volume', 'close_time', 'qav', 'not', 'tbba', 'tbqa', 'ignore'])
+                df['time'] = pd.to_datetime(df['open_time'], unit='ms').dt.strftime('%Y-%m-%d %H:%M:%S')
+                for col in ['open', 'high', 'low', 'close', 'volume']:
+                    df[col] = df[col].astype(float)
+                return df[['time', 'open', 'high', 'low', 'close', 'volume']]
+            
+            # Bybit response structure
+            elif isinstance(data, dict) and 'result' in data and 'list' in data['result']:
+                raw_list = data['result']['list']
+                df = pd.DataFrame(raw_list, columns=['open_time', 'open', 'high', 'low', 'close', 'volume', 'turnover'])
+                df = df.iloc[::-1].reset_index(drop=True)
+                df['time'] = pd.to_datetime(df['open_time'].astype(int), unit='ms').dt.strftime('%Y-%m-%d %H:%M:%S')
+                for col in ['open', 'high', 'low', 'close', 'volume']:
+                    df[col] = df[col].astype(float)
+                return df[['time', 'open', 'high', 'low', 'close', 'volume']]
+
+        except Exception as err:
+            logging.warning(f"[fetch_klines] Endpoint failed ({url}): {err}")
+            continue
+
+    logging.error(f"[fetch_klines] All data endpoints failed for symbol: {symbol}")
     return pd.DataFrame()
+
 
 def calc_ema(series: pd.Series, period: int) -> pd.Series:
     return series.ewm(span=period, adjust=False).mean()
+
 
 def calc_tema(series: pd.Series, period: int = 200) -> pd.Series:
     ema1 = calc_ema(series, period)
     ema2 = calc_ema(ema1, period)
     ema3 = calc_ema(ema2, period)
     return (3 * ema1) - (3 * ema2) + ema3
+
 
 def calc_rsi(series: pd.Series, period: int = 14) -> pd.Series:
     delta = series.diff()
@@ -101,51 +149,178 @@ def calc_rsi(series: pd.Series, period: int = 14) -> pd.Series:
     rs = gain / (loss.replace(0, np.nan))
     return (100 - (100 / (1 + rs))).fillna(50)
 
-def calculate_volume_profile_gaps(df: pd.DataFrame, num_bins: int = 100, detection_pct: float = 0.07) -> list:
-    if df.empty or 'volume' not in df.columns:
-        return []
-    pLST, pHST = df['low'].min(), df['high'].max()
-    if pLST == pHST:
-        return []
-    pSTP = (pHST - pLST) / num_bins
-    vD_vt = np.zeros(num_bins)
-    for _, row in df.iterrows():
-        sSI = max(int(np.floor((row['low'] - pLST) / pSTP)), 0)
-        eSI = min(int(np.floor((row['high'] - pLST) / pSTP)), num_bins - 1)
-        for pLI in range(sSI, eSI + 1):
-            vD_vt[pLI] += row['volume'] / max(row['high'] - row['low'], 1e-10) * pSTP
-    return [float(round(pLST + (i + 0.5) * pSTP, 2)) for i in range(len(vD_vt)) if vD_vt[i] == 0]
 
-def compute_volume_profile(df: pd.DataFrame, num_bins: int = 70):
-    min_p, max_p = df['low'].min(), df['high'].max()
+def compute_volume_profile(
+    df: pd.DataFrame,
+    num_bins: int = 100,
+    lookback_bars: int = 600,
+    va_pct: float = 0.70,
+):
+    """Computes POC, VAH, and VAL aligned with TradingView's Fixed Range (600 bars, 70% Value Area)."""
+    if (
+        df.empty
+        or "volume" not in df.columns
+        or "high" not in df.columns
+        or "low" not in df.columns
+    ):
+        return np.nan, np.nan, np.nan
+
+    df_range = df.tail(lookback_bars).copy()
+    if df_range.empty:
+        return np.nan, np.nan, np.nan
+
+    min_p, max_p = float(df_range["low"].min()), float(df_range["high"].max())
+    if min_p >= max_p or np.isnan(min_p) or np.isnan(max_p):
+        return np.nan, np.nan, np.nan
+
     bin_size = (max_p - min_p) / num_bins
     if bin_size <= 0:
-        return 0, 0, 0
-    bins = np.zeros(num_bins)
-    for _, row in df.iterrows():
-        idx = min(int(((row['high'] + row['low'] + row['close']) / 3.0 - min_p) / bin_size), num_bins - 1)
-        bins[max(idx, 0)] += row['volume']
-    poc_idx = np.argmax(bins)
-    return min_p + (poc_idx + 0.5) * bin_size, min_p + (poc_idx + 1) * bin_size, min_p + poc_idx * bin_size
+        return np.nan, np.nan, np.nan
+
+    vol_profile = np.zeros(num_bins)
+
+    for _, row in df_range.iterrows():
+        low_val, high_val, vol = (
+            float(row["low"]),
+            float(row["high"]),
+            float(row["volume"]),
+        )
+        s_idx = max(int(np.floor((low_val - min_p) / bin_size)), 0)
+        e_idx = min(int(np.floor((high_val - min_p) / bin_size)), num_bins - 1)
+
+        num_spanned = e_idx - s_idx + 1
+        vol_per_bin = vol / num_spanned if num_spanned > 0 else vol
+
+        for idx in range(s_idx, e_idx + 1):
+            vol_profile[idx] += vol_per_bin
+
+    poc_idx = int(np.argmax(vol_profile))
+    poc = min_p + (poc_idx + 0.5) * bin_size
+
+    target_vol = np.sum(vol_profile) * va_pct
+    current_vol = vol_profile[poc_idx]
+    la_idx, lb_idx = poc_idx, poc_idx
+
+    max_iter = num_bins * 2
+    iter_count = 0
+
+    while current_vol < target_vol and iter_count < max_iter:
+        iter_count += 1
+        if lb_idx == 0 and la_idx == num_bins - 1:
+            break
+
+        up_vol = vol_profile[la_idx + 1] if la_idx < num_bins - 1 else 0.0
+        dn_vol = vol_profile[lb_idx - 1] if lb_idx > 0 else 0.0
+
+        if up_vol >= dn_vol:
+            current_vol += up_vol
+            la_idx += 1
+        else:
+            current_vol += dn_vol
+            lb_idx -= 1
+
+    vah = min_p + (la_idx + 1.0) * bin_size
+    val = min_p + (lb_idx + 0.0) * bin_size
+
+    return float(poc), float(vah), float(val)
+
+
+def calculate_volume_profile_gaps(df: pd.DataFrame, num_bins: int = 100, lookback_bars: int = 600, detection_pct: float = 0.07) -> list:
+    """Identifies Volume Profile Gaps (LVNs)."""
+    if df.empty or 'volume' not in df.columns or 'high' not in df.columns or 'low' not in df.columns:
+        return []
+
+    df_range = df.tail(lookback_bars).copy()
+    if df_range.empty:
+        return []
+
+    pLST, pHST = float(df_range['low'].min()), float(df_range['high'].max())
+    if pLST >= pHST or np.isnan(pLST) or np.isnan(pHST):
+        return []
+
+    bin_size = (pHST - pLST) / num_bins
+    if bin_size <= 0:
+        return []
+
+    vol_profile = np.zeros(num_bins)
+
+    for _, row in df_range.iterrows():
+        low_val, high_val, vol = float(row['low']), float(row['high']), float(row['volume'])
+        s_idx = max(int(np.floor((low_val - pLST) / bin_size)), 0)
+        e_idx = min(int(np.floor((high_val - pLST) / bin_size)), num_bins - 1)
+        
+        num_spanned = (e_idx - s_idx + 1)
+        vol_per_bin = vol / num_spanned if num_spanned > 0 else vol
+
+        for idx in range(s_idx, e_idx + 1):
+            vol_profile[idx] += vol_per_bin
+
+    max_vol = np.max(vol_profile)
+    if max_vol == 0:
+        return []
+
+    noN = max(1, int(num_bins * detection_pct))
+    padded_vt = np.pad(vol_profile, (noN, noN), mode='constant', constant_values=max_vol)
+
+    gap_prices = []
+
+    for vn in range(2 * noN, num_bins + 2 * noN):
+        uNth = True
+        for cVN in range(vn - 2 * noN, vn - noN):
+            if padded_vt[vn - noN] >= padded_vt[cVN]:
+                uNth = False
+                break
+
+        lNth = True
+        for cVN in range(vn - noN + 1, vn + 1):
+            if padded_vt[vn - noN] >= padded_vt[cVN]:
+                lNth = False
+                break
+
+        if uNth and lNth:
+            bin_idx = vn - 2 * noN
+            gap_price = float(round(pLST + (bin_idx + 0.5) * bin_size, 2))
+            if pLST <= gap_price <= pHST:
+                gap_prices.append(gap_price)
+
+    return list(dict.fromkeys(gap_prices))
+
 
 def evaluate_signals(df: pd.DataFrame, symbol: str = "ETH/USDT", account_balance: float = 10000.0, **kwargs) -> dict:
     config = load_symbol_config(symbol)
     tema_period = int(config.get("tema_period", 200))
-    
+
     if df.empty or len(df) < tema_period:
         return {"action": "HOLD", "reason": "Insufficient historical data for indicator convergence"}
 
-    # Compute Indicators
+    # Calculate indicators on current timeframe
     df['tema'] = calc_tema(df['close'], period=tema_period)
     df['rsi'] = calc_rsi(df['close'], period=int(config.get("rsi_period", 14)))
-    
+
     latest = df.iloc[-1]
-    prev = df.iloc[-2]
-    
     current_close = float(latest['close'])
     current_tema = float(latest['tema'])
     current_rsi = float(latest['rsi'])
-    
+
+    # Higher Timeframe (4H) Trend Confirmation
+    macro_trend_long = True
+    macro_trend_short = True
+    try:
+        df_4h = fetch_klines(symbol=symbol, interval="4h", limit=max(200, tema_period + 10))
+        if not df_4h.empty and len(df_4h) >= tema_period:
+            df_4h['tema_4h'] = calc_tema(df_4h['close'], period=tema_period)
+            latest_4h_close = float(df_4h.iloc[-1]['close'])
+            latest_4h_tema = float(df_4h.iloc[-1]['tema_4h'])
+            
+            macro_trend_long = latest_4h_close > latest_4h_tema
+            macro_trend_short = latest_4h_close < latest_4h_tema
+    except Exception as e:
+        logging.warning(f"[strategy.py] Could not fetch 4H trend context for {symbol}: {e}")
+
+    # Compute Volume Profile structures
+    poc, vah, val = compute_volume_profile(df, lookback_bars=600)
+    vp_gaps = calculate_volume_profile_gaps(df, detection_pct=float(config.get("vp_detection_pct", 0.07)))
+
     rsi_thresh = float(config.get("rsi_thresh", 42.0))
     use_rsi = bool(config.get("use_rsi_filter", True))
     use_candlestick = bool(config.get("use_candlestick_confirm", True))
@@ -153,15 +328,15 @@ def evaluate_signals(df: pd.DataFrame, symbol: str = "ETH/USDT", account_balance
     min_sentiment = float(config.get("min_sentiment", 0.0))
     min_rr = float(config.get("min_rr", 2.0))
     risk_pct = float(config.get("risk_pct", 1.0))
+    max_sl_pct = float(config.get("max_sl_pct", 0.02))
 
-    # Optional Sentiment Check via kwargs or default
     sentiment_score = kwargs.get("sentiment_score", 0.5)
     if sentiment_score < min_sentiment:
         return {"action": "HOLD", "reason": "Sentiment score below minimum threshold"}
 
-    # Zone Proximity & Trend Rules
-    upper_zone = current_tema * (1.0 + zone_tolerance)
-    lower_zone = current_tema * (1.0 - zone_tolerance)
+    # Define key confluence levels
+    upper_tema_zone = current_tema * (1.0 + zone_tolerance)
+    lower_tema_zone = current_tema * (1.0 - zone_tolerance)
 
     bullish_candlestick = (latest['close'] > latest['open']) if use_candlestick else True
     bearish_candlestick = (latest['close'] < latest['open']) if use_candlestick else True
@@ -169,13 +344,35 @@ def evaluate_signals(df: pd.DataFrame, symbol: str = "ETH/USDT", account_balance
     rsi_long_ok = (current_rsi >= rsi_thresh) if use_rsi else True
     rsi_short_ok = (current_rsi <= (100 - rsi_thresh)) if use_rsi else True
 
-    # Long Setup
-    if current_close >= lower_zone and current_close <= upper_zone and rsi_long_ok and bullish_candlestick:
-        stop_loss = round(current_tema * (1.0 - (zone_tolerance * 1.5)), 5)
+    # Identify dynamic Volume Profile targets & stop anchors
+    overhead_gaps = sorted([g for g in vp_gaps if g > current_close])
+    underneath_gaps = sorted([g for g in vp_gaps if g < current_close], reverse=True)
+
+    # LONG Entry Confluence Check
+    near_tema = lower_tema_zone <= current_close <= upper_tema_zone
+    near_val = not np.isnan(val) and abs(current_close - val) / current_close <= zone_tolerance
+    near_gap_support = len(underneath_gaps) > 0 and (current_close - underneath_gaps[0]) / current_close <= zone_tolerance
+
+    if (near_tema or near_val or near_gap_support) and rsi_long_ok and bullish_candlestick and macro_trend_long:
+        sl_anchor = val if (not np.isnan(val) and val < current_close) else current_tema
+        raw_stop_loss = min(sl_anchor * (1.0 - zone_tolerance), current_close * 0.99)
+        tightest_allowed_sl = current_close * (1.0 - max_sl_pct)
+        stop_loss = round(max(raw_stop_loss, tightest_allowed_sl), 5)
+        
         risk_distance = current_close - stop_loss
+
         if risk_distance <= 0:
-            return {"action": "HOLD", "reason": "Invalid risk distance computed"}
-        take_profit = round(current_close + (risk_distance * min_rr), 5)
+            return {"action": "HOLD", "reason": "Invalid risk distance computed for LONG"}
+
+        tp_candidates = overhead_gaps + [x for x in [poc, vah] if not np.isnan(x) and x > current_close]
+        min_tp = current_close + (risk_distance * min_rr)
+        
+        if tp_candidates:
+            take_profit = round(max(min(tp_candidates), min_tp), 5)
+        else:
+            take_profit = round(min_tp, 5)
+
+        computed_rr = round((take_profit - current_close) / risk_distance, 2)
         risk_amt = account_balance * (risk_pct / 100.0)
         position_size = round(risk_amt / risk_distance, 4)
 
@@ -186,17 +383,35 @@ def evaluate_signals(df: pd.DataFrame, symbol: str = "ETH/USDT", account_balance
             "entry_price": current_close,
             "stop_loss": stop_loss,
             "take_profit": take_profit,
-            "risk_reward_ratio": min_rr,
-            "position_size": position_size
+            "risk_reward_ratio": computed_rr,
+            "position_size": position_size,
+            "reason": "Long signal confirmed with TEMA, 4H HTF trend, and Volume Profile support confluence"
         }
 
-    # Short Setup
-    elif current_close <= upper_zone and current_close >= lower_zone and rsi_short_ok and bearish_candlestick:
-        stop_loss = round(current_tema * (1.0 + (zone_tolerance * 1.5)), 5)
+    # SHORT Entry Confluence Check
+    near_vah = not np.isnan(vah) and abs(current_close - vah) / current_close <= zone_tolerance
+    near_gap_resistance = len(overhead_gaps) > 0 and (overhead_gaps[0] - current_close) / current_close <= zone_tolerance
+
+    if (near_tema or near_vah or near_gap_resistance) and rsi_short_ok and bearish_candlestick and macro_trend_short:
+        sl_anchor = vah if (not np.isnan(vah) and vah > current_close) else current_tema
+        raw_stop_loss = max(sl_anchor * (1.0 + zone_tolerance), current_close * 1.01)
+        tightest_allowed_sl = current_close * (1.0 + max_sl_pct)
+        stop_loss = round(min(raw_stop_loss, tightest_allowed_sl), 5)
+
         risk_distance = stop_loss - current_close
+
         if risk_distance <= 0:
-            return {"action": "HOLD", "reason": "Invalid risk distance computed"}
-        take_profit = round(current_close - (risk_distance * min_rr), 5)
+            return {"action": "HOLD", "reason": "Invalid risk distance computed for SHORT"}
+
+        tp_candidates = underneath_gaps + [x for x in [poc, val] if not np.isnan(x) and x < current_close]
+        min_tp = current_close - (risk_distance * min_rr)
+
+        if tp_candidates:
+            take_profit = round(min(max(tp_candidates), min_tp), 5)
+        else:
+            take_profit = round(min_tp, 5)
+
+        computed_rr = round((current_close - take_profit) / risk_distance, 2)
         risk_amt = account_balance * (risk_pct / 100.0)
         position_size = round(risk_amt / risk_distance, 4)
 
@@ -207,8 +422,9 @@ def evaluate_signals(df: pd.DataFrame, symbol: str = "ETH/USDT", account_balance
             "entry_price": current_close,
             "stop_loss": stop_loss,
             "take_profit": take_profit,
-            "risk_reward_ratio": min_rr,
-            "position_size": position_size
+            "risk_reward_ratio": computed_rr,
+            "position_size": position_size,
+            "reason": "Short signal confirmed with TEMA, 4H HTF trend, and Volume Profile resistance confluence"
         }
 
-    return {"action": "HOLD", "reason": "Price action outside target TEMA zones or filters unmet"}
+    return {"action": "HOLD", "reason": "Price action outside target TEMA/VP confluence zones or filters unmet"}

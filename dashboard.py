@@ -1,5 +1,4 @@
 import os
-import urllib.request
 import json
 import numpy as np
 import pandas as pd
@@ -11,7 +10,7 @@ from app_manager import start_background_tasks
 
 start_background_tasks()
 
-st.set_page_config(page_title="Forex & Crypto Trading Terminal", layout="wide")
+st.set_page_config(page_title="Trading Terminal", layout="wide")
 load_dotenv()
 
 HTTP_PROXY = os.getenv("HTTP_PROXY") or os.getenv("PROXY_URL")
@@ -21,6 +20,7 @@ if HTTP_PROXY or HTTPS_PROXY:
     os.environ["HTTP_PROXY"] = HTTP_PROXY or HTTPS_PROXY
     os.environ["HTTPS_PROXY"] = HTTPS_PROXY or HTTP_PROXY
     os.environ["NO_PROXY"] = "localhost,127.0.0.1,.supabase.co"
+
 
 def check_password():
     expected_password = os.getenv("DASHBOARD_PASSWORD", "securepass123")
@@ -40,6 +40,7 @@ def check_password():
             st.error("😕 Password incorrect")
     return False
 
+
 if not check_password():
     st.stop()
 
@@ -53,6 +54,7 @@ import strategy
 
 ensure_schema_updated()
 
+
 def normalize_symbol(symbol: str) -> str:
     if not symbol:
         return ""
@@ -62,6 +64,7 @@ def normalize_symbol(symbol: str) -> str:
     if s.endswith("USDT") and len(s) > 4:
         return f"{s[:-4]}/{s[-4:]}"
     return s
+
 
 symbols_env = os.getenv("SYMBOLS") or os.getenv("SYMBOL", "ETH/USDT,BNB/USDT,SOL/USDT")
 env_symbols = [normalize_symbol(s) for s in symbols_env.split(",")]
@@ -73,7 +76,7 @@ if database_url:
 conn = get_db_connection()
 try:
     with conn.cursor() as cur:
-        cur.execute("""UPDATE trade_setups SET pair = REPLACE(REPLACE(pair, '"', ''), '''', '');""")
+        cur.execute("""UPDATE trade_setups SET pair = REPLACE(REPLACE(pair, '"', ''), '''org.postgresql.util.PSQLException''', '');""")
         conn.commit()
 except Exception:
     pass
@@ -96,11 +99,15 @@ st.sidebar.subheader("🎯 Strategy Parameters (Harmonized)")
 config_target_pair = st.sidebar.selectbox("Load Dynamic Config For:", available_pairs, index=0)
 dyn_cfg = strategy.load_symbol_config(config_target_pair)
 
+lookback_bars = st.sidebar.number_input("Lookback Bars (Range)", value=600, min_value=100, max_value=2000, step=50)
 tema_period = st.sidebar.number_input("TEMA Period", value=int(dyn_cfg.get("tema_period", 200)), min_value=10, max_value=500)
 rsi_period = st.sidebar.number_input("RSI Period", value=int(dyn_cfg.get("rsi_period", 14)), min_value=2, max_value=50)
 rsi_thresh = st.sidebar.slider("RSI Threshold", min_value=20, max_value=80, value=int(dyn_cfg.get("rsi_thresh", 42)))
 zone_tolerance_pct = st.sidebar.slider("Volume Zone Proximity (%)", min_value=0.1, max_value=3.0, value=float(dyn_cfg.get("zone_tolerance", 0.0075)) * 100.0, step=0.05)
-vp_detection_pct = st.sidebar.slider("Volume Gap Detection (%)", min_value=1.0, max_value=20.0, value=float(dyn_cfg.get("vp_detection_pct", 0.07)) * 100.0, step=0.5) / 100.0
+
+vp_cfg_val = float(dyn_cfg.get("vp_detection_pct", 0.07))
+vp_init_slider = (vp_cfg_val * 100.0) if vp_cfg_val <= 1.0 else vp_cfg_val
+node_detection_pct = st.sidebar.slider("Node Detection (%)", min_value=0.5, max_value=15.0, value=float(np.clip(vp_init_slider, 0.5, 15.0)), step=0.5) / 100.0
 
 use_rsi_filter = st.sidebar.checkbox("Enable RSI Momentum Filter", value=bool(dyn_cfg.get("use_rsi_filter", True)))
 use_candlestick_confirm = st.sidebar.checkbox("Require Candlestick Confirmation", value=bool(dyn_cfg.get("use_candlestick_confirm", True)))
@@ -187,8 +194,9 @@ if df_ohlc is not None and not df_ohlc.empty:
             df_ohlc['time'] = pd.to_datetime(df_ohlc['time']).dt.strftime('%Y-%m-%d %H:%M:%S')
 
         df_ohlc['tema_custom'] = strategy.calc_tema(df_ohlc['close'], period=min(tema_period, len(df_ohlc)))
-        poc, vah, val = strategy.compute_volume_profile(df_ohlc)
-        detected_gaps = strategy.calculate_volume_profile_gaps(df_ohlc, num_bins=100, detection_pct=vp_detection_pct)
+        
+        poc, vah, val = strategy.compute_volume_profile(df_ohlc, num_bins=100, lookback_bars=lookback_bars, va_pct=0.70)
+        detected_gaps = strategy.calculate_volume_profile_gaps(df_ohlc, num_bins=100, lookback_bars=lookback_bars, detection_pct=node_detection_pct)
 
         chart = StreamlitChart(width=1100, height=500)
         chart.layout(background_color='#131722', text_color='#d1d4dc')
@@ -200,13 +208,27 @@ if df_ohlc is not None and not df_ohlc.empty:
             tema_line = chart.create_line(name=f"{tema_period} TEMA", color="orange", width=2)
             tema_line.set(tema_df)
 
-        if pd.notnull(vah): chart.horizontal_line(float(vah), color="green", text=f"VAH: {vah:.2f}")
-        if pd.notnull(val): chart.horizontal_line(float(val), color="green", text=f"VAL: {val:.2f}")
-        if pd.notnull(poc): chart.horizontal_line(float(poc), color="red", text=f"POC: {poc:.2f}")
+        if pd.notnull(vah) and vah > 0:
+            chart.horizontal_line(float(vah), color="#2962ff", style="solid", width=2, text=f"VAH: {vah:.2f}")
+        if pd.notnull(val) and val > 0:
+            chart.horizontal_line(float(val), color="#2962ff", style="solid", width=2, text=f"VAL: {val:.2f}")
+        if pd.notnull(poc) and poc > 0:
+            chart.horizontal_line(float(poc), color="#f44336", style="solid", width=2, text=f"POC: {poc:.2f}")
 
         if overlay_gaps and detected_gaps:
+            df_lookback = df_ohlc.tail(lookback_bars)
+            min_chart_p = float(df_lookback['low'].min())
+            max_chart_p = float(df_lookback['high'].max())
+
             for gap_price in detected_gaps:
-                if pd.notnull(gap_price): chart.horizontal_line(float(gap_price), color="purple", style="dashed", text=f"GAP: {gap_price:.2f}")
+                if pd.notnull(gap_price) and min_chart_p <= float(gap_price) <= max_chart_p:
+                    chart.horizontal_line(
+                        float(gap_price), 
+                        color="#ff9800", 
+                        style="dashed", 
+                        width=1,
+                        text=f"GAP: {gap_price:.2f}"
+                    )
 
         if overlay_chart and not df_all_trades.empty:
             symbol_trades = df_all_trades[(df_all_trades['pair'].apply(normalize_symbol) == normalize_symbol(chart_symbol)) & (df_all_trades['status'].isin(['EXECUTED', 'PENDING']))]
@@ -239,7 +261,6 @@ with tab_history:
     else:
         st.info("No closed trade history available.")
 
-# --- RESTORED ANALYTICS & LOG MODULES ---
 st.markdown("---")
 col_eq, col_hm = st.columns(2)
 
