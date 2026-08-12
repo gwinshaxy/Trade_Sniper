@@ -3,7 +3,6 @@ import gc
 import time
 import random
 import logging
-import warnings
 import pandas as pd
 import numpy as np
 import psycopg2
@@ -20,7 +19,6 @@ GLOBAL_DATA = None
 def get_db_connection():
     db_url = os.getenv("DATABASE_URL")
     if not db_url:
-        logging.error("DATABASE_URL environment variable is not set.")
         return None
     try:
         return psycopg2.connect(db_url)
@@ -35,47 +33,29 @@ def ensure_tables_exist():
     try:
         with conn.cursor() as cur:
             cur.execute("""
-                CREATE TABLE IF NOT EXISTS candles (
-                    id SERIAL PRIMARY KEY,
-                    timestamp TIMESTAMP WITHOUT TIME ZONE,
-                    symbol VARCHAR(20) NOT NULL,
-                    open NUMERIC, high NUMERIC, low NUMERIC, close NUMERIC, volume NUMERIC
-                );
-            """)
-            cur.execute("""
                 CREATE TABLE IF NOT EXISTS strategy_parameters (
                     id SERIAL PRIMARY KEY,
                     symbol VARCHAR(20) UNIQUE NOT NULL,
+                    tema_period INT NOT NULL DEFAULT 200,
+                    rsi_period INT NOT NULL DEFAULT 14,
+                    rsi_thresh FLOAT DEFAULT 42.0,
+                    zone_tolerance NUMERIC NOT NULL DEFAULT 0.0075,
+                    min_sentiment NUMERIC NOT NULL DEFAULT 0.0,
+                    risk_pct NUMERIC NOT NULL DEFAULT 1.0,
+                    min_rr NUMERIC NOT NULL DEFAULT 2.0,
+                    vp_detection_pct NUMERIC NOT NULL DEFAULT 0.07,
+                    use_rsi_filter BOOLEAN DEFAULT TRUE,
+                    use_candlestick_confirm BOOLEAN DEFAULT TRUE,
+                    fitness_score NUMERIC DEFAULT 0.0,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 );
             """)
-            columns_to_add = [
-                ("tema_period", "INT NOT NULL DEFAULT 200"),
-                ("rsi_period", "INT NOT NULL DEFAULT 14"),
-                ("zone_tolerance", "NUMERIC NOT NULL DEFAULT 0.015"),
-                ("min_sentiment", "NUMERIC NOT NULL DEFAULT 0.0"),
-                ("risk_pct", "NUMERIC NOT NULL DEFAULT 1.0"),
-                ("min_rr", "NUMERIC NOT NULL DEFAULT 2.0"),
-                ("fitness_score", "NUMERIC DEFAULT 0.0")
-            ]
-            for col_name, col_type in columns_to_add:
-                cur.execute(f"""
-                    DO $$ 
-                    BEGIN 
-                        IF NOT EXISTS (
-                            SELECT 1 FROM information_schema.columns 
-                            WHERE table_name='strategy_parameters' AND column_name='{col_name}'
-                        ) THEN
-                            ALTER TABLE strategy_parameters ADD COLUMN {col_name} {col_type};
-                        END IF;
-                    END $$;
-                """)
             conn.commit()
         conn.close()
     except Exception as e:
         logging.error(f"Failed to update schema: {e}")
 
-def fetch_binance_klines_direct(symbol="BTCUSDT", interval="1h", limit=3000):
+def fetch_binance_klines_direct(symbol="BTC/USDT", interval="1h", limit=3000):
     clean_symbol = symbol.replace("/", "").upper()
     url = f"https://api.binance.com/api/v3/klines?symbol={clean_symbol}&interval={interval}&limit={limit}"
     response = requests.get(url, timeout=10)
@@ -91,23 +71,11 @@ def fetch_binance_klines_direct(symbol="BTCUSDT", interval="1h", limit=3000):
             df[col] = df[col].astype(float)
         return df[["timestamp", "open", "high", "low", "close", "volume"]]
     else:
-        raise Exception(f"Binance Direct API Returned Status {response.status_code}")
+        raise Exception(f"Binance API Error Status {response.status_code}")
 
-def fetch_historical_candles(symbol="BTCUSDT", limit=3000):
+def fetch_historical_candles(symbol="BTC/USDT", limit=3000):
     ensure_tables_exist()
     clean_symbol = symbol.replace("/", "").upper()
-    conn = get_db_connection()
-    if conn:
-        try:
-            query = "SELECT timestamp, open, high, low, close, volume FROM candles WHERE symbol = %s ORDER BY timestamp DESC LIMIT %s;"
-            df = pd.read_sql_query(query, conn, params=(clean_symbol, limit))
-            conn.close()
-            if not df.empty and len(df) > 100:
-                return df.iloc[::-1].reset_index(drop=True)
-        except Exception:
-            if conn:
-                conn.close()
-
     try:
         df = fetch_binance_klines_direct(symbol=clean_symbol, interval="1h", limit=limit)
         if not df.empty:
@@ -149,15 +117,10 @@ def save_optimized_parameters(symbol, best_params, fitness_score):
                           fitness_score = EXCLUDED.fitness_score,
                           updated_at = NOW();
         """
-        cursor.execute(query, (
-            clean_symbol, int(tema_period), int(rsi_period), 
-            float(zone_tolerance), float(min_sentiment), 
-            float(risk_pct), float(min_rr), float(fitness_score)
-        ))
+        cursor.execute(query, (clean_symbol, int(tema_period), int(rsi_period), float(zone_tolerance), float(min_sentiment), float(risk_pct), float(min_rr), float(fitness_score)))
         conn.commit()
         cursor.close()
         conn.close()
-        logging.info(f"Saved updated parameters for {clean_symbol} to Database.")
     except Exception as e:
         logging.error(f"Failed to save parameters: {e}")
 
@@ -170,13 +133,10 @@ def init_worker(data):
     global GLOBAL_DATA
     GLOBAL_DATA = data
 
-def compute_ema(series, period):
-    return series.ewm(span=period, adjust=False).mean()
-
 def compute_tema(series, period):
-    ema1 = compute_ema(series, period)
-    ema2 = compute_ema(ema1, period)
-    ema3 = compute_ema(ema2, period)
+    ema1 = series.ewm(span=period, adjust=False).mean()
+    ema2 = ema1.ewm(span=period, adjust=False).mean()
+    ema3 = ema2.ewm(span=period, adjust=False).mean()
     return 3 * ema1 - 3 * ema2 + ema3
 
 def compute_rsi(series, period=14):
@@ -208,22 +168,18 @@ def evaluate_strategy(individual):
         return (-999.0,)
 
     returns = df_close.pct_change().fillna(0)
-    effective_leverage = (risk_pct / 100.0) * (min_rr / 2.0)
-    strategy_returns = returns * pd.Series(combined_signal, index=returns.index).shift(1).fillna(0) * effective_leverage
-
-    mean_ret = strategy_returns.mean()
+    strategy_returns = returns * pd.Series(combined_signal, index=returns.index).shift(1).fillna(0) * (risk_pct / 100.0)
     std_dev = strategy_returns.std()
     
     if std_dev == 0 or np.isnan(std_dev):
         return (-999.0,)
 
-    sharpe_ratio = (mean_ret / std_dev) * np.sqrt(252 * 24)
+    sharpe_ratio = (strategy_returns.mean() / std_dev) * np.sqrt(252 * 24)
     return (float(sharpe_ratio),) if not np.isnan(sharpe_ratio) else (-999.0,)
 
 def create_random_individual():
     return creator.Individual([
-        random.randint(50, 300),
-        random.randint(7, 30),
+        random.randint(50, 300), random.randint(7, 30),
         round(random.uniform(0.005, 0.030), 4),
         round(random.uniform(-0.5, 0.5), 2),
         round(random.uniform(0.5, 3.0), 2),
@@ -247,16 +203,15 @@ toolbox.register("mate", tools.cxTwoPoint)
 toolbox.register("mutate", mutate_individual)
 toolbox.register("select", tools.selTournament, tournsize=3)
 
-def run_optimization(symbol="BTCUSDT"):
+def run_optimization(symbol="BTC/USDT"):
     global GLOBAL_DATA
     data_df = fetch_historical_candles(symbol=symbol, limit=3000)
     GLOBAL_DATA = data_df
 
-    POP_SIZE, NGEN = 20, 10
     pool = Pool(processes=2, initializer=init_worker, initargs=(data_df,))
     toolbox.register("map", pool.map)
 
-    pop = toolbox.population(n=POP_SIZE)
+    pop = toolbox.population(n=20)
     hof = tools.HallOfFame(maxsize=1)
 
     invalid_ind = [ind for ind in pop if not ind.fitness.valid]
@@ -264,7 +219,7 @@ def run_optimization(symbol="BTCUSDT"):
         ind.fitness.values = fit
     hof.update(pop)
 
-    for gen in range(1, NGEN + 1):
+    for _ in range(1, 11):
         offspring = list(map(toolbox.clone, toolbox.select(pop, len(pop))))
         for c1, c2 in zip(offspring[::2], offspring[1::2]):
             if random.random() < 0.6:
@@ -288,21 +243,16 @@ def run_optimization(symbol="BTCUSDT"):
     toolbox.unregister("map")
 
     best_params = hof[0]
-    best_score = hof[0].fitness.values[0]
-    save_optimized_parameters(symbol, best_params, best_score)
-    
+    save_optimized_parameters(symbol, best_params, hof[0].fitness.values[0])
     GLOBAL_DATA = None
     gc.collect()
     return best_params
 
-def start_reoptimization_loop(symbols=["BNBUSDT", "ETHUSDT", "SOLUSDT"], interval_hours=24):
+if __name__ == "__main__":
     while True:
         try:
-            for symbol in symbols:
+            for symbol in ["BNB/USDT", "ETH/USDT", "SOL/USDT"]:
                 run_optimization(symbol=symbol)
         except Exception as e:
             logging.error(f"Error in optimization cycle: {e}")
-        time.sleep(interval_hours * 3600)
-
-if __name__ == "__main__":
-    start_reoptimization_loop(symbols=["BNBUSDT", "ETHUSDT", "SOLUSDT"], interval_hours=24)
+        time.sleep(86400)

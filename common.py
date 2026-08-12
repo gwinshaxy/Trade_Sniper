@@ -18,11 +18,10 @@ def get_db_connection():
     return psycopg2.connect(DB_URL)
 
 def ensure_schema_updated():
-    """Ensures trade_setups and strategy_config tables exist with current schemas."""
+    """Ensures trade_setups and strategy_parameters tables exist with fully synchronized schemas."""
     conn = get_db_connection()
     cursor = conn.cursor()
     
-    # 1. Trade setups table
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS trade_setups (
             id SERIAL PRIMARY KEY,
@@ -59,16 +58,21 @@ def ensure_schema_updated():
     for col in trade_columns:
         cursor.execute(f"ALTER TABLE trade_setups ADD COLUMN IF NOT EXISTS {col};")
 
-    # 2. Strategy config table for DEAP Genetic Optimization results
     cursor.execute("""
-        CREATE TABLE IF NOT EXISTS strategy_config (
-            symbol VARCHAR(20) PRIMARY KEY,
-            tema_period INT DEFAULT 200,
-            rsi_period INT DEFAULT 14,
+        CREATE TABLE IF NOT EXISTS strategy_parameters (
+            id SERIAL PRIMARY KEY,
+            symbol VARCHAR(20) UNIQUE NOT NULL,
+            tema_period INT NOT NULL DEFAULT 200,
+            rsi_period INT NOT NULL DEFAULT 14,
             rsi_thresh FLOAT DEFAULT 42.0,
-            zone_tolerance FLOAT DEFAULT 0.0075,
+            zone_tolerance NUMERIC NOT NULL DEFAULT 0.0075,
+            min_sentiment NUMERIC NOT NULL DEFAULT 0.0,
+            risk_pct NUMERIC NOT NULL DEFAULT 1.0,
+            min_rr NUMERIC NOT NULL DEFAULT 2.0,
+            vp_detection_pct NUMERIC NOT NULL DEFAULT 0.07,
             use_rsi_filter BOOLEAN DEFAULT TRUE,
             use_candlestick_confirm BOOLEAN DEFAULT TRUE,
+            fitness_score NUMERIC DEFAULT 0.0,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
     """)

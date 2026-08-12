@@ -19,7 +19,7 @@ def run_script(script_name):
 def run_fastapi_webhook():
     """Runs the FastAPI webhook engine internally on port 8000 (or mapped port)."""
     try:
-        print("Starting internal FastAPI webhook_engine...")
+        print("Starting internal FastAPI webhook engine...")
         uvicorn.run(fastapi_app, host="0.0.0.0", port=8000, log_level="info")
     except Exception as e:
         print(f"FastAPI webhook engine crashed: {e}")
@@ -33,37 +33,32 @@ def keep_alive():
         
     while True:
         try:
-            time.sleep(600)  # Wait 10 minutes
+            time.sleep(600)
             response = requests.get(app_url, timeout=10)
             print(f"Keep-alive ping sent to {app_url}, status: {response.status_code}")
         except Exception as e:
             print(f"Keep-alive ping failed: {e}")
 
 def start_background_tasks():
-    """Spawns all 4 core background engines and the keep-alive thread safely."""
+    """Spawns all core background engines and the keep-alive thread safely."""
     if os.environ.get("BG_TASKS_STARTED") == "true":
         return
     
     os.environ["BG_TASKS_STARTED"] = "true"
     
-    # 1. Core Trading Execution Worker (`worker.py`)
     worker_thread = threading.Thread(target=run_script, args=("worker.py",), daemon=True)
     worker_thread.start()
     
-    # 2. Real-Time WebSocket Price Monitor (`price_monitor.py`)
     monitor_thread = threading.Thread(target=run_script, args=("price_monitor.py",), daemon=True)
     monitor_thread.start()
     
-    # 3. DEAP Genetic Optimizer (`optimizer.py`)
     optimizer_thread = threading.Thread(target=run_script, args=("optimizer.py",), daemon=True)
     optimizer_thread.start()
     
-    # 4. Webhook Engine (`webhook_engine.py` via FastAPI/Uvicorn)
     webhook_thread = threading.Thread(target=run_fastapi_webhook, daemon=True)
     webhook_thread.start()
     
-    # 5. Render Free Tier Keep-Alive Ping Thread
     ping_thread = threading.Thread(target=keep_alive, daemon=True)
     ping_thread.start()
     
-    print("All backend scripts (worker, price_monitor, optimizer, webhook_engine, keep-alive) successfully initialized.")
+    print("All backend scripts (worker, price_monitor, optimizer, webhook, keep-alive) successfully initialized.")

@@ -14,14 +14,11 @@ from common import (
 )
 
 load_dotenv()
-logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s"
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
 ensure_schema_updated()
 
 def fetch_active_trades():
-    """Fetch all open trades requiring real-time price monitoring."""
     conn = get_db_connection()
     if not conn:
         return []
@@ -40,7 +37,6 @@ def fetch_active_trades():
         conn.close()
 
 def execute_auto_settlement(trade_id, exit_price, reason):
-    """Settles the trade using common.calculate_pnl and dispatches Telegram HTML alerts."""
     conn = get_db_connection()
     if not conn:
         return
@@ -54,16 +50,8 @@ def execute_auto_settlement(trade_id, exit_price, reason):
             if not trade:
                 return
 
-            pair = trade["pair"]
-            direction = trade["direction"]
-            entry = float(trade["entry_price"])
-            pos_size = float(trade["position_size"])
-            default_balance = float(os.getenv("ACCOUNT_BALANCE", 10000.0))
-            initial_balance = float(trade["account_balance"]) if trade["account_balance"] else default_balance
-
-            # Calculate Realized PnL via common module
             pnl_usd, pnl_pct, outcome = calculate_pnl(
-                direction, entry, exit_price, pos_size, initial_balance
+                trade["direction"], float(trade["entry_price"]), exit_price, float(trade["position_size"]), float(trade["account_balance"] or 10000.0)
             )
 
             cur.execute("""
@@ -75,19 +63,7 @@ def execute_auto_settlement(trade_id, exit_price, reason):
             conn.commit()
 
             emoji = "🟢" if outcome == "WIN" else "🔴"
-            msg = (
-                f"<b>{emoji} REAL-TIME SETTLEMENT ({reason})</b>\n\n"
-                f"<b>Trade ID:</b> <code>#{trade_id}</code>\n"
-                f"<b>Pair:</b> <code>{pair}</code>\n"
-                f"<b>Exit Price:</b> ${exit_price:,.2f}\n"
-                f"<b>PnL ($):</b> ${pnl_usd:,.2f}\n"
-                f"<b>PnL (%):</b> {pnl_pct:.2f}%\n"
-                f"<b>Outcome:</b> {outcome}"
-            )
-            send_telegram_notification(msg)
-            logging.info(
-                f"⚡ AUTO-SETTLEMENT ({reason}): Trade #{trade_id} closed at {exit_price} | PnL: ${pnl_usd:.2f} ({outcome})"
-            )
+            send_telegram_notification(f"<b>{emoji} REAL-TIME SETTLEMENT ({reason})</b>\n\n<b>Trade ID:</b> <code>#{trade_id}</code>\n<b>PnL:</b> ${pnl_usd:,.2f} ({outcome})")
     except Exception as e:
         conn.rollback()
         logging.error(f"Failed auto-settlement for trade #{trade_id}: {e}")
@@ -95,68 +71,48 @@ def execute_auto_settlement(trade_id, exit_price, reason):
         conn.close()
 
 async def monitor_prices():
-    """Connects to Binance WebSockets and monitors prices against active trade SL/TP."""
     while True:
         trades = fetch_active_trades()
         if not trades:
             await asyncio.sleep(10)
             continue
 
-        crypto_trades = [
-            t for t in trades
-            if t["pair"].replace("/", "").upper().endswith("USDT")
-        ]
+        crypto_trades = [t for t in trades if t["pair"].replace("/", "").upper().endswith("USDT")]
         if not crypto_trades:
             await asyncio.sleep(10)
             continue
 
-        active_pairs = list(
-            set([t["pair"].replace("/", "").lower() for t in crypto_trades])
-        )
+        active_pairs = list(set([t["pair"].replace("/", "").lower() for t in crypto_trades]))
         stream_names = "/".join([f"{p}@ticker" for p in active_pairs])
         ws_url = f"wss://stream.binance.com:9443/ws/{stream_names}"
 
         try:
-            logging.info(f"📡 Connecting to Binance WebSocket stream for pairs: {active_pairs}")
             async with websockets.connect(ws_url) as websocket:
                 while True:
                     message = await asyncio.wait_for(websocket.recv(), timeout=30.0)
                     data = json.loads(message)
-
                     symbol = data.get("s")
                     current_price = float(data.get("c"))
 
                     for trade in crypto_trades:
-                        trade_symbol = trade["pair"].replace("/", "").upper()
-                        if trade_symbol != symbol:
+                        if trade["pair"].replace("/", "").upper() != symbol:
                             continue
-
-                        trade_id = trade["id"]
-                        direction = trade["direction"]
-                        sl = float(trade["stop_loss"])
-                        tp = float(trade["take_profit"])
-
-                        if direction == "LONG":
-                            if current_price >= tp:
-                                execute_auto_settlement(trade_id, tp, "TAKE_PROFIT")
+                        if trade["direction"] == "LONG":
+                            if current_price >= float(trade["take_profit"]):
+                                execute_auto_settlement(trade["id"], float(trade["take_profit"]), "TAKE_PROFIT")
                                 break
-                            elif current_price <= sl:
-                                execute_auto_settlement(trade_id, sl, "STOP_LOSS")
+                            elif current_price <= float(trade["stop_loss"]):
+                                execute_auto_settlement(trade["id"], float(trade["stop_loss"]), "STOP_LOSS")
                                 break
-                        elif direction == "SHORT":
-                            if current_price <= tp:
-                                execute_auto_settlement(trade_id, tp, "TAKE_PROFIT")
+                        elif trade["direction"] == "SHORT":
+                            if current_price <= float(trade["take_profit"]):
+                                execute_auto_settlement(trade["id"], float(trade["take_profit"]), "TAKE_PROFIT")
                                 break
-                            elif current_price >= sl:
-                                execute_auto_settlement(trade_id, sl, "STOP_LOSS")
+                            elif current_price >= float(trade["stop_loss"]):
+                                execute_auto_settlement(trade["id"], float(trade["stop_loss"]), "STOP_LOSS")
                                 break
-
-        except (asyncio.TimeoutError, websockets.ConnectionClosed):
-            logging.warning("WebSocket connection reset. Reconnecting...")
-            await asyncio.sleep(4)
-        except Exception as e:
-            logging.error(f"Stream error: {e}")
-            await asyncio.sleep(10)
+        except Exception:
+            await asyncio.sleep(5)
 
 if __name__ == "__main__":
     asyncio.run(monitor_prices())
