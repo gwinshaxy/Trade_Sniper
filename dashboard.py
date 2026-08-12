@@ -32,7 +32,7 @@ def check_password():
     st.markdown("## 🔒 Restricted Access")
     st.markdown("Please enter the password to access the Trading Terminal.")
     password_input = st.text_input("Password", type="password")
-    if st.button("Login"):
+    if st.button("Login", width="stretch"):
         if password_input == expected_password:
             st.session_state["password_correct"] = True
             st.rerun()
@@ -131,7 +131,7 @@ account_balance = st.sidebar.number_input("Account Balance ($)", min_value=1.0, 
 risk_pct = st.sidebar.number_input("Risk Per Trade (%)", min_value=0.01, max_value=100.0, value=1.0)
 calc_position_size = round((account_balance * (risk_pct / 100.0)) / risk, 4) if risk > 0 else 0.0
 
-if st.sidebar.button("🚀 Execute Order"):
+if st.sidebar.button("🚀 Execute Order", width="stretch"):
     clean_executed_pair = normalize_symbol(pair)
     conn = get_db_connection()
     cursor = conn.cursor()
@@ -153,11 +153,11 @@ if st.sidebar.button("🚀 Execute Order"):
 st.title("📊 Forex & Crypto Trading Terminal")
 
 closed_trades = df_all_trades[df_all_trades['status'] == 'CLOSED'] if not df_all_trades.empty else pd.DataFrame()
-net_realized_pnl = closed_trades['pnl_usd'].sum() if not closed_trades.empty else 0.0
+net_realized_pnl = float(closed_trades['pnl_usd'].sum()) if not closed_trades.empty and 'pnl_usd' in closed_trades.columns else 0.0
 profit_factor_val = 0.0
-if not closed_trades.empty:
-    wins_sum = closed_trades[closed_trades['outcome'] == 'WIN']['pnl_usd'].sum()
-    loss_sum = abs(closed_trades[closed_trades['outcome'] == 'LOSS']['pnl_usd'].sum())
+if not closed_trades.empty and 'pnl_usd' in closed_trades.columns:
+    wins_sum = float(closed_trades[closed_trades['outcome'] == 'WIN']['pnl_usd'].sum())
+    loss_sum = abs(float(closed_trades[closed_trades['outcome'] == 'LOSS']['pnl_usd'].sum()))
     profit_factor_val = round(wins_sum / loss_sum, 2) if loss_sum > 0 else 0.0
 
 col_m1, col_m2, col_m3, col_m4 = st.columns(4)
@@ -249,7 +249,7 @@ with tab_pending:
     df_active = pd.read_sql("SELECT id, pair, direction, entry_price, stop_loss, take_profit, risk_reward_ratio AS rrr, risk_pct AS risk_p, position_size, status, trade_state, created_at FROM trade_setups WHERE status IN ('EXECUTED', 'PENDING');", database_url) if database_url else pd.DataFrame()
     if not df_active.empty:
         df_active['pair'] = df_active['pair'].apply(normalize_symbol)
-        st.dataframe(df_active, use_container_width=True)
+        st.dataframe(df_active, width="stretch")
     else:
         st.info("No active setups found.")
 
@@ -257,7 +257,7 @@ with tab_history:
     df_closed_log = pd.read_sql("SELECT id, pair, direction, entry_price, exit_price, pnl_usd, pnl_pct, outcome, closed_at FROM trade_setups WHERE status = 'CLOSED';", database_url) if database_url else pd.DataFrame()
     if not df_closed_log.empty:
         df_closed_log['pair'] = df_closed_log['pair'].apply(normalize_symbol)
-        st.dataframe(df_closed_log, use_container_width=True)
+        st.dataframe(df_closed_log, width="stretch")
     else:
         st.info("No closed trade history available.")
 
@@ -268,6 +268,7 @@ with col_eq:
     st.subheader("📈 Cumulative Equity Curve")
     if not closed_trades.empty and 'pnl_usd' in closed_trades.columns:
         df_eq = closed_trades.sort_values('closed_at').copy()
+        df_eq['pnl_usd'] = pd.to_numeric(df_eq['pnl_usd'], errors='coerce').fillna(0.0)
         df_eq['cumulative_pnl'] = df_eq['pnl_usd'].cumsum()
         st.line_chart(df_eq.set_index('closed_at')['cumulative_pnl'])
     else:
@@ -280,8 +281,9 @@ with col_hm:
             closed_trades['closed_at'] = pd.to_datetime(closed_trades['closed_at'])
             closed_trades['day_of_week'] = closed_trades['closed_at'].dt.day_name()
             closed_trades['hour'] = closed_trades['closed_at'].dt.hour
+            closed_trades['pnl_usd'] = pd.to_numeric(closed_trades['pnl_usd'], errors='coerce').fillna(0.0)
             heatmap_data = closed_trades.pivot_table(index='day_of_week', columns='hour', values='pnl_usd', aggfunc='sum').fillna(0)
-            st.dataframe(heatmap_data, use_container_width=True)
+            st.dataframe(heatmap_data, width="stretch")
         except Exception:
             st.info("No heatmap data available.")
     else:
@@ -297,10 +299,11 @@ with col_per:
         try:
             df_per = closed_trades.copy()
             df_per['closed_at'] = pd.to_datetime(df_per['closed_at'])
-            period_rule = 'W' if group_interval == 'Weekly' else 'M'
+            df_per['pnl_usd'] = pd.to_numeric(df_per['pnl_usd'], errors='coerce').fillna(0.0)
+            period_rule = 'W' if group_interval == 'Weekly' else 'ME'
             periodic_summary = df_per.groupby(pd.Grouper(key='closed_at', freq=period_rule)).agg({'pnl_usd': ['sum', 'count']})
             periodic_summary.columns = ['Net PnL ($)', 'Trade Count']
-            st.dataframe(periodic_summary, use_container_width=True)
+            st.dataframe(periodic_summary, width="stretch")
         except Exception:
             st.info("No periodic data available.")
     else:
