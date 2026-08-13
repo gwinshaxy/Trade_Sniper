@@ -15,7 +15,7 @@ if DB_URL:
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-# Dynamic Connection Pool setup for threaded services
+# Global Connection Pool
 _db_pool = None
 
 def get_db_pool():
@@ -26,34 +26,47 @@ def get_db_pool():
         _db_pool = pool.ThreadedConnectionPool(1, 20, DB_URL)
     return _db_pool
 
-class ConnectionContext:
-    def __init__(self, db_pool):
-        self.pool = db_pool
-        self.conn = None
+
+class PooledConnectionWrapper:
+    """Wrapper around psycopg2 connection to handle pool release cleanly."""
+    def __init__(self, conn, db_pool):
+        self._conn = conn
+        self._pool = db_pool
+
+    def close(self):
+        """Returns connection back to the pool instead of destroying it."""
+        if self._conn and self._pool:
+            try:
+                self._pool.putconn(self._conn)
+            except Exception:
+                try:
+                    self._conn.close()
+                except Exception:
+                    pass
+            self._conn = None
 
     def __enter__(self):
-        self.conn = self.pool.getconn()
-        return self.conn
+        return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        if self.conn:
-            if exc_type is not None:
-                self.conn.rollback()
-            self.pool.putconn(self.conn)
+        if exc_type:
+            try:
+                self._conn.rollback()
+            except Exception:
+                pass
+        self.close()
+
+    def __getattr__(self, name):
+        """Delegates all unhandled attributes/methods directly to the underlying psycopg2 connection."""
+        return getattr(self._conn, name)
+
 
 def get_db_connection():
-    """Establishes and returns a PostgreSQL database connection from the pool."""
+    """Retrieves a connection from the pool wrapped in PooledConnectionWrapper."""
     p = get_db_pool()
     conn = p.getconn()
-    # Attach monkey-patched close method to return connection to pool cleanly
-    original_close = conn.close
-    def pooled_close():
-        try:
-            p.putconn(conn)
-        except Exception:
-            original_close()
-    conn.close = pooled_close
-    return conn
+    return PooledConnectionWrapper(conn, p)
+
 
 def ensure_schema_updated():
     """Ensures trade_setups and strategy_parameters tables exist with fully synchronized schemas."""
@@ -132,6 +145,7 @@ def ensure_schema_updated():
     cursor.close()
     conn.close()
 
+
 def calculate_pnl(direction: str, entry_price: float, exit_price: float, position_size: float, account_balance: float):
     """Calculates realized PnL in USD and Percentage."""
     if direction.upper() == "LONG":
@@ -142,6 +156,7 @@ def calculate_pnl(direction: str, entry_price: float, exit_price: float, positio
     pnl_pct = (pnl_usd / account_balance) * 100 if account_balance > 0 else 0.0
     outcome = "WIN" if pnl_usd >= 0 else "LOSS"
     return round(pnl_usd, 2), round(pnl_pct, 2), outcome
+
 
 def send_telegram_notification(message: str) -> bool:
     """Sends an HTML formatted Telegram alert if credentials exist."""
@@ -155,6 +170,7 @@ def send_telegram_notification(message: str) -> bool:
     except Exception as e:
         print(f"[Telegram Alert Error]: {e}")
         return False
+
 
 def close_trade_manually(trade_id: int, exit_price: float, reason: str = "MANUAL_CLOSE"):
     """Manually closes an active trade, updates PnL, and notifies via Telegram."""
