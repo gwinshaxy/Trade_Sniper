@@ -14,7 +14,9 @@ class DynamicTradeManager:
         state = trade_row.get('trade_state', 'OPEN')
         
         curr_price = float(latest_candle['close'])
-        tema = float(latest_candle.get('200_TEMA', curr_price))
+        
+        # Harmonized lookup for TEMA under both keys ('200_TEMA' and 'tema')
+        tema = float(latest_candle.get('200_TEMA', latest_candle.get('tema', curr_price)))
         initial_risk = abs(entry - curr_sl)
 
         # 1. Break-Even Check (at 1:1 R:R)
@@ -27,12 +29,12 @@ class DynamicTradeManager:
                 return {
                     "action": "UPDATE_SL",
                     "trade_id": trade_id,
-                    "new_sl": round(be_price, 2),
+                    "new_sl": round(be_price, 5),
                     "new_state": "BE_LOCKED",
-                    "msg": f"🎯 Trade #{trade_id} hit 1:1 R:R. Moving Stop Loss to Break-Even (${be_price:.2f})."
+                    "msg": f"🎯 Trade #{trade_id} hit 1:1 R:R. Moving Stop Loss to Break-Even (${be_price:.5f})."
                 }
 
-        # 2. Dynamic 200 TEMA Trailing Stop
+        # 2. Dynamic Trailing Stop along TEMA
         elif state in ['BE_LOCKED', 'TRAILING']:
             if direction == 'LONG':
                 proposed_sl = tema * (1 - self.tema_offset_pct)
@@ -40,9 +42,9 @@ class DynamicTradeManager:
                     return {
                         "action": "UPDATE_SL",
                         "trade_id": trade_id,
-                        "new_sl": round(proposed_sl, 2),
+                        "new_sl": round(proposed_sl, 5),
                         "new_state": "TRAILING",
-                        "msg": f"📈 Trade #{trade_id} Trailing SL updated to ${proposed_sl:.2f} along 200 TEMA (${tema:.2f})."
+                        "msg": f"📈 Trade #{trade_id} Trailing SL updated to ${proposed_sl:.5f} along TEMA (${tema:.5f})."
                     }
             elif direction == 'SHORT':
                 proposed_sl = tema * (1 + self.tema_offset_pct)
@@ -50,9 +52,9 @@ class DynamicTradeManager:
                     return {
                         "action": "UPDATE_SL",
                         "trade_id": trade_id,
-                        "new_sl": round(proposed_sl, 2),
+                        "new_sl": round(proposed_sl, 5),
                         "new_state": "TRAILING",
-                        "msg": f"📉 Trade #{trade_id} Trailing SL updated to ${proposed_sl:.2f} along 200 TEMA (${tema:.2f})."
+                        "msg": f"📉 Trade #{trade_id} Trailing SL updated to ${proposed_sl:.5f} along TEMA (${tema:.5f})."
                     }
 
         return {"action": "NONE"}

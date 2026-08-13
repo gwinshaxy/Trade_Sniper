@@ -59,6 +59,9 @@ def load_symbol_config(symbol: str) -> dict:
                     config.setdefault("rsi_thresh", 42.0)
                     config.setdefault("use_rsi_filter", True)
                     config.setdefault("use_candlestick_confirm", True)
+                    config.setdefault("use_adx_filter", True)
+                    config.setdefault("adx_period", 14)
+                    config.setdefault("adx_threshold", 20.0)
                     config.setdefault("max_sl_pct", 0.02)
                     logging.info(f"[load_symbol_config] Loaded dynamic DEAP params for {clean_symbol}")
                     return config
@@ -69,6 +72,7 @@ def load_symbol_config(symbol: str) -> dict:
 
     return {
         "tema_period": 200, "rsi_period": 14, "rsi_thresh": 42.0,
+        "adx_period": 14, "adx_threshold": 20.0, "use_adx_filter": True,
         "zone_tolerance": 0.0075, "min_sentiment": 0.0, "risk_pct": 1.0,
         "min_rr": 2.0, "vp_detection_pct": 0.07, "use_rsi_filter": True,
         "use_candlestick_confirm": True, "max_sl_pct": 0.02
@@ -191,6 +195,34 @@ def calc_rsi(series: pd.Series, period: int = 14) -> pd.Series:
     loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
     rs = gain / (loss.replace(0, np.nan))
     return (100 - (100 / (1 + rs))).fillna(50)
+
+
+def calc_adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    """Calculates Average Directional Index (ADX) to quantify trend strength."""
+    if df.empty or len(df) < period + 1:
+        return pd.Series(0.0, index=df.index)
+
+    df_calc = df.copy()
+    df_calc['prev_close'] = df_calc['close'].shift(1)
+    df_calc['tr1'] = df_calc['high'] - df_calc['low']
+    df_calc['tr2'] = (df_calc['high'] - df_calc['prev_close']).abs()
+    df_calc['tr3'] = (df_calc['low'] - df_calc['prev_close']).abs()
+    tr = df_calc[['tr1', 'tr2', 'tr3']].max(axis=1)
+
+    up_move = df_calc['high'] - df_calc['high'].shift(1)
+    down_move = df_calc['low'].shift(1) - df_calc['low']
+
+    plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
+    minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
+
+    # Wilder's Smoothing
+    tr_smooth = tr.ewm(alpha=1/period, adjust=False).mean()
+    plus_di = 100 * (pd.Series(plus_dm, index=df.index).ewm(alpha=1/period, adjust=False).mean() / tr_smooth.replace(0, np.nan))
+    minus_di = 100 * (pd.Series(minus_dm, index=df.index).ewm(alpha=1/period, adjust=False).mean() / tr_smooth.replace(0, np.nan))
+
+    dx = (abs(plus_di - minus_di) / (plus_di + minus_di).replace(0, np.nan)) * 100
+    adx = dx.ewm(alpha=1/period, adjust=False).mean().fillna(0.0)
+    return adx
 
 
 def compute_volume_profile(
@@ -331,47 +363,61 @@ def calculate_volume_profile_gaps(df: pd.DataFrame, num_bins: int = 100, lookbac
 
 def evaluate_signals(df: pd.DataFrame, symbol: str = "ETH/USDT", account_balance: float = 10000.0, **kwargs) -> dict:
     config = load_symbol_config(symbol)
-    tema_period = int(config.get("tema_period", 200))
+    tema_period = int(kwargs.get("tema_period", config.get("tema_period", 200)))
+    rsi_period = int(kwargs.get("rsi_period", config.get("rsi_period", 14)))
+    adx_period = int(kwargs.get("adx_period", config.get("adx_period", 14)))
 
-    if df.empty or len(df) < tema_period:
+    if df.empty or len(df) < max(tema_period, adx_period + 1):
         return {"action": "HOLD", "reason": "Insufficient historical data for indicator convergence"}
 
     # Calculate indicators on current timeframe
     df['tema'] = calc_tema(df['close'], period=tema_period)
-    df['rsi'] = calc_rsi(df['close'], period=int(config.get("rsi_period", 14)))
+    df['rsi'] = calc_rsi(df['close'], period=rsi_period)
+    df['adx'] = calc_adx(df, period=adx_period)
 
     latest = df.iloc[-1]
     current_close = float(latest['close'])
     current_tema = float(latest['tema'])
     current_rsi = float(latest['rsi'])
+    current_adx = float(latest['adx'])
+
+    # Chop/Trend Guardrail: ADX Threshold Check
+    use_adx_filter = bool(kwargs.get("use_adx_filter", config.get("use_adx_filter", True)))
+    adx_threshold = float(kwargs.get("adx_threshold", config.get("adx_threshold", 20.0)))
+
+    if use_adx_filter and current_adx < adx_threshold:
+        return {"action": "HOLD", "reason": f"ADX filter active: Market is choppy/ranging (ADX: {current_adx:.2f} < {adx_threshold:.2f})"}
 
     # Higher Timeframe (4H) Trend Confirmation
     macro_trend_long = True
     macro_trend_short = True
-    try:
-        df_4h = fetch_klines(symbol=symbol, interval="4h", limit=max(200, tema_period + 10))
-        if not df_4h.empty and len(df_4h) >= tema_period:
-            df_4h['tema_4h'] = calc_tema(df_4h['close'], period=tema_period)
-            latest_4h_close = float(df_4h.iloc[-1]['close'])
-            latest_4h_tema = float(df_4h.iloc[-1]['tema_4h'])
-            
-            macro_trend_long = latest_4h_close > latest_4h_tema
-            macro_trend_short = latest_4h_close < latest_4h_tema
-    except Exception as e:
-        logging.warning(f"[strategy.py] Could not fetch 4H trend context for {symbol}: {e}")
+    disable_htf = bool(kwargs.get("disable_htf", False))
+
+    if not disable_htf:
+        try:
+            df_4h = fetch_klines(symbol=symbol, interval="4h", limit=max(200, tema_period + 10))
+            if not df_4h.empty and len(df_4h) >= tema_period:
+                df_4h['tema_4h'] = calc_tema(df_4h['close'], period=tema_period)
+                latest_4h_close = float(df_4h.iloc[-1]['close'])
+                latest_4h_tema = float(df_4h.iloc[-1]['tema_4h'])
+                
+                macro_trend_long = latest_4h_close > latest_4h_tema
+                macro_trend_short = latest_4h_close < latest_4h_tema
+        except Exception as e:
+            logging.warning(f"[strategy.py] Could not fetch 4H trend context for {symbol}: {e}")
 
     # Compute Volume Profile structures
     poc, vah, val = compute_volume_profile(df, lookback_bars=600)
     vp_gaps = calculate_volume_profile_gaps(df, detection_pct=float(config.get("vp_detection_pct", 0.07)))
 
-    rsi_thresh = float(config.get("rsi_thresh", 42.0))
-    use_rsi = bool(config.get("use_rsi_filter", True))
-    use_candlestick = bool(config.get("use_candlestick_confirm", True))
-    zone_tolerance = float(config.get("zone_tolerance", 0.0075))
-    min_sentiment = float(config.get("min_sentiment", 0.0))
-    min_rr = float(config.get("min_rr", 2.0))
-    risk_pct = float(config.get("risk_pct", 1.0))
-    max_sl_pct = float(config.get("max_sl_pct", 0.02))
+    rsi_thresh = float(kwargs.get("rsi_thresh", config.get("rsi_thresh", 42.0)))
+    use_rsi = bool(kwargs.get("use_rsi_filter", config.get("use_rsi_filter", True)))
+    use_candlestick = bool(kwargs.get("use_candlestick_confirm", config.get("use_candlestick_confirm", True)))
+    zone_tolerance = float(kwargs.get("zone_tolerance", config.get("zone_tolerance", 0.0075)))
+    min_sentiment = float(kwargs.get("min_sentiment", config.get("min_sentiment", 0.0)))
+    min_rr = float(kwargs.get("min_rr", config.get("min_rr", 2.0)))
+    risk_pct = float(kwargs.get("risk_pct", config.get("risk_pct", 1.0)))
+    max_sl_pct = float(kwargs.get("max_sl_pct", config.get("max_sl_pct", 0.02)))
 
     sentiment_score = kwargs.get("sentiment_score", 0.5)
     if sentiment_score < min_sentiment:
@@ -427,8 +473,9 @@ def evaluate_signals(df: pd.DataFrame, symbol: str = "ETH/USDT", account_balance
             "stop_loss": stop_loss,
             "take_profit": take_profit,
             "risk_reward_ratio": computed_rr,
+            "risk_pct": risk_pct,
             "position_size": position_size,
-            "reason": "Long signal confirmed with TEMA, 4H HTF trend, and Volume Profile support confluence"
+            "reason": "Long signal confirmed with TEMA, ADX trend strength, 4H HTF trend, and Volume Profile support confluence"
         }
 
     # SHORT Entry Confluence Check
@@ -466,8 +513,9 @@ def evaluate_signals(df: pd.DataFrame, symbol: str = "ETH/USDT", account_balance
             "stop_loss": stop_loss,
             "take_profit": take_profit,
             "risk_reward_ratio": computed_rr,
+            "risk_pct": risk_pct,
             "position_size": position_size,
-            "reason": "Short signal confirmed with TEMA, 4H HTF trend, and Volume Profile resistance confluence"
+            "reason": "Short signal confirmed with TEMA, ADX trend strength, 4H HTF trend, and Volume Profile resistance confluence"
         }
 
     return {"action": "HOLD", "reason": "Price action outside target TEMA/VP confluence zones or filters unmet"}

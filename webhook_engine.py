@@ -36,7 +36,7 @@ def settle_trade(payload: SettlementPayload):
             return {"status": "ignored", "message": f"Trade {trade_id} is already closed."}
 
         pnl_usd, pnl_pct, outcome = calculate_pnl(
-            direction, float(entry_price), payload.exit_price, float(position_size), float(account_balance or 100.0)
+            direction, float(entry_price), payload.exit_price, float(position_size), float(account_balance or 10000.0)
         )
 
         cursor.execute(

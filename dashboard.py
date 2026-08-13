@@ -103,12 +103,19 @@ lookback_bars = st.sidebar.number_input("Lookback Bars (Range)", value=600, min_
 tema_period = st.sidebar.number_input("TEMA Period", value=int(dyn_cfg.get("tema_period", 200)), min_value=10, max_value=500)
 rsi_period = st.sidebar.number_input("RSI Period", value=int(dyn_cfg.get("rsi_period", 14)), min_value=2, max_value=50)
 rsi_thresh = st.sidebar.slider("RSI Threshold", min_value=20, max_value=80, value=int(dyn_cfg.get("rsi_thresh", 42)))
+
+# Expanded Strategy Parameters
+adx_period = st.sidebar.number_input("ADX Period", value=int(dyn_cfg.get("adx_period", 14)), min_value=2, max_value=50)
+adx_threshold = st.sidebar.slider("ADX Threshold", min_value=10.0, max_value=50.0, value=float(dyn_cfg.get("adx_threshold", 20.0)), step=1.0)
+max_sl_pct = st.sidebar.slider("Max SL Distance (%)", min_value=0.5, max_value=10.0, value=float(dyn_cfg.get("max_sl_pct", 0.02)) * 100.0, step=0.1) / 100.0
+
 zone_tolerance_pct = st.sidebar.slider("Volume Zone Proximity (%)", min_value=0.1, max_value=3.0, value=float(dyn_cfg.get("zone_tolerance", 0.0075)) * 100.0, step=0.05)
 
 vp_cfg_val = float(dyn_cfg.get("vp_detection_pct", 0.07))
 vp_init_slider = (vp_cfg_val * 100.0) if vp_cfg_val <= 1.0 else vp_cfg_val
 node_detection_pct = st.sidebar.slider("Node Detection (%)", min_value=0.5, max_value=15.0, value=float(np.clip(vp_init_slider, 0.5, 15.0)), step=0.5) / 100.0
 
+use_adx_filter = st.sidebar.checkbox("Enable ADX Trend Filter", value=bool(dyn_cfg.get("use_adx_filter", True)))
 use_rsi_filter = st.sidebar.checkbox("Enable RSI Momentum Filter", value=bool(dyn_cfg.get("use_rsi_filter", True)))
 use_candlestick_confirm = st.sidebar.checkbox("Require Candlestick Confirmation", value=bool(dyn_cfg.get("use_candlestick_confirm", True)))
 

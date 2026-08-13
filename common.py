@@ -65,6 +65,10 @@ def ensure_schema_updated():
             tema_period INT NOT NULL DEFAULT 200,
             rsi_period INT NOT NULL DEFAULT 14,
             rsi_thresh FLOAT DEFAULT 42.0,
+            adx_period INT DEFAULT 14,
+            adx_threshold FLOAT DEFAULT 20.0,
+            use_adx_filter BOOLEAN DEFAULT TRUE,
+            max_sl_pct FLOAT DEFAULT 0.02,
             zone_tolerance NUMERIC NOT NULL DEFAULT 0.0075,
             min_sentiment NUMERIC NOT NULL DEFAULT 0.0,
             risk_pct NUMERIC NOT NULL DEFAULT 1.0,
@@ -76,6 +80,15 @@ def ensure_schema_updated():
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
     """)
+
+    param_columns = [
+        "adx_period INT DEFAULT 14",
+        "adx_threshold FLOAT DEFAULT 20.0",
+        "use_adx_filter BOOLEAN DEFAULT TRUE",
+        "max_sl_pct FLOAT DEFAULT 0.02"
+    ]
+    for col in param_columns:
+        cursor.execute(f"ALTER TABLE strategy_parameters ADD COLUMN IF NOT EXISTS {col};")
         
     conn.commit()
     cursor.close()
@@ -93,7 +106,7 @@ def calculate_pnl(direction: str, entry_price: float, exit_price: float, positio
     return round(pnl_usd, 2), round(pnl_pct, 2), outcome
 
 def send_telegram_notification(message: str) -> bool:
-    """Sends an HTML formatted Telegram alert if credentials are set in .env."""
+    """Sends an HTML formatted Telegram alert if credentials exist."""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return False
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"

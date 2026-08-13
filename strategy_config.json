@@ -1,7 +1,15 @@
 {
   "tema_period": 200,
   "rsi_period": 14,
-  "zone_tolerance": 0.015,
+  "rsi_thresh": 42.0,
+  "adx_period": 14,
+  "adx_threshold": 20.0,
+  "use_adx_filter": true,
+  "use_rsi_filter": true,
+  "use_candlestick_confirm": true,
+  "max_sl_pct": 0.02,
+  "zone_tolerance": 0.0075,
+  "vp_detection_pct": 0.07,
   "min_sentiment": 0.0,
   "risk_pct": 1.0,
   "min_rr": 2.0
