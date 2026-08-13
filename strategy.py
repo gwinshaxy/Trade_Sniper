@@ -32,7 +32,7 @@ def normalize_symbol(symbol: str) -> str:
 
 
 def load_symbol_config(symbol: str) -> dict:
-    """Loads optimized strategy parameters from PostgreSQL database stripping slashes for lookup."""
+    """Loads optimized strategy parameters from PostgreSQL database safely closing connections in a finally block."""
     clean_symbol = normalize_symbol(symbol).replace("/", "").upper()
     db_url = os.getenv("DATABASE_URL")
     
@@ -40,6 +40,7 @@ def load_symbol_config(symbol: str) -> dict:
         db_url = db_url.strip('"').strip("'").strip()
     
     if PSYCOPG2_AVAILABLE and db_url:
+        conn = None
         try:
             conn = psycopg2.connect(db_url)
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
@@ -53,7 +54,6 @@ def load_symbol_config(symbol: str) -> dict:
                     (clean_symbol,)
                 )
                 row = cur.fetchone()
-                conn.close()
                 if row:
                     config = dict(row)
                     config.setdefault("rsi_thresh", 42.0)
@@ -63,12 +63,18 @@ def load_symbol_config(symbol: str) -> dict:
                     config.setdefault("adx_period", 14)
                     config.setdefault("adx_threshold", 20.0)
                     config.setdefault("max_sl_pct", 0.02)
-                    logging.info(f"[load_symbol_config] Loaded dynamic DEAP params for {clean_symbol}")
+                    logging.debug(f"[load_symbol_config] Loaded dynamic DEAP params for {clean_symbol}")
                     return config
                 else:
                     logging.warning(f"[load_symbol_config] Parameter row missing for {clean_symbol}, using defaults.")
         except Exception as e:
             logging.error(f"[load_symbol_config] DB query failed for {clean_symbol}: {e}")
+        finally:
+            if conn:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
 
     return {
         "tema_period": 200, "rsi_period": 14, "rsi_thresh": 42.0,
@@ -198,19 +204,21 @@ def calc_rsi(series: pd.Series, period: int = 14) -> pd.Series:
 
 
 def calc_adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
-    """Calculates Average Directional Index (ADX) to quantify trend strength."""
+    """Calculates Average Directional Index (ADX) with optimized series manipulation to avoid full DataFrame duplication overhead."""
     if df.empty or len(df) < period + 1:
         return pd.Series(0.0, index=df.index)
 
-    df_calc = df.copy()
-    df_calc['prev_close'] = df_calc['close'].shift(1)
-    df_calc['tr1'] = df_calc['high'] - df_calc['low']
-    df_calc['tr2'] = (df_calc['high'] - df_calc['prev_close']).abs()
-    df_calc['tr3'] = (df_calc['low'] - df_calc['prev_close']).abs()
-    tr = df_calc[['tr1', 'tr2', 'tr3']].max(axis=1)
+    high = df['high']
+    low = df['low']
+    prev_close = df['close'].shift(1)
 
-    up_move = df_calc['high'] - df_calc['high'].shift(1)
-    down_move = df_calc['low'].shift(1) - df_calc['low']
+    tr1 = high - low
+    tr2 = (high - prev_close).abs()
+    tr3 = (low - prev_close).abs()
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+
+    up_move = high - high.shift(1)
+    down_move = low.shift(1) - low
 
     plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
     minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
