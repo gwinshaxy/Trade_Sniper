@@ -14,25 +14,29 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
 # --- SINGLETON PROCESS GUARD FOR RENDER 512MB RAM ---
-def ensure_background_process(script_name: str):
-    """Ensures a script runs as a single background process across Streamlit reruns."""
+@st.cache_resource
+def ensure_background_services_once():
+    """Ensures background scripts run as single background processes across Streamlit reruns."""
+    services = ["worker.py", "price_monitor.py", "optimizer.py", "webhook_engine.py"]
+    running_cmds = []
+
     for proc in psutil.process_iter(['cmdline']):
         try:
             cmd = proc.info.get('cmdline')
-            if cmd and any(script_name in arg for arg in cmd):
-                logging.info(f"Process '{script_name}' is already running (PID {proc.pid}). Skipping spawn.")
-                return
+            if cmd:
+                running_cmds.append(" ".join(cmd))
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             continue
 
-    logging.info(f"Starting background process: {script_name}...")
-    subprocess.Popen([sys.executable, script_name])
+    for script_name in services:
+        if not any(script_name in cmd for cmd in running_cmds):
+            logging.info(f"Starting background process: {script_name}...")
+            subprocess.Popen([sys.executable, script_name])
+        else:
+            logging.info(f"Process '{script_name}' is already running. Skipping spawn.")
 
-# Spawn background services safely without duplication
-ensure_background_process("worker.py")
-ensure_background_process("price_monitor.py")
-ensure_background_process("optimizer.py")
-ensure_background_process("webhook_engine.py")
+# Spawn background services safely without repeated executions on UI interactions
+ensure_background_services_once()
 
 st.set_page_config(page_title="Trading Terminal", layout="wide")
 
@@ -104,7 +108,9 @@ try:
         conn.commit()
 except Exception:
     pass
-conn.close()
+finally:
+    if conn:
+        conn.close()
 
 df_all_trades = pd.read_sql("SELECT * FROM trade_setups ORDER BY id DESC;", database_url) if database_url else pd.DataFrame()
 db_pairs = [normalize_symbol(p) for p in df_all_trades['pair'].unique().tolist()] if not df_all_trades.empty else []

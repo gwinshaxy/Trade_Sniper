@@ -1,5 +1,6 @@
 import os
 import psycopg2
+from psycopg2 import pool
 import requests
 from dotenv import load_dotenv
 
@@ -8,14 +9,51 @@ env_path = os.path.join(base_dir, ".env")
 load_dotenv(dotenv_path=env_path)
 
 DB_URL = os.getenv("DATABASE_URL") or os.getenv("DB_URL")
+if DB_URL:
+    DB_URL = DB_URL.strip('"').strip("'")
+
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
+# Dynamic Connection Pool setup for threaded services
+_db_pool = None
+
+def get_db_pool():
+    global _db_pool
+    if _db_pool is None:
+        if not DB_URL:
+            raise ValueError("Neither DATABASE_URL nor DB_URL environment variable is set in .env.")
+        _db_pool = pool.ThreadedConnectionPool(1, 20, DB_URL)
+    return _db_pool
+
+class ConnectionContext:
+    def __init__(self, db_pool):
+        self.pool = db_pool
+        self.conn = None
+
+    def __enter__(self):
+        self.conn = self.pool.getconn()
+        return self.conn
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self.conn:
+            if exc_type is not None:
+                self.conn.rollback()
+            self.pool.putconn(self.conn)
+
 def get_db_connection():
-    """Establishes and returns a PostgreSQL database connection."""
-    if not DB_URL:
-        raise ValueError("Neither DATABASE_URL nor DB_URL environment variable is set in .env.")
-    return psycopg2.connect(DB_URL)
+    """Establishes and returns a PostgreSQL database connection from the pool."""
+    p = get_db_pool()
+    conn = p.getconn()
+    # Attach monkey-patched close method to return connection to pool cleanly
+    original_close = conn.close
+    def pooled_close():
+        try:
+            p.putconn(conn)
+        except Exception:
+            original_close()
+    conn.close = pooled_close
+    return conn
 
 def ensure_schema_updated():
     """Ensures trade_setups and strategy_parameters tables exist with fully synchronized schemas."""

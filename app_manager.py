@@ -3,12 +3,28 @@ import time
 import subprocess
 import os
 import sys
+import psutil
 import requests
 import uvicorn
 from webhook_engine import app as fastapi_app
 
+def is_process_running(script_name: str) -> bool:
+    """Checks if a background Python script is currently running."""
+    for proc in psutil.process_iter(['cmdline']):
+        try:
+            cmd = proc.info.get('cmdline')
+            if cmd and any(script_name in arg for arg in cmd):
+                return True
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+    return False
+
 def run_script(script_name):
     """Generic loop to run background Python scripts and stop cleanly on Ctrl+C."""
+    if is_process_running(script_name):
+        print(f"Process {script_name} is already active. Skipping background loop spawn.")
+        return
+
     while True:
         try:
             print(f"Starting background process: {script_name}...")
@@ -71,3 +87,12 @@ def start_background_tasks():
     ping_thread.start()
     
     print("All backend scripts (worker, price_monitor, optimizer, webhook, keep-alive) successfully initialized.")
+
+if __name__ == "__main__":
+    start_background_tasks()
+    # Keep the main process alive when executed as entry point
+    try:
+        while True:
+            time.sleep(3600)
+    except KeyboardInterrupt:
+        print("Main process stopped.")
