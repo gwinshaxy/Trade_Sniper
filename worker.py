@@ -1,6 +1,7 @@
 import time
 import logging
 import os
+import gc
 import pandas as pd
 from dotenv import load_dotenv
 
@@ -34,7 +35,8 @@ def run_worker_loop():
                 # --- PHASE 1: EVALUATE NEW TRADING SIGNALS ---
                 for symbol in SYMBOLS:
                     try:
-                        df = fetch_klines(symbol=symbol, interval="1h", limit=300)
+                        # Reduced limit from 300 to 150 to keep memory low
+                        df = fetch_klines(symbol=symbol, interval="1h", limit=150)
                         if not df.empty:
                             signal = evaluate_signals(df, symbol=symbol, account_balance=ACCOUNT_BALANCE)
                             if signal.get("action") in ["BUY", "SELL"]:
@@ -85,7 +87,7 @@ def run_worker_loop():
                     for tr in open_trades:
                         trade_id, pair, direction, entry, sl, tp, pos_size, acct_bal, state = tr
 
-                        df = fetch_klines(symbol=pair, interval="1h", limit=300)
+                        df = fetch_klines(symbol=pair, interval="1h", limit=150)
                         if not df.empty:
                             config = load_symbol_config(pair)
                             tema_period = int(config.get("tema_period", 200))
@@ -150,6 +152,8 @@ def run_worker_loop():
                     conn.close()
                 except Exception:
                     pass
+            # Force RAM cleanup on each cycle
+            gc.collect()
 
         time.sleep(POLL_INTERVAL_SECONDS)
 

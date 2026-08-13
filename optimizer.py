@@ -6,7 +6,6 @@ import logging
 import pandas as pd
 import numpy as np
 import psycopg2
-from multiprocessing import Pool
 from deap import base, creator, tools
 from dotenv import load_dotenv
 
@@ -68,13 +67,9 @@ if not hasattr(creator, "FitnessMax"):
 if not hasattr(creator, "Individual"):
     creator.create("Individual", list, fitness=creator.FitnessMax)
 
-def init_worker(data):
-    global GLOBAL_DATA
-    GLOBAL_DATA = data
-
 def evaluate_strategy(individual):
     global GLOBAL_DATA
-    if GLOBAL_DATA is None or GLOBAL_DATA.empty or len(GLOBAL_DATA) < 300:
+    if GLOBAL_DATA is None or GLOBAL_DATA.empty or len(GLOBAL_DATA) < 200:
         return (-999.0,)
 
     (
@@ -96,7 +91,7 @@ def evaluate_strategy(individual):
     combined_signal = np.where(long_signal, 1.0, np.where(short_signal, -1.0, 0.0))
 
     # Reject strategies with insufficient trading frequency
-    if np.count_nonzero(np.diff(combined_signal)) < 15:
+    if np.count_nonzero(np.diff(combined_signal)) < 10:
         return (-999.0,)
 
     returns = df_close.pct_change().fillna(0)
@@ -146,25 +141,24 @@ toolbox.register("select", tools.selTournament, tournsize=3)
 
 def run_optimization(symbol="BTC/USDT"):
     global GLOBAL_DATA
-    data_df = strategy.fetch_klines(symbol=symbol, interval="1h", limit=3000)
+    # Fetch 1,000 candles max to keep memory overhead light
+    data_df = strategy.fetch_klines(symbol=symbol, interval="1h", limit=1000)
     if data_df.empty:
         logging.warning(f"Could not fetch historical klines for {symbol}. Skipping optimization.")
         return None
 
     GLOBAL_DATA = data_df
 
-    pool = Pool(processes=2, initializer=init_worker, initargs=(data_df,))
-    toolbox.register("map", pool.map)
-
-    pop = toolbox.population(n=30)
+    # Single-threaded execution for low-memory environments (prevents process duplication OOM)
+    pop = toolbox.population(n=20)
     hof = tools.HallOfFame(maxsize=1)
 
     invalid_ind = [ind for ind in pop if not ind.fitness.valid]
-    for ind, fit in zip(invalid_ind, toolbox.map(toolbox.evaluate, invalid_ind)):
-        ind.fitness.values = fit
+    for ind in invalid_ind:
+        ind.fitness.values = evaluate_strategy(ind)
     hof.update(pop)
 
-    for gen in range(1, 11):
+    for gen in range(1, 6):
         offspring = list(map(toolbox.clone, toolbox.select(pop, len(pop))))
         for c1, c2 in zip(offspring[::2], offspring[1::2]):
             if random.random() < 0.6:
@@ -176,16 +170,12 @@ def run_optimization(symbol="BTC/USDT"):
                 del mutant.fitness.values
 
         invalid_ind = [ind for ind in offspring if not ind.fitness.valid]
-        for ind, fit in zip(invalid_ind, toolbox.map(toolbox.evaluate, invalid_ind)):
-            ind.fitness.values = fit
+        for ind in invalid_ind:
+            ind.fitness.values = evaluate_strategy(ind)
 
         pop[:] = offspring
         hof.update(pop)
         gc.collect()
-
-    pool.close()
-    pool.join()
-    toolbox.unregister("map")
 
     if len(hof) > 0:
         best_params = hof[0]
@@ -208,6 +198,7 @@ if __name__ == "__main__":
             for symbol in symbols:
                 logging.info(f"Starting DEAP optimization run for {symbol}...")
                 run_optimization(symbol=symbol)
+                time.sleep(15)  # Rest period between symbols to avoid memory/CPU accumulation
         except Exception as e:
             logging.error(f"Error in optimization cycle: {e}")
-        time.sleep(86400)
+        time.sleep(14400)  # Re-optimize every 4 hours instead of continuous loops

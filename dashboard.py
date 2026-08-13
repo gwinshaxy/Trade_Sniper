@@ -1,17 +1,39 @@
 import os
+import sys
 import json
+import logging
+import subprocess
+import psutil
 import numpy as np
 import pandas as pd
 import streamlit as st
 from dotenv import load_dotenv
 from lightweight_charts.widgets import StreamlitChart
 
-from app_manager import start_background_tasks
+load_dotenv()
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
-start_background_tasks()
+# --- SINGLETON PROCESS GUARD FOR RENDER 512MB RAM ---
+def ensure_background_process(script_name: str):
+    """Ensures a script runs as a single background process across Streamlit reruns."""
+    for proc in psutil.process_iter(['cmdline']):
+        try:
+            cmd = proc.info.get('cmdline')
+            if cmd and any(script_name in arg for arg in cmd):
+                logging.info(f"Process '{script_name}' is already running (PID {proc.pid}). Skipping spawn.")
+                return
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+
+    logging.info(f"Starting background process: {script_name}...")
+    subprocess.Popen([sys.executable, script_name])
+
+# Spawn background services safely without duplication
+ensure_background_process("worker.py")
+ensure_background_process("price_monitor.py")
+ensure_background_process("optimizer.py")
 
 st.set_page_config(page_title="Trading Terminal", layout="wide")
-load_dotenv()
 
 HTTP_PROXY = os.getenv("HTTP_PROXY") or os.getenv("PROXY_URL")
 HTTPS_PROXY = os.getenv("HTTPS_PROXY") or os.getenv("PROXY_URL")
