@@ -6,104 +6,26 @@ import logging
 import pandas as pd
 import numpy as np
 import psycopg2
-import requests
 from multiprocessing import Pool
 from deap import base, creator, tools
 from dotenv import load_dotenv
+
+from common import get_db_connection, ensure_schema_updated
+import strategy
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 GLOBAL_DATA = None
 
-def get_db_connection():
-    db_url = os.getenv("DATABASE_URL")
-    if not db_url:
-        return None
-    try:
-        return psycopg2.connect(db_url)
-    except Exception as e:
-        logging.error(f"Failed to connect to database: {e}")
-        return None
-
-def ensure_tables_exist():
-    conn = get_db_connection()
-    if not conn:
-        return
-    try:
-        with conn.cursor() as cur:
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS strategy_parameters (
-                    id SERIAL PRIMARY KEY,
-                    symbol VARCHAR(20) UNIQUE NOT NULL,
-                    tema_period INT NOT NULL DEFAULT 200,
-                    rsi_period INT NOT NULL DEFAULT 14,
-                    rsi_thresh FLOAT DEFAULT 42.0,
-                    adx_period INT DEFAULT 14,
-                    adx_threshold FLOAT DEFAULT 20.0,
-                    use_adx_filter BOOLEAN DEFAULT TRUE,
-                    max_sl_pct FLOAT DEFAULT 0.02,
-                    zone_tolerance NUMERIC NOT NULL DEFAULT 0.0075,
-                    min_sentiment NUMERIC NOT NULL DEFAULT 0.0,
-                    risk_pct NUMERIC NOT NULL DEFAULT 1.0,
-                    min_rr NUMERIC NOT NULL DEFAULT 2.0,
-                    vp_detection_pct NUMERIC NOT NULL DEFAULT 0.07,
-                    use_rsi_filter BOOLEAN DEFAULT TRUE,
-                    use_candlestick_confirm BOOLEAN DEFAULT TRUE,
-                    fitness_score NUMERIC DEFAULT 0.0,
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                );
-            """)
-            conn.commit()
-        conn.close()
-    except Exception as e:
-        logging.error(f"Failed to update schema: {e}")
-
-def fetch_binance_klines_direct(symbol="BTC/USDT", interval="1h", limit=3000):
-    clean_symbol = symbol.replace("/", "").upper()
-    url = f"https://api.binance.com/api/v3/klines?symbol={clean_symbol}&interval={interval}&limit={limit}"
-    response = requests.get(url, timeout=10)
-    if response.status_code == 200:
-        data = response.json()
-        df = pd.DataFrame(data, columns=[
-            "timestamp", "open", "high", "low", "close", "volume",
-            "close_time", "quote_asset_volume", "number_of_trades",
-            "taker_buy_base_asset_volume", "taker_buy_quote_asset_volume", "ignore"
-        ])
-        df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
-        for col in ["open", "high", "low", "close", "volume"]:
-            df[col] = df[col].astype(float)
-        return df[["timestamp", "open", "high", "low", "close", "volume"]]
-    else:
-        raise Exception(f"Binance API Error Status {response.status_code}")
-
-def fetch_historical_candles(symbol="BTC/USDT", limit=3000):
-    ensure_tables_exist()
-    clean_symbol = symbol.replace("/", "").upper()
-    try:
-        df = fetch_binance_klines_direct(symbol=clean_symbol, interval="1h", limit=limit)
-        if not df.empty:
-            return df
-    except Exception:
-        pass
-
-    np.random.seed(42)
-    returns = np.random.normal(0.0003, 0.02, limit)
-    close_prices = 50000 * np.exp(np.cumsum(returns))
-    return pd.DataFrame({
-        "timestamp": pd.date_range(end=pd.Timestamp.now(), periods=limit, freq="1h"),
-        "open": close_prices * 0.999, "high": close_prices * 1.002,
-        "low": close_prices * 0.998, "close": close_prices,
-        "volume": np.random.randint(100, 1000, size=limit)
-    })
-
 def save_optimized_parameters(symbol, best_params, fitness_score):
-    ensure_tables_exist()
+    """Saves or updates optimized strategy parameters in the database."""
+    ensure_schema_updated()
     conn = get_db_connection()
     if not conn:
         return
     try:
-        clean_symbol = symbol.replace("/", "").upper()
+        clean_symbol = symbol.replace("/", "").strip().upper()
         cursor = conn.cursor()
         (
             tema_period, rsi_period, rsi_thresh, adx_period, adx_threshold, 
@@ -137,8 +59,9 @@ def save_optimized_parameters(symbol, best_params, fitness_score):
         conn.commit()
         cursor.close()
         conn.close()
+        logging.info(f"Successfully saved DEAP optimization parameters for {clean_symbol} (Fitness: {fitness_score:.4f})")
     except Exception as e:
-        logging.error(f"Failed to save parameters: {e}")
+        logging.error(f"Failed to save parameters for {symbol}: {e}")
 
 if not hasattr(creator, "FitnessMax"):
     creator.create("FitnessMax", base.Fitness, weights=(1.0,))
@@ -149,22 +72,9 @@ def init_worker(data):
     global GLOBAL_DATA
     GLOBAL_DATA = data
 
-def compute_tema(series, period):
-    ema1 = series.ewm(span=period, adjust=False).mean()
-    ema2 = ema1.ewm(span=period, adjust=False).mean()
-    ema3 = ema2.ewm(span=period, adjust=False).mean()
-    return 3 * ema1 - 3 * ema2 + ema3
-
-def compute_rsi(series, period=14):
-    delta = series.diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
-    rs = gain / loss.replace(0, np.nan)
-    return (100 - (100 / (1 + rs))).fillna(50)
-
 def evaluate_strategy(individual):
     global GLOBAL_DATA
-    if GLOBAL_DATA is None or GLOBAL_DATA.empty:
+    if GLOBAL_DATA is None or GLOBAL_DATA.empty or len(GLOBAL_DATA) < 300:
         return (-999.0,)
 
     (
@@ -174,16 +84,18 @@ def evaluate_strategy(individual):
 
     df_close = GLOBAL_DATA["close"]
     
-    tema_series = compute_tema(df_close, period=int(tema_period))
-    rsi_series = compute_rsi(df_close, period=int(rsi_period))
+    tema_series = strategy.calc_tema(df_close, period=int(tema_period))
+    rsi_series = strategy.calc_rsi(df_close, period=int(rsi_period))
+    adx_series = strategy.calc_adx(GLOBAL_DATA, period=int(adx_period))
 
     upper_zone = tema_series * (1.0 + zone_tolerance)
     lower_zone = tema_series * (1.0 - zone_tolerance)
 
-    long_signal = (df_close > upper_zone) & (rsi_series > rsi_thresh)
-    short_signal = (df_close < lower_zone) & (rsi_series < (100.0 - rsi_thresh))
+    long_signal = (df_close > upper_zone) & (rsi_series > rsi_thresh) & (adx_series > adx_threshold)
+    short_signal = (df_close < lower_zone) & (rsi_series < (100.0 - rsi_thresh)) & (adx_series > adx_threshold)
     combined_signal = np.where(long_signal, 1.0, np.where(short_signal, -1.0, 0.0))
 
+    # Reject strategies with insufficient trading frequency
     if np.count_nonzero(np.diff(combined_signal)) < 15:
         return (-999.0,)
 
@@ -199,16 +111,16 @@ def evaluate_strategy(individual):
 
 def create_random_individual():
     return creator.Individual([
-        random.randint(50, 300),           # tema_period
-        random.randint(7, 30),             # rsi_period
-        round(random.uniform(30.0, 50.0), 1),# rsi_thresh
-        random.randint(7, 30),             # adx_period
-        round(random.uniform(15.0, 30.0), 1),# adx_threshold
-        round(random.uniform(0.01, 0.05), 3),# max_sl_pct
+        random.randint(50, 300),              # tema_period
+        random.randint(7, 30),                # rsi_period
+        round(random.uniform(30.0, 50.0), 1), # rsi_thresh
+        random.randint(7, 30),                # adx_period
+        round(random.uniform(15.0, 35.0), 1), # adx_threshold
+        round(random.uniform(0.01, 0.05), 3), # max_sl_pct
         round(random.uniform(0.005, 0.030), 4),# zone_tolerance
-        round(random.uniform(-0.5, 0.5), 2),# min_sentiment
-        round(random.uniform(0.5, 3.0), 2), # risk_pct
-        round(random.uniform(1.2, 4.0), 2)  # min_rr
+        round(random.uniform(-0.5, 0.5), 2),  # min_sentiment
+        round(random.uniform(0.5, 3.0), 2),    # risk_pct
+        round(random.uniform(1.2, 4.0), 2)     # min_rr
     ])
 
 def mutate_individual(individual, indpb=0.25):
@@ -216,7 +128,7 @@ def mutate_individual(individual, indpb=0.25):
     if random.random() < indpb: individual[1] = random.randint(7, 30)
     if random.random() < indpb: individual[2] = round(random.uniform(30.0, 50.0), 1)
     if random.random() < indpb: individual[3] = random.randint(7, 30)
-    if random.random() < indpb: individual[4] = round(random.uniform(15.0, 30.0), 1)
+    if random.random() < indpb: individual[4] = round(random.uniform(15.0, 35.0), 1)
     if random.random() < indpb: individual[5] = round(random.uniform(0.01, 0.05), 3)
     if random.random() < indpb: individual[6] = round(random.uniform(0.005, 0.030), 4)
     if random.random() < indpb: individual[7] = round(random.uniform(-0.5, 0.5), 2)
@@ -234,13 +146,17 @@ toolbox.register("select", tools.selTournament, tournsize=3)
 
 def run_optimization(symbol="BTC/USDT"):
     global GLOBAL_DATA
-    data_df = fetch_historical_candles(symbol=symbol, limit=3000)
+    data_df = strategy.fetch_klines(symbol=symbol, interval="1h", limit=3000)
+    if data_df.empty:
+        logging.warning(f"Could not fetch historical klines for {symbol}. Skipping optimization.")
+        return None
+
     GLOBAL_DATA = data_df
 
     pool = Pool(processes=2, initializer=init_worker, initargs=(data_df,))
     toolbox.register("map", pool.map)
 
-    pop = toolbox.population(n=20)
+    pop = toolbox.population(n=30)
     hof = tools.HallOfFame(maxsize=1)
 
     invalid_ind = [ind for ind in pop if not ind.fitness.valid]
@@ -248,7 +164,7 @@ def run_optimization(symbol="BTC/USDT"):
         ind.fitness.values = fit
     hof.update(pop)
 
-    for _ in range(1, 11):
+    for gen in range(1, 11):
         offspring = list(map(toolbox.clone, toolbox.select(pop, len(pop))))
         for c1, c2 in zip(offspring[::2], offspring[1::2]):
             if random.random() < 0.6:
@@ -271,16 +187,26 @@ def run_optimization(symbol="BTC/USDT"):
     pool.join()
     toolbox.unregister("map")
 
-    best_params = hof[0]
-    save_optimized_parameters(symbol, best_params, hof[0].fitness.values[0])
+    if len(hof) > 0:
+        best_params = hof[0]
+        save_optimized_parameters(symbol, best_params, hof[0].fitness.values[0])
+        GLOBAL_DATA = None
+        gc.collect()
+        return best_params
+
     GLOBAL_DATA = None
     gc.collect()
-    return best_params
+    return None
 
 if __name__ == "__main__":
+    ensure_schema_updated()
+    symbols_env = os.getenv("SYMBOLS") or os.getenv("SYMBOL", "ETH/USDT,BNB/USDT,SOL/USDT")
+    symbols = [s.strip().upper() for s in symbols_env.split(",")]
+
     while True:
         try:
-            for symbol in ["BNB/USDT", "ETH/USDT", "SOL/USDT"]:
+            for symbol in symbols:
+                logging.info(f"Starting DEAP optimization run for {symbol}...")
                 run_optimization(symbol=symbol)
         except Exception as e:
             logging.error(f"Error in optimization cycle: {e}")

@@ -14,12 +14,36 @@ class DynamicTradeManager:
         state = trade_row.get('trade_state', 'OPEN')
         
         curr_price = float(latest_candle['close'])
-        
-        # Harmonized lookup for TEMA under both keys ('200_TEMA' and 'tema')
         tema = float(latest_candle.get('200_TEMA', latest_candle.get('tema', curr_price)))
         initial_risk = abs(entry - curr_sl)
 
-        # 1. Break-Even Check (at 1:1 R:R)
+        # -------------------------------------------------------------
+        # 1. STOP LOSS BREACH CHECK (HIGHEST PRIORITY)
+        # -------------------------------------------------------------
+        sl_hit = (curr_price <= curr_sl) if direction == 'LONG' else (curr_price >= curr_sl)
+        if sl_hit:
+            return {
+                "action": "CLOSE_SL",
+                "trade_id": trade_id,
+                "exit_price": curr_sl,
+                "msg": f"🔴 <b>STOP LOSS HIT</b>\n\nTrade #{trade_id} hit Stop Loss at ${curr_sl:.5f}!"
+            }
+
+        # -------------------------------------------------------------
+        # 2. TAKE PROFIT BREACH CHECK
+        # -------------------------------------------------------------
+        tp_hit = (curr_price >= curr_tp) if direction == 'LONG' else (curr_price <= curr_tp)
+        if tp_hit:
+            return {
+                "action": "CLOSE_TP",
+                "trade_id": trade_id,
+                "exit_price": curr_tp,
+                "msg": f"🟢 <b>TAKE PROFIT HIT</b>\n\nTrade #{trade_id} hit Take Profit at ${curr_tp:.5f}!"
+            }
+
+        # -------------------------------------------------------------
+        # 3. BREAK-EVEN CHECK (At 1:1 R:R)
+        # -------------------------------------------------------------
         if state == 'OPEN':
             tp1_target = entry + initial_risk if direction == 'LONG' else entry - initial_risk
             be_triggered = (curr_price >= tp1_target) if direction == 'LONG' else (curr_price <= tp1_target)
@@ -34,7 +58,9 @@ class DynamicTradeManager:
                     "msg": f"🎯 Trade #{trade_id} hit 1:1 R:R. Moving Stop Loss to Break-Even (${be_price:.5f})."
                 }
 
-        # 2. Dynamic Trailing Stop along TEMA
+        # -------------------------------------------------------------
+        # 4. DYNAMIC TRAILING STOP ALONG TEMA
+        # -------------------------------------------------------------
         elif state in ['BE_LOCKED', 'TRAILING']:
             if direction == 'LONG':
                 proposed_sl = tema * (1 - self.tema_offset_pct)

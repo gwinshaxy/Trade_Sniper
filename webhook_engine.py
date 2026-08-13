@@ -46,7 +46,13 @@ def settle_trade(payload: SettlementPayload):
         conn.commit()
         
         emoji = "🟢" if outcome == "WIN" else "🔴"
-        send_telegram_notification(f"<b>{emoji} TRADE SETTLED VIA WEBHOOK</b>\n\n<b>Trade ID:</b> <code>#{trade_id}</code>\n<b>PnL:</b> ${pnl_usd:,.2f} ({outcome})")
+        send_telegram_notification(
+            f"<b>{emoji} TRADE SETTLED VIA WEBHOOK</b>\n\n"
+            f"<b>Trade ID:</b> <code>#{trade_id}</code>\n"
+            f"<b>Pair:</b> <code>{pair}</code>\n"
+            f"<b>Exit Price:</b> ${payload.exit_price:.5f}\n"
+            f"<b>PnL:</b> ${pnl_usd:,.2f} ({outcome})"
+        )
         return {"status": "success", "trade_id": trade_id, "pnl_usd": pnl_usd, "pnl_pct": pnl_pct, "outcome": outcome}
     finally:
         cursor.close()

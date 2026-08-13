@@ -49,6 +49,7 @@ from common import (
     ensure_schema_updated,
     get_db_connection,
     send_telegram_notification,
+    close_trade_manually,
 )
 import strategy
 
@@ -99,7 +100,7 @@ st.sidebar.subheader("🎯 Strategy Parameters (Harmonized)")
 config_target_pair = st.sidebar.selectbox("Load Dynamic Config For:", available_pairs, index=0)
 dyn_cfg = strategy.load_symbol_config(config_target_pair)
 
-lookback_bars = st.sidebar.number_input("Lookback Bars (Range)", value=600, min_value=100, max_value=2000, step=50)
+lookback_bars = st.sidebar.number_input("Lookback Bars (Range)", value=1000, min_value=100, max_value=2000, step=50)
 tema_period = st.sidebar.number_input("TEMA Period", value=int(dyn_cfg.get("tema_period", 200)), min_value=10, max_value=500)
 rsi_period = st.sidebar.number_input("RSI Period", value=int(dyn_cfg.get("rsi_period", 14)), min_value=2, max_value=50)
 rsi_thresh = st.sidebar.slider("RSI Threshold", min_value=20, max_value=80, value=int(dyn_cfg.get("rsi_thresh", 42)))
@@ -251,12 +252,53 @@ else:
     st.warning(f"Could not load market chart for {chart_symbol}.")
 
 st.markdown("---")
-tab_pending, tab_history = st.tabs(["⏳ Pending / Setups", "📜 Cumulative Trades History"])
+tab_pending, tab_history = st.tabs(["⏳ Active / Manual Management", "📜 Cumulative Trades History"])
 with tab_pending:
+    st.subheader("🛠️ Active Trade Management & Manual Overrides")
     df_active = pd.read_sql("SELECT id, pair, direction, entry_price, stop_loss, take_profit, risk_reward_ratio AS rrr, risk_pct AS risk_p, position_size, status, trade_state, created_at FROM trade_setups WHERE status IN ('EXECUTED', 'PENDING');", database_url) if database_url else pd.DataFrame()
+    
     if not df_active.empty:
         df_active['pair'] = df_active['pair'].apply(normalize_symbol)
         st.dataframe(df_active, width="stretch")
+        
+        st.markdown("### 🔧 Manual Trade Control Action")
+        selected_trade_id = st.selectbox("Select Trade ID to Manage:", df_active['id'].tolist())
+        selected_trade_row = df_active[df_active['id'] == selected_trade_id].iloc[0]
+        
+        col_m1, col_m2, col_m3 = st.columns(3)
+        with col_m1:
+            new_sl = st.number_input("Update SL ($)", value=float(selected_trade_row['stop_loss']), format="%.5f")
+            if st.button("Update Stop Loss"):
+                conn = get_db_connection()
+                cur = conn.cursor()
+                cur.execute("UPDATE trade_setups SET stop_loss = %s WHERE id = %s;", (new_sl, selected_trade_id))
+                conn.commit()
+                cur.close()
+                conn.close()
+                st.success(f"Updated SL for Trade #{selected_trade_id} to ${new_sl:.5f}")
+                st.rerun()
+
+        with col_m2:
+            new_tp = st.number_input("Update TP ($)", value=float(selected_trade_row['take_profit']), format="%.5f")
+            if st.button("Update Take Profit"):
+                conn = get_db_connection()
+                cur = conn.cursor()
+                cur.execute("UPDATE trade_setups SET take_profit = %s WHERE id = %s;", (new_tp, selected_trade_id))
+                conn.commit()
+                cur.close()
+                conn.close()
+                st.success(f"Updated TP for Trade #{selected_trade_id} to ${new_tp:.5f}")
+                st.rerun()
+
+        with col_m3:
+            exit_price_input = st.number_input("Manual Exit Price ($)", value=float(selected_trade_row['entry_price']), format="%.5f")
+            if st.button("🚨 Market Close Trade Now", type="primary"):
+                if close_trade_manually(selected_trade_id, exit_price_input, reason="MANUAL_OVERRIDE"):
+                    st.success(f"Trade #{selected_trade_id} successfully closed manually.")
+                    st.rerun()
+                else:
+                    st.error("Failed to close trade.")
+
     else:
         st.info("No active setups found.")
 

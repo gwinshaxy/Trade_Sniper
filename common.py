@@ -117,3 +117,51 @@ def send_telegram_notification(message: str) -> bool:
     except Exception as e:
         print(f"[Telegram Alert Error]: {e}")
         return False
+
+def close_trade_manually(trade_id: int, exit_price: float, reason: str = "MANUAL_CLOSE"):
+    """Manually closes an active trade, updates PnL, and notifies via Telegram."""
+    conn = get_db_connection()
+    if not conn:
+        return False
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT direction, entry_price, position_size, account_balance, pair 
+            FROM trade_setups WHERE id = %s AND status IN ('EXECUTED', 'PENDING');
+        """, (trade_id,))
+        row = cursor.fetchone()
+        if not row:
+            cursor.close()
+            conn.close()
+            return False
+
+        direction, entry_price, position_size, account_balance, pair = row
+        pnl_usd, pnl_pct, outcome = calculate_pnl(
+            direction, float(entry_price), float(exit_price), float(position_size), float(account_balance or 10000.0)
+        )
+
+        cursor.execute("""
+            UPDATE trade_setups
+            SET exit_price = %s, pnl_usd = %s, pnl_pct = %s, outcome = %s,
+                status = 'CLOSED', trade_state = 'CLOSED', closed_at = CURRENT_TIMESTAMP
+            WHERE id = %s;
+        """, (round(exit_price, 5), pnl_usd, pnl_pct, outcome, trade_id))
+        conn.commit()
+        cursor.close()
+        conn.close()
+
+        emoji = "🔴" if pnl_usd < 0 else "🟢"
+        send_telegram_notification(
+            f"<b>{emoji} MANUAL TRADE CLOSED ({reason})</b>\n\n"
+            f"<b>Trade ID:</b> <code>#{trade_id}</code>\n"
+            f"<b>Pair:</b> <code>{pair}</code>\n"
+            f"<b>Exit Price:</b> ${exit_price:.5f}\n"
+            f"<b>PnL:</b> ${pnl_usd:,.2f} ({pnl_pct:.2f}%)"
+        )
+        return True
+    except Exception as e:
+        if conn:
+            conn.rollback()
+            conn.close()
+        print(f"[Manual Close Error]: {e}")
+        return False

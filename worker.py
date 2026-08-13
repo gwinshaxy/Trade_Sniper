@@ -8,7 +8,7 @@ load_dotenv()
 
 from strategy import fetch_klines, evaluate_signals, load_symbol_config, calc_tema
 from agent import DynamicTradeManager
-from common import get_db_connection, ensure_schema_updated, send_telegram_notification
+from common import get_db_connection, ensure_schema_updated, send_telegram_notification, calculate_pnl
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
@@ -50,7 +50,7 @@ def run_worker_loop():
                                 # Prevent duplicate active orders on the same pair
                                 with conn.cursor() as cur:
                                     cur.execute(
-                                        "SELECT id FROM trade_setups WHERE pair = %s AND status = 'EXECUTED' AND trade_state = 'OPEN';",
+                                        "SELECT id FROM trade_setups WHERE pair = %s AND status = 'EXECUTED' AND trade_state != 'CLOSED';",
                                         (pair,)
                                     )
                                     existing = cur.fetchone()
@@ -76,14 +76,14 @@ def run_worker_loop():
                     except Exception as sym_err:
                         logging.error(f"[PHASE 1] Error evaluating signal for {symbol}: {sym_err}")
 
-                # --- PHASE 2: MANAGE OPEN POSITIONS (TRAILING STOP / BE) ---
+                # --- PHASE 2: MANAGE OPEN POSITIONS (TRAILING STOP / BE / CLOSES) ---
                 try:
                     with conn.cursor() as cur:
-                        cur.execute("SELECT id, pair, direction, entry_price, stop_loss, take_profit, trade_state FROM trade_setups WHERE status = 'EXECUTED' AND trade_state != 'CLOSED';")
+                        cur.execute("SELECT id, pair, direction, entry_price, stop_loss, take_profit, position_size, account_balance, trade_state FROM trade_setups WHERE status = 'EXECUTED' AND trade_state != 'CLOSED';")
                         open_trades = cur.fetchall()
 
                     for tr in open_trades:
-                        trade_id, pair, direction, entry, sl, tp, state = tr
+                        trade_id, pair, direction, entry, sl, tp, pos_size, acct_bal, state = tr
 
                         df = fetch_klines(symbol=pair, interval="1h", limit=300)
                         if not df.empty:
@@ -103,8 +103,34 @@ def run_worker_loop():
                             })
 
                             action_res = trade_manager.process_trade(trade_row, latest_candle)
+                            action = action_res.get("action")
 
-                            if action_res.get("action") == "UPDATE_SL":
+                            # Handle Stop Loss or Take Profit Settlement
+                            if action in ["CLOSE_SL", "CLOSE_TP"]:
+                                exit_price = action_res["exit_price"]
+                                pnl_usd, pnl_pct, outcome = calculate_pnl(
+                                    direction, float(entry), float(exit_price), float(pos_size), float(acct_bal or ACCOUNT_BALANCE)
+                                )
+
+                                with conn.cursor() as cur:
+                                    cur.execute(
+                                        """
+                                        UPDATE trade_setups 
+                                        SET exit_price = %s, pnl_usd = %s, pnl_pct = %s, outcome = %s, status = 'CLOSED', trade_state = 'CLOSED', closed_at = CURRENT_TIMESTAMP 
+                                        WHERE id = %s;
+                                        """,
+                                        (exit_price, pnl_usd, pnl_pct, outcome, trade_id)
+                                    )
+                                    conn.commit()
+
+                                send_telegram_notification(
+                                    f"{action_res['msg']}\n\n"
+                                    f"<b>PnL:</b> ${pnl_usd:,.2f} ({outcome})\n"
+                                    f"<b>Exit Price:</b> ${exit_price:.5f}"
+                                )
+
+                            # Handle Trailing Stop or Break-Even SL Update
+                            elif action == "UPDATE_SL":
                                 with conn.cursor() as cur:
                                     cur.execute(
                                         "UPDATE trade_setups SET stop_loss = %s, trade_state = %s WHERE id = %s;", 
@@ -112,6 +138,7 @@ def run_worker_loop():
                                     )
                                     conn.commit()
                                 send_telegram_notification(action_res['msg'])
+
                 except Exception as pos_err:
                     logging.error(f"[PHASE 2] Error managing open positions: {pos_err}")
 
