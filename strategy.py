@@ -32,7 +32,7 @@ def normalize_symbol(symbol: str) -> str:
 
 
 def load_symbol_config(symbol: str) -> dict:
-    """Loads optimized strategy parameters from PostgreSQL database safely closing connections in a finally block."""
+    """Loads optimized strategy parameters from PostgreSQL database safely with non-null fallbacks."""
     clean_symbol = normalize_symbol(symbol).replace("/", "").upper()
     db_url = os.getenv("DATABASE_URL")
     
@@ -56,13 +56,13 @@ def load_symbol_config(symbol: str) -> dict:
                 row = cur.fetchone()
                 if row:
                     config = dict(row)
-                    config.setdefault("rsi_thresh", 42.0)
-                    config.setdefault("use_rsi_filter", True)
-                    config.setdefault("use_candlestick_confirm", True)
-                    config.setdefault("use_adx_filter", True)
-                    config.setdefault("adx_period", 14)
-                    config.setdefault("adx_threshold", 20.0)
-                    config.setdefault("max_sl_pct", 0.02)
+                    config["rsi_thresh"] = float(config.get("rsi_thresh") or 42.0)
+                    config["use_rsi_filter"] = bool(config.get("use_rsi_filter", True))
+                    config["use_candlestick_confirm"] = bool(config.get("use_candlestick_confirm", True))
+                    config["use_adx_filter"] = bool(config.get("use_adx_filter", True))
+                    config["adx_period"] = int(config.get("adx_period") or 14)
+                    config["adx_threshold"] = float(config.get("adx_threshold") or 20.0)
+                    config["max_sl_pct"] = float(config.get("max_sl_pct") or 0.02)
                     logging.debug(f"[load_symbol_config] Loaded dynamic DEAP params for {clean_symbol}")
                     return config
                 else:
@@ -103,7 +103,6 @@ def get_ai_sentiment_score(text: str) -> float:
 
 
 def fetch_cryptocompare_klines(symbol: str = "ETH/USDT", limit: int = 1000) -> pd.DataFrame:
-    """Fallback: CryptoCompare Historical Hourly Data API."""
     try:
         clean = symbol.replace("/", "").upper()
         fsym = clean[:-4] if clean.endswith("USDT") else clean[:-3]
@@ -135,11 +134,9 @@ def fetch_klines(symbol: str = "BNB/USDT", interval: str = "1h", limit: int = 10
     norm_sym = normalize_symbol(symbol)
     binance_symbol = norm_sym.replace("/", "")
     
-    # Bybit Interval Mapping
     bybit_interval_map = {"1m": "1", "5m": "5", "15m": "15", "1h": "60", "4h": "240", "1d": "D"}
     bybit_interval = bybit_interval_map.get(interval, "60")
 
-    # 1. Primary & Exchange Endpoints
     urls = [
         f"https://api.binance.com/api/v3/klines?symbol={binance_symbol}&interval={interval}&limit={min(limit, 1000)}",
         f"https://api.binance.us/api/v3/klines?symbol={binance_symbol}&interval={interval}&limit={min(limit, 1000)}",
@@ -152,7 +149,6 @@ def fetch_klines(symbol: str = "BNB/USDT", interval: str = "1h", limit: int = 10
             with urllib.request.urlopen(req, timeout=6) as resp:
                 data = json.loads(resp.read().decode('utf-8'))
             
-            # Binance / Binance US structure
             if isinstance(data, list) and len(data) > 0:
                 df = pd.DataFrame(data, columns=['open_time', 'open', 'high', 'low', 'close', 'volume', 'close_time', 'qav', 'not', 'tbba', 'tbqa', 'ignore'])
                 df['time'] = pd.to_datetime(df['open_time'], unit='ms').dt.strftime('%Y-%m-%d %H:%M:%S')
@@ -160,7 +156,6 @@ def fetch_klines(symbol: str = "BNB/USDT", interval: str = "1h", limit: int = 10
                     df[col] = df[col].astype(float)
                 return df[['time', 'open', 'high', 'low', 'close', 'volume']]
             
-            # Bybit structure
             elif isinstance(data, dict) and 'result' in data and 'list' in data['result']:
                 raw_list = data['result']['list']
                 df = pd.DataFrame(raw_list, columns=['open_time', 'open', 'high', 'low', 'close', 'volume', 'turnover'])
@@ -174,7 +169,6 @@ def fetch_klines(symbol: str = "BNB/USDT", interval: str = "1h", limit: int = 10
             logging.debug(f"[fetch_klines] Endpoint bypassed ({url}): {err}")
             continue
 
-    # 2. Third-Party Fallback (CryptoCompare)
     df_fallback = fetch_cryptocompare_klines(symbol=norm_sym, limit=limit)
     if not df_fallback.empty:
         logging.info(f"[fetch_klines] Successfully retrieved fallback data from CryptoCompare for {norm_sym}")
@@ -204,7 +198,6 @@ def calc_rsi(series: pd.Series, period: int = 14) -> pd.Series:
 
 
 def calc_adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
-    """Calculates Average Directional Index (ADX) with optimized series manipulation to avoid full DataFrame duplication overhead."""
     if df.empty or len(df) < period + 1:
         return pd.Series(0.0, index=df.index)
 
@@ -223,7 +216,6 @@ def calc_adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
     plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
     minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
 
-    # Wilder's Smoothing
     tr_smooth = tr.ewm(alpha=1/period, adjust=False).mean()
     plus_di = 100 * (pd.Series(plus_dm, index=df.index).ewm(alpha=1/period, adjust=False).mean() / tr_smooth.replace(0, np.nan))
     minus_di = 100 * (pd.Series(minus_dm, index=df.index).ewm(alpha=1/period, adjust=False).mean() / tr_smooth.replace(0, np.nan))
@@ -239,7 +231,6 @@ def compute_volume_profile(
     lookback_bars: int = 600,
     va_pct: float = 0.70,
 ):
-    """Computes POC, VAH, and VAL aligned with TradingView's Fixed Range (600 bars, 70% Value Area)."""
     if (
         df.empty
         or "volume" not in df.columns
@@ -309,7 +300,6 @@ def compute_volume_profile(
 
 
 def calculate_volume_profile_gaps(df: pd.DataFrame, num_bins: int = 100, lookback_bars: int = 600, detection_pct: float = 0.07) -> list:
-    """Identifies Volume Profile Gaps (LVNs)."""
     if df.empty or 'volume' not in df.columns or 'high' not in df.columns or 'low' not in df.columns:
         return []
 
@@ -378,7 +368,6 @@ def evaluate_signals(df: pd.DataFrame, symbol: str = "ETH/USDT", account_balance
     if df.empty or len(df) < max(tema_period, adx_period + 1):
         return {"action": "HOLD", "reason": "Insufficient historical data for indicator convergence"}
 
-    # Calculate indicators on current timeframe
     df['tema'] = calc_tema(df['close'], period=tema_period)
     df['rsi'] = calc_rsi(df['close'], period=rsi_period)
     df['adx'] = calc_adx(df, period=adx_period)
@@ -389,14 +378,12 @@ def evaluate_signals(df: pd.DataFrame, symbol: str = "ETH/USDT", account_balance
     current_rsi = float(latest['rsi'])
     current_adx = float(latest['adx'])
 
-    # Chop/Trend Guardrail: ADX Threshold Check
     use_adx_filter = bool(kwargs.get("use_adx_filter", config.get("use_adx_filter", True)))
     adx_threshold = float(kwargs.get("adx_threshold", config.get("adx_threshold", 20.0)))
 
     if use_adx_filter and current_adx < adx_threshold:
         return {"action": "HOLD", "reason": f"ADX filter active: Market is choppy/ranging (ADX: {current_adx:.2f} < {adx_threshold:.2f})"}
 
-    # Higher Timeframe (4H) Trend Confirmation
     macro_trend_long = True
     macro_trend_short = True
     disable_htf = bool(kwargs.get("disable_htf", False))
@@ -414,7 +401,6 @@ def evaluate_signals(df: pd.DataFrame, symbol: str = "ETH/USDT", account_balance
         except Exception as e:
             logging.warning(f"[strategy.py] Could not fetch 4H trend context for {symbol}: {e}")
 
-    # Compute Volume Profile structures
     poc, vah, val = compute_volume_profile(df, lookback_bars=600)
     vp_gaps = calculate_volume_profile_gaps(df, detection_pct=float(config.get("vp_detection_pct", 0.07)))
 
@@ -431,7 +417,6 @@ def evaluate_signals(df: pd.DataFrame, symbol: str = "ETH/USDT", account_balance
     if sentiment_score < min_sentiment:
         return {"action": "HOLD", "reason": "Sentiment score below minimum threshold"}
 
-    # Define key confluence levels
     upper_tema_zone = current_tema * (1.0 + zone_tolerance)
     lower_tema_zone = current_tema * (1.0 - zone_tolerance)
 
@@ -441,11 +426,9 @@ def evaluate_signals(df: pd.DataFrame, symbol: str = "ETH/USDT", account_balance
     rsi_long_ok = (current_rsi >= rsi_thresh) if use_rsi else True
     rsi_short_ok = (current_rsi <= (100 - rsi_thresh)) if use_rsi else True
 
-    # Identify dynamic Volume Profile targets & stop anchors
     overhead_gaps = sorted([g for g in vp_gaps if g > current_close])
     underneath_gaps = sorted([g for g in vp_gaps if g < current_close], reverse=True)
 
-    # LONG Entry Confluence Check
     near_tema = lower_tema_zone <= current_close <= upper_tema_zone
     near_val = not np.isnan(val) and abs(current_close - val) / current_close <= zone_tolerance
     near_gap_support = len(underneath_gaps) > 0 and (current_close - underneath_gaps[0]) / current_close <= zone_tolerance
@@ -486,7 +469,6 @@ def evaluate_signals(df: pd.DataFrame, symbol: str = "ETH/USDT", account_balance
             "reason": "Long signal confirmed with TEMA, ADX trend strength, 4H HTF trend, and Volume Profile support confluence"
         }
 
-    # SHORT Entry Confluence Check
     near_vah = not np.isnan(vah) and abs(current_close - vah) / current_close <= zone_tolerance
     near_gap_resistance = len(overhead_gaps) > 0 and (overhead_gaps[0] - current_close) / current_close <= zone_tolerance
 

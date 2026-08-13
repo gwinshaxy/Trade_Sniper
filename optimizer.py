@@ -90,7 +90,6 @@ def evaluate_strategy(individual):
     short_signal = (df_close < lower_zone) & (rsi_series < (100.0 - rsi_thresh)) & (adx_series > adx_threshold)
     combined_signal = np.where(long_signal, 1.0, np.where(short_signal, -1.0, 0.0))
 
-    # Reject strategies with insufficient trading frequency
     if np.count_nonzero(np.diff(combined_signal)) < 10:
         return (-999.0,)
 
@@ -141,7 +140,6 @@ toolbox.register("select", tools.selTournament, tournsize=3)
 
 def run_optimization(symbol="BTC/USDT"):
     global GLOBAL_DATA
-    # Fetch 1,000 candles max to keep memory overhead light
     data_df = strategy.fetch_klines(symbol=symbol, interval="1h", limit=1000)
     if data_df.empty:
         logging.warning(f"Could not fetch historical klines for {symbol}. Skipping optimization.")
@@ -149,7 +147,6 @@ def run_optimization(symbol="BTC/USDT"):
 
     GLOBAL_DATA = data_df
 
-    # Single-threaded execution for low-memory environments (prevents process duplication OOM)
     pop = toolbox.population(n=20)
     hof = tools.HallOfFame(maxsize=1)
 
@@ -198,7 +195,7 @@ if __name__ == "__main__":
             for symbol in symbols:
                 logging.info(f"Starting DEAP optimization run for {symbol}...")
                 run_optimization(symbol=symbol)
-                time.sleep(15)  # Rest period between symbols to avoid memory/CPU accumulation
+                time.sleep(15)
         except Exception as e:
             logging.error(f"Error in optimization cycle: {e}")
-        time.sleep(14400)  # Re-optimize every 4 hours instead of continuous loops
+        time.sleep(14400)

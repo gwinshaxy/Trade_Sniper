@@ -32,6 +32,7 @@ def ensure_background_process(script_name: str):
 ensure_background_process("worker.py")
 ensure_background_process("price_monitor.py")
 ensure_background_process("optimizer.py")
+ensure_background_process("webhook_engine.py")
 
 st.set_page_config(page_title="Trading Terminal", layout="wide")
 
