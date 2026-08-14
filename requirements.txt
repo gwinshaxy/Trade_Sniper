@@ -113,4 +113,3 @@ yfinance==1.5.2
 zlib-ng==1.0.0
 sqlalchemy>=2.0.36
 psutil>=5.9.0
-

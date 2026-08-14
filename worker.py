@@ -70,7 +70,7 @@ def run_worker_loop():
                                             f"<b>Direction:</b> <code>{direction}</code>\n"
                                             f"<b>Entry:</b> ${entry:.5f}\n"
                                             f"<b>SL:</b> ${sl:.5f} | <b>TP:</b> ${tp:.5f}\n"
-                                            f"<b>Risk:</b> {risk_pct}%"
+                                            f"<b>Dynamic Risk:</b> {risk_pct}%"
                                         )
                     except Exception as sym_err:
                         logging.error(f"[PHASE 1] Error evaluating signal for {symbol}: {sym_err}")

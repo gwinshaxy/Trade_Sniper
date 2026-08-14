@@ -1,12 +1,12 @@
 import json
 import logging
-import urllib.request
 import os
 import re
-import pandas as pd
+import urllib.request
 import numpy as np
-from google import genai
+import pandas as pd
 from dotenv import load_dotenv
+from google import genai
 
 load_dotenv()
 
@@ -21,6 +21,7 @@ except ImportError:
 
 
 def normalize_symbol(symbol: str) -> str:
+    """Normalizes exchange symbol formats (e.g. BTCUSDT to BTC/USDT)."""
     if not symbol:
         return ""
     s = str(symbol).replace('"', '').replace("'", "").strip().upper()
@@ -32,7 +33,7 @@ def normalize_symbol(symbol: str) -> str:
 
 
 def load_symbol_config(symbol: str) -> dict:
-    """Loads optimized strategy parameters from PostgreSQL database safely with non-null fallbacks."""
+    """Loads dynamic strategy parameters from PostgreSQL database with safe fallback defaults."""
     clean_symbol = normalize_symbol(symbol).replace("/", "").upper()
     db_url = os.getenv("DATABASE_URL")
     
@@ -63,12 +64,12 @@ def load_symbol_config(symbol: str) -> dict:
                     config["adx_period"] = int(config.get("adx_period") or 14)
                     config["adx_threshold"] = float(config.get("adx_threshold") or 20.0)
                     config["max_sl_pct"] = float(config.get("max_sl_pct") or 0.02)
-                    logging.debug(f"[load_symbol_config] Loaded dynamic DEAP params for {clean_symbol}")
+                    logging.debug(f"[load_symbol_config] Loaded dynamic DEAP parameters for {clean_symbol}")
                     return config
                 else:
-                    logging.warning(f"[load_symbol_config] Parameter row missing for {clean_symbol}, using defaults.")
+                    logging.warning(f"[load_symbol_config] Dynamic parameter row missing for {clean_symbol}, applying static defaults.")
         except Exception as e:
-            logging.error(f"[load_symbol_config] DB query failed for {clean_symbol}: {e}")
+            logging.error(f"[load_symbol_config] Database query failed for {clean_symbol}: {e}")
         finally:
             if conn:
                 try:
@@ -86,6 +87,7 @@ def load_symbol_config(symbol: str) -> dict:
 
 
 def get_ai_sentiment_score(text: str) -> float:
+    """Evaluates text market sentiment using Gemini 2.5 Flash."""
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
         return 0.5
@@ -103,6 +105,7 @@ def get_ai_sentiment_score(text: str) -> float:
 
 
 def fetch_cryptocompare_klines(symbol: str = "ETH/USDT", limit: int = 1000) -> pd.DataFrame:
+    """Fallback market data provider via CryptoCompare REST API."""
     try:
         clean = symbol.replace("/", "").upper()
         fsym = clean[:-4] if clean.endswith("USDT") else clean[:-3]
@@ -131,6 +134,7 @@ def fetch_cryptocompare_klines(symbol: str = "ETH/USDT", limit: int = 1000) -> p
 
 
 def fetch_klines(symbol: str = "BNB/USDT", interval: str = "1h", limit: int = 1000) -> pd.DataFrame:
+    """Primary multi-exchange market candle data fetcher."""
     norm_sym = normalize_symbol(symbol)
     binance_symbol = norm_sym.replace("/", "")
     
@@ -179,10 +183,12 @@ def fetch_klines(symbol: str = "BNB/USDT", interval: str = "1h", limit: int = 10
 
 
 def calc_ema(series: pd.Series, period: int) -> pd.Series:
+    """Exponential Moving Average calculation."""
     return series.ewm(span=period, adjust=False).mean()
 
 
 def calc_tema(series: pd.Series, period: int = 200) -> pd.Series:
+    """Triple Exponential Moving Average (TEMA) calculation."""
     ema1 = calc_ema(series, period)
     ema2 = calc_ema(ema1, period)
     ema3 = calc_ema(ema2, period)
@@ -190,6 +196,7 @@ def calc_tema(series: pd.Series, period: int = 200) -> pd.Series:
 
 
 def calc_rsi(series: pd.Series, period: int = 14) -> pd.Series:
+    """Relative Strength Index (RSI) calculation."""
     delta = series.diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
@@ -198,6 +205,7 @@ def calc_rsi(series: pd.Series, period: int = 14) -> pd.Series:
 
 
 def calc_adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    """Average Directional Index (ADX) trend strength calculation."""
     if df.empty or len(df) < period + 1:
         return pd.Series(0.0, index=df.index)
 
@@ -231,6 +239,7 @@ def compute_volume_profile(
     lookback_bars: int = 600,
     va_pct: float = 0.70,
 ):
+    """Calculates Point of Control (POC), Value Area High (VAH), and Value Area Low (VAL)."""
     if (
         df.empty
         or "volume" not in df.columns
@@ -300,6 +309,7 @@ def compute_volume_profile(
 
 
 def calculate_volume_profile_gaps(df: pd.DataFrame, num_bins: int = 100, lookback_bars: int = 600, detection_pct: float = 0.07) -> list:
+    """Identifies low-volume gaps (liquidity voids) in the Volume Profile."""
     if df.empty or 'volume' not in df.columns or 'high' not in df.columns or 'low' not in df.columns:
         return []
 
@@ -360,6 +370,7 @@ def calculate_volume_profile_gaps(df: pd.DataFrame, num_bins: int = 100, lookbac
 
 
 def evaluate_signals(df: pd.DataFrame, symbol: str = "ETH/USDT", account_balance: float = 10000.0, **kwargs) -> dict:
+    """Evaluates multi-timeframe indicators and returns executable BUY, SELL, or HOLD dicts."""
     config = load_symbol_config(symbol)
     tema_period = int(kwargs.get("tema_period", config.get("tema_period", 200)))
     rsi_period = int(kwargs.get("rsi_period", config.get("rsi_period", 14)))
@@ -410,7 +421,7 @@ def evaluate_signals(df: pd.DataFrame, symbol: str = "ETH/USDT", account_balance
     zone_tolerance = float(kwargs.get("zone_tolerance", config.get("zone_tolerance", 0.0075)))
     min_sentiment = float(kwargs.get("min_sentiment", config.get("min_sentiment", 0.0)))
     min_rr = float(kwargs.get("min_rr", config.get("min_rr", 2.0)))
-    risk_pct = float(kwargs.get("risk_pct", config.get("risk_pct", 1.0)))
+    base_risk_pct = float(kwargs.get("risk_pct", config.get("risk_pct", 1.0)))
     max_sl_pct = float(kwargs.get("max_sl_pct", config.get("max_sl_pct", 0.02)))
 
     sentiment_score = kwargs.get("sentiment_score", 0.5)
@@ -433,6 +444,7 @@ def evaluate_signals(df: pd.DataFrame, symbol: str = "ETH/USDT", account_balance
     near_val = not np.isnan(val) and abs(current_close - val) / current_close <= zone_tolerance
     near_gap_support = len(underneath_gaps) > 0 and (current_close - underneath_gaps[0]) / current_close <= zone_tolerance
 
+    # LONG EXECUTION PATH
     if (near_tema or near_val or near_gap_support) and rsi_long_ok and bullish_candlestick and macro_trend_long:
         sl_anchor = val if (not np.isnan(val) and val < current_close) else current_tema
         raw_stop_loss = min(sl_anchor * (1.0 - zone_tolerance), current_close * 0.99)
@@ -444,6 +456,14 @@ def evaluate_signals(df: pd.DataFrame, symbol: str = "ETH/USDT", account_balance
         if risk_distance <= 0:
             return {"action": "HOLD", "reason": "Invalid risk distance computed for LONG"}
 
+        actual_sl_pct = risk_distance / current_close
+        
+        # Option 2: Dynamic 3% Account Risk Cap Calculation
+        if max_sl_pct > 0:
+            dynamic_risk_pct = min(3.0, round(base_risk_pct * (actual_sl_pct / max_sl_pct), 2))
+        else:
+            dynamic_risk_pct = base_risk_pct
+
         tp_candidates = overhead_gaps + [x for x in [poc, vah] if not np.isnan(x) and x > current_close]
         min_tp = current_close + (risk_distance * min_rr)
         
@@ -453,7 +473,7 @@ def evaluate_signals(df: pd.DataFrame, symbol: str = "ETH/USDT", account_balance
             take_profit = round(min_tp, 5)
 
         computed_rr = round((take_profit - current_close) / risk_distance, 2)
-        risk_amt = account_balance * (risk_pct / 100.0)
+        risk_amt = account_balance * (dynamic_risk_pct / 100.0)
         position_size = round(risk_amt / risk_distance, 4)
 
         return {
@@ -464,7 +484,7 @@ def evaluate_signals(df: pd.DataFrame, symbol: str = "ETH/USDT", account_balance
             "stop_loss": stop_loss,
             "take_profit": take_profit,
             "risk_reward_ratio": computed_rr,
-            "risk_pct": risk_pct,
+            "risk_pct": dynamic_risk_pct,
             "position_size": position_size,
             "reason": "Long signal confirmed with TEMA, ADX trend strength, 4H HTF trend, and Volume Profile support confluence"
         }
@@ -472,6 +492,7 @@ def evaluate_signals(df: pd.DataFrame, symbol: str = "ETH/USDT", account_balance
     near_vah = not np.isnan(vah) and abs(current_close - vah) / current_close <= zone_tolerance
     near_gap_resistance = len(overhead_gaps) > 0 and (overhead_gaps[0] - current_close) / current_close <= zone_tolerance
 
+    # SHORT EXECUTION PATH
     if (near_tema or near_vah or near_gap_resistance) and rsi_short_ok and bearish_candlestick and macro_trend_short:
         sl_anchor = vah if (not np.isnan(vah) and vah > current_close) else current_tema
         raw_stop_loss = max(sl_anchor * (1.0 + zone_tolerance), current_close * 1.01)
@@ -483,6 +504,14 @@ def evaluate_signals(df: pd.DataFrame, symbol: str = "ETH/USDT", account_balance
         if risk_distance <= 0:
             return {"action": "HOLD", "reason": "Invalid risk distance computed for SHORT"}
 
+        actual_sl_pct = risk_distance / current_close
+
+        # Option 2: Dynamic 3% Account Risk Cap Calculation
+        if max_sl_pct > 0:
+            dynamic_risk_pct = min(3.0, round(base_risk_pct * (actual_sl_pct / max_sl_pct), 2))
+        else:
+            dynamic_risk_pct = base_risk_pct
+
         tp_candidates = underneath_gaps + [x for x in [poc, val] if not np.isnan(x) and x < current_close]
         min_tp = current_close - (risk_distance * min_rr)
 
@@ -492,7 +521,7 @@ def evaluate_signals(df: pd.DataFrame, symbol: str = "ETH/USDT", account_balance
             take_profit = round(min_tp, 5)
 
         computed_rr = round((current_close - take_profit) / risk_distance, 2)
-        risk_amt = account_balance * (risk_pct / 100.0)
+        risk_amt = account_balance * (dynamic_risk_pct / 100.0)
         position_size = round(risk_amt / risk_distance, 4)
 
         return {
@@ -503,7 +532,7 @@ def evaluate_signals(df: pd.DataFrame, symbol: str = "ETH/USDT", account_balance
             "stop_loss": stop_loss,
             "take_profit": take_profit,
             "risk_reward_ratio": computed_rr,
-            "risk_pct": risk_pct,
+            "risk_pct": dynamic_risk_pct,
             "position_size": position_size,
             "reason": "Short signal confirmed with TEMA, ADX trend strength, 4H HTF trend, and Volume Profile resistance confluence"
         }

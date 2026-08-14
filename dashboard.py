@@ -8,9 +8,12 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 from dotenv import load_dotenv
+
+# Force .env file variables to override pre-existing environment variables
+load_dotenv(override=True)
+
 from lightweight_charts.widgets import StreamlitChart
 
-load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
 # --- SINGLETON PROCESS GUARD FOR RENDER 512MB RAM ---
@@ -50,7 +53,10 @@ if HTTP_PROXY or HTTPS_PROXY:
 
 
 def check_password():
-    expected_password = os.getenv("DASHBOARD_PASSWORD", "securepass123")
+    # Retrieve password from .env, falling back to securepass123 if omitted
+    raw_env_pass = os.getenv("DASHBOARD_PASSWORD", "securepass123")
+    expected_password = raw_env_pass.strip().strip('"').strip("'")
+    
     if "password_correct" not in st.session_state:
         st.session_state["password_correct"] = False
     if st.session_state["password_correct"]:
@@ -59,8 +65,9 @@ def check_password():
     st.markdown("## 🔒 Restricted Access")
     st.markdown("Please enter the password to access the Trading Terminal.")
     password_input = st.text_input("Password", type="password")
+    
     if st.button("Login", width="stretch"):
-        if password_input == expected_password:
+        if password_input.strip() == expected_password:
             st.session_state["password_correct"] = True
             st.rerun()
         else:
@@ -104,7 +111,7 @@ if database_url:
 conn = get_db_connection()
 try:
     with conn.cursor() as cur:
-        cur.execute("""UPDATE trade_setups SET pair = REPLACE(REPLACE(pair, '"', ''), '''org.postgresql.util.PSQLException''', '');""")
+        cur.execute("""UPDATE trade_setups SET pair = REPLACE(REPLACE(pair::text, '"', ''), '''', '') WHERE pair IS NOT NULL;""")
         conn.commit()
 except Exception:
     pass
