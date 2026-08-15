@@ -4,6 +4,7 @@ import json
 import logging
 import subprocess
 import psutil
+import gc
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -92,8 +93,8 @@ if conn:
     finally:
         conn.close()
 
-# --- CACHED DATA LOADERS TO PREVENT ENDLESS LOADING SPINNER ---
-@st.cache_data(ttl=5)
+# --- CACHED DATA LOADERS WITH STRICT MEMORY CONTROL ---
+@st.cache_data(ttl=10, max_entries=20)
 def load_all_trades(db_url):
     if not db_url:
         return pd.DataFrame()
@@ -103,7 +104,7 @@ def load_all_trades(db_url):
         logging.error(f"Error reading trade setups from DB: {err}")
         return pd.DataFrame()
 
-@st.cache_data(ttl=5)
+@st.cache_data(ttl=10, max_entries=20)
 def load_active_trades(db_url):
     if not db_url:
         return pd.DataFrame()
@@ -116,7 +117,7 @@ def load_active_trades(db_url):
         logging.error(f"Error reading active setups: {err}")
         return pd.DataFrame()
 
-@st.cache_data(ttl=5)
+@st.cache_data(ttl=10, max_entries=20)
 def load_closed_trades_log(db_url):
     if not db_url:
         return pd.DataFrame()
@@ -146,7 +147,7 @@ st.sidebar.subheader("🎯 Strategy Parameters (Harmonized)")
 config_target_pair = st.sidebar.selectbox("Load Dynamic Config For:", available_pairs, index=0)
 dyn_cfg = strategy.load_symbol_config(config_target_pair)
 
-lookback_bars = st.sidebar.number_input("Lookback Bars (Range)", value=1000, min_value=100, max_value=2000, step=50)
+lookback_bars = st.sidebar.number_input("Lookback Bars (Range)", value=500, min_value=100, max_value=1000, step=50)
 tema_period = st.sidebar.number_input("TEMA Period", value=int(dyn_cfg.get("tema_period", 200)), min_value=10, max_value=500)
 rsi_period = st.sidebar.number_input("RSI Period", value=int(dyn_cfg.get("rsi_period", 14)), min_value=2, max_value=50)
 rsi_thresh = st.sidebar.slider("RSI Threshold", min_value=20, max_value=80, value=int(dyn_cfg.get("rsi_thresh", 42)))
@@ -424,3 +425,6 @@ with col_log:
     ]
     for log in log_messages:
         st.code(log, language="text")
+
+# Reclaim unused RAM at end of execution cycle
+gc.collect()
