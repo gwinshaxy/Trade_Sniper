@@ -244,14 +244,15 @@ except Exception as fetch_err:
 if df_ohlc is not None and not df_ohlc.empty:
     try:
         if 'time' in df_ohlc.columns:
-            df_ohlc['time'] = pd.to_datetime(df_ohlc['time']).dt.strftime('%Y-%m-%d %H:%M:%S')
+            df_ohlc['time'] = pd.to_datetime(df_ohlc['time'], utc=True)
         elif 'timestamp' in df_ohlc.columns:
-            df_ohlc['time'] = pd.to_datetime(df_ohlc['timestamp']).dt.strftime('%Y-%m-%d %H:%M:%S')
+            df_ohlc['time'] = pd.to_datetime(df_ohlc['timestamp'], utc=True)
         elif isinstance(df_ohlc.index, pd.DatetimeIndex):
             df_ohlc = df_ohlc.reset_index()
             df_ohlc.rename(columns={df_ohlc.columns[0]: 'time'}, inplace=True)
-            df_ohlc['time'] = pd.to_datetime(df_ohlc['time']).dt.strftime('%Y-%m-%d %H:%M:%S')
+            df_ohlc['time'] = pd.to_datetime(df_ohlc['time'], utc=True)
 
+        df_ohlc = df_ohlc.sort_values('time').drop_duplicates(subset=['time']).reset_index(drop=True)
         df_ohlc['tema_custom'] = strategy.calc_tema(df_ohlc['close'], period=min(tema_period, len(df_ohlc)))
         
         poc, vah, val = strategy.compute_volume_profile(df_ohlc, num_bins=100, lookback_bars=lookback_bars, va_pct=0.70)
@@ -260,9 +261,11 @@ if df_ohlc is not None and not df_ohlc.empty:
         chart = StreamlitChart(width=1100, height=500)
         chart.layout(background_color='#131722', text_color='#d1d4dc')
         chart.volume_config(scale_margin_top=0.85, scale_margin_bottom=0.0, up_color='#26a69a', down_color='#ef5350')
-        chart.set(df_ohlc[['time', 'open', 'high', 'low', 'close', 'volume']].dropna())
+        
+        chart_data = df_ohlc[['time', 'open', 'high', 'low', 'close', 'volume']].dropna().copy()
+        chart.set(chart_data)
 
-        tema_df = df_ohlc[['time', 'tema_custom']].dropna().rename(columns={'tema_custom': f'{tema_period} TEMA'})
+        tema_df = df_ohlc[['time', 'tema_custom']].dropna().rename(columns={'tema_custom': f'{tema_period} TEMA'}).copy()
         if not tema_df.empty:
             tema_line = chart.create_line(name=f"{tema_period} TEMA", color="orange", width=2)
             tema_line.set(tema_df)
