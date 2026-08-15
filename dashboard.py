@@ -22,25 +22,28 @@ PORT = int(os.getenv("PORT", 8000))
 # --- SINGLETON PROCESS GUARD FOR RENDER 512MB RAM ---
 @st.cache_resource
 def ensure_background_services_once():
-    """Ensures background scripts run as single background processes across Streamlit reruns."""
+    """Ensures background scripts run as single background processes without blocking UI boot."""
     services = ["worker.py", "price_monitor.py", "optimizer.py", "webhook_engine.py"]
-    running_cmds = []
-
+    
+    running_scripts = set()
     for proc in psutil.process_iter(['cmdline']):
         try:
-            cmd = proc.info.get('cmdline')
-            if cmd:
-                running_cmds.append(" ".join(cmd))
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            cmd = proc.info.get('cmdline') or []
+            cmd_str = " ".join(cmd)
+            for script in services:
+                if script in cmd_str:
+                    running_scripts.add(script)
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
             continue
 
+    # Prevent background processes from inheriting primary web PORT=8000
+    env = os.environ.copy()
+    if "PORT" in env:
+        del env["PORT"]
+
     for script_name in services:
-        if not any(script_name in cmd for cmd in running_cmds):
+        if script_name not in running_scripts:
             logging.info(f"Starting background process: {script_name}...")
-            # Prevent background scripts from inheriting the primary web PORT variable (8000)
-            env = os.environ.copy()
-            if "PORT" in env:
-                del env["PORT"]
             subprocess.Popen([sys.executable, script_name], env=env)
         else:
             logging.info(f"Process '{script_name}' is already running. Skipping spawn.")
@@ -126,7 +129,44 @@ if conn:
     finally:
         conn.close()
 
-df_all_trades = pd.read_sql("SELECT * FROM trade_setups ORDER BY id DESC;", database_url) if database_url else pd.DataFrame()
+# --- CACHED DATA LOADERS TO PREVENT ENDLESS LOADING SPINNER ---
+@st.cache_data(ttl=5)
+def load_all_trades(db_url):
+    if not db_url:
+        return pd.DataFrame()
+    try:
+        return pd.read_sql("SELECT * FROM trade_setups ORDER BY id DESC;", db_url)
+    except Exception as err:
+        logging.error(f"Error reading trade setups from DB: {err}")
+        return pd.DataFrame()
+
+@st.cache_data(ttl=5)
+def load_active_trades(db_url):
+    if not db_url:
+        return pd.DataFrame()
+    try:
+        return pd.read_sql(
+            "SELECT id, pair, direction, entry_price, stop_loss, take_profit, risk_reward_ratio AS rrr, risk_pct AS risk_p, position_size, status, trade_state, created_at FROM trade_setups WHERE status IN ('EXECUTED', 'PENDING');",
+            db_url
+        )
+    except Exception as err:
+        logging.error(f"Error reading active setups: {err}")
+        return pd.DataFrame()
+
+@st.cache_data(ttl=5)
+def load_closed_trades_log(db_url):
+    if not db_url:
+        return pd.DataFrame()
+    try:
+        return pd.read_sql(
+            "SELECT id, pair, direction, entry_price, exit_price, pnl_usd, pnl_pct, outcome, closed_at FROM trade_setups WHERE status = 'CLOSED';",
+            db_url
+        )
+    except Exception as err:
+        logging.error(f"Error reading closed setups: {err}")
+        return pd.DataFrame()
+
+df_all_trades = load_all_trades(database_url)
 db_pairs = [normalize_symbol(p) for p in df_all_trades['pair'].unique().tolist()] if not df_all_trades.empty and 'pair' in df_all_trades.columns else []
 available_pairs = list(dict.fromkeys(env_symbols + db_pairs))
 for default_pair in ["ETH/USDT", "BNB/USDT", "SOL/USDT"]:
@@ -198,6 +238,7 @@ if st.sidebar.button("🚀 Execute Order", width="stretch"):
         conn.commit()
         cursor.close()
         conn.close()
+        st.cache_data.clear()
         st.success("Trade executed successfully!")
         send_telegram_notification(f"<b>🚀 NEW MANUAL TRADE EXECUTED</b>\n\n<b>Pair:</b> <code>{clean_executed_pair}</code>\n<b>Direction:</b> <code>{direction}</code>")
         st.rerun()
@@ -301,7 +342,7 @@ st.markdown("---")
 tab_pending, tab_history = st.tabs(["⏳ Active / Manual Management", "📜 Cumulative Trades History"])
 with tab_pending:
     st.subheader("🛠️ Active Trade Management & Manual Overrides")
-    df_active = pd.read_sql("SELECT id, pair, direction, entry_price, stop_loss, take_profit, risk_reward_ratio AS rrr, risk_pct AS risk_p, position_size, status, trade_state, created_at FROM trade_setups WHERE status IN ('EXECUTED', 'PENDING');", database_url) if database_url else pd.DataFrame()
+    df_active = load_active_trades(database_url)
     
     if not df_active.empty:
         df_active['pair'] = df_active['pair'].apply(normalize_symbol)
@@ -322,6 +363,7 @@ with tab_pending:
                     conn.commit()
                     cur.close()
                     conn.close()
+                    st.cache_data.clear()
                     st.success(f"Updated SL for Trade #{selected_trade_id} to ${new_sl:.5f}")
                     st.rerun()
 
@@ -335,6 +377,7 @@ with tab_pending:
                     conn.commit()
                     cur.close()
                     conn.close()
+                    st.cache_data.clear()
                     st.success(f"Updated TP for Trade #{selected_trade_id} to ${new_tp:.5f}")
                     st.rerun()
 
@@ -342,6 +385,7 @@ with tab_pending:
             exit_price_input = st.number_input("Manual Exit Price ($)", value=float(selected_trade_row['entry_price']), format="%.5f")
             if st.button("🚨 Market Close Trade Now", type="primary"):
                 if close_trade_manually(selected_trade_id, exit_price_input, reason="MANUAL_OVERRIDE"):
+                    st.cache_data.clear()
                     st.success(f"Trade #{selected_trade_id} successfully closed manually.")
                     st.rerun()
                 else:
@@ -351,7 +395,7 @@ with tab_pending:
         st.info("No active setups found.")
 
 with tab_history:
-    df_closed_log = pd.read_sql("SELECT id, pair, direction, entry_price, exit_price, pnl_usd, pnl_pct, outcome, closed_at FROM trade_setups WHERE status = 'CLOSED';", database_url) if database_url else pd.DataFrame()
+    df_closed_log = load_closed_trades_log(database_url)
     if not df_closed_log.empty:
         df_closed_log['pair'] = df_closed_log['pair'].apply(normalize_symbol)
         st.dataframe(df_closed_log, width="stretch")
