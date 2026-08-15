@@ -37,7 +37,11 @@ def ensure_background_services_once():
     for script_name in services:
         if not any(script_name in cmd for cmd in running_cmds):
             logging.info(f"Starting background process: {script_name}...")
-            subprocess.Popen([sys.executable, script_name])
+            # Prevent background scripts from inheriting the primary web PORT variable (8000)
+            env = os.environ.copy()
+            if "PORT" in env:
+                del env["PORT"]
+            subprocess.Popen([sys.executable, script_name], env=env)
         else:
             logging.info(f"Process '{script_name}' is already running. Skipping spawn.")
 

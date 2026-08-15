@@ -60,4 +60,6 @@ def settle_trade(payload: SettlementPayload):
         conn.close()
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    # Dynamically pull WEBHOOK_PORT or default to 8080 (ignoring primary PORT=8000)
+    webhook_port = int(os.getenv("WEBHOOK_PORT", 8080))
+    uvicorn.run("webhook_engine:app", host="0.0.0.0", port=webhook_port, reload=False)
