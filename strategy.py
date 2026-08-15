@@ -3,6 +3,7 @@ import logging
 import os
 import re
 import urllib.request
+import functools
 import numpy as np
 import pandas as pd
 import ccxt
@@ -16,7 +17,10 @@ except ImportError:
 
 load_dotenv()
 
+# Reduce logging noisiness for root loggers
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logging.getLogger("ccxt").setLevel(logging.ERROR)
+logging.getLogger("urllib3").setLevel(logging.ERROR)
 
 try:
     import psycopg2
@@ -27,7 +31,6 @@ except ImportError:
 
 
 def normalize_symbol(symbol: str) -> str:
-    """Normalizes exchange symbol formats (e.g., BTCUSDT or BTC/USDT)."""
     if not symbol:
         return ""
     s = str(symbol).replace('"', '').replace("'", "").strip().upper()
@@ -40,8 +43,9 @@ def normalize_symbol(symbol: str) -> str:
     return s
 
 
+@functools.lru_cache(maxsize=32)
 def load_symbol_config(symbol: str) -> dict:
-    """Loads dynamic strategy parameters from PostgreSQL database with safe fallback defaults."""
+    """Cached config fetcher to prevent high-frequency DB queries on every candle tick."""
     clean_symbol = normalize_symbol(symbol).replace("/", "").upper()
     db_url = os.getenv("DATABASE_URL")
     
@@ -73,8 +77,8 @@ def load_symbol_config(symbol: str) -> dict:
                     config["adx_threshold"] = float(config.get("adx_threshold") or 20.0)
                     config["max_sl_pct"] = float(config.get("max_sl_pct") or 0.02)
                     return config
-        except Exception as e:
-            logging.error(f"[load_symbol_config] Database query failed for {clean_symbol}: {e}")
+        except Exception:
+            pass
         finally:
             if conn:
                 try:
@@ -92,34 +96,29 @@ def load_symbol_config(symbol: str) -> dict:
 
 
 def get_ai_sentiment_score(text: str) -> float:
-    """Evaluates text market sentiment using Gemini 2.5 Flash."""
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key or not GENAI_AVAILABLE:
         return 0.5
     try:
         client = genai.Client(api_key=api_key)
-        prompt = f"Analyze the financial sentiment of the following text and return ONLY a single float number between 0.0 (bearish) and 1.0 (bullish):\n\n'{text}'"
+        prompt = f"Analyze financial sentiment. Return ONLY a single float between 0.0 and 1.0:\n\n'{text}'"
         response = client.models.generate_content(model='gemini-2.5-flash', contents=prompt)
-        
         match = re.search(r"0\.\d+|1\.0|0|1", response.text.strip())
-        if match:
-            return max(0.0, min(1.0, float(match.group(0))))
-        return 0.5
+        return max(0.0, min(1.0, float(match.group(0)))) if match else 0.5
     except Exception:
         return 0.5
 
 
-def fetch_binance_and_ccxt_klines(symbol: str = "ETH/USDT", interval: str = "1h", limit: int = 1000) -> pd.DataFrame:
-    """Fetches market data with automatic geo-unrestricted exchange fallbacks (Kraken, Binance US, Coinbase)."""
+def fetch_binance_and_ccxt_klines(symbol: str = "ETH/USDT", interval: str = "1h", limit: int = 500) -> pd.DataFrame:
+    """Fetches market data with quiet failover handling."""
     norm_symbol = normalize_symbol(symbol)
     clean = norm_symbol.replace('/', '').replace('"', '').replace("'", "").strip().upper()
 
-    # 1. Primary: Binance Public REST API
     try:
         url = f"https://api.binance.com/api/v3/klines?symbol={clean}&interval={interval}&limit={min(limit, 1000)}"
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
         
-        with urllib.request.urlopen(req, timeout=5) as resp:
+        with urllib.request.urlopen(req, timeout=3) as resp:
             raw_data = json.loads(resp.read().decode('utf-8'))
 
         if isinstance(raw_data, list) and len(raw_data) > 0:
@@ -132,10 +131,9 @@ def fetch_binance_and_ccxt_klines(symbol: str = "ETH/USDT", interval: str = "1h"
             for col in ['open', 'high', 'low', 'close', 'volume']:
                 df[col] = df[col].astype(float)
             return df[['time', 'open', 'high', 'low', 'close', 'volume']].sort_values('time').drop_duplicates(subset=['time']).reset_index(drop=True)
-    except Exception as e:
-        logging.warning(f"[Binance Primary Blocked/Failed]: {e}. Attempting geo-unrestricted fallbacks...")
+    except Exception:
+        pass  # Quiet fallback to Kraken / Coinbase
 
-    # 2. Resilient CCXT Fallbacks (Kraken, BinanceUS, Coinbase)
     exchanges_to_try = [
         ('kraken', ccxt.kraken({'enableRateLimit': True})),
         ('binanceus', ccxt.binanceus({'enableRateLimit': True})),
@@ -150,22 +148,18 @@ def fetch_binance_and_ccxt_klines(symbol: str = "ETH/USDT", interval: str = "1h"
                 df['time'] = pd.to_datetime(df['timestamp'], unit='ms', utc=True)
                 for col in ['open', 'high', 'low', 'close', 'volume']:
                     df[col] = df[col].astype(float)
-                logging.info(f"[Market Data Success]: Fetched {len(df)} candles via {ex_name.upper()}")
                 return df[['time', 'open', 'high', 'low', 'close', 'volume']].sort_values('time').drop_duplicates(subset=['time']).reset_index(drop=True)
-        except Exception as ex_err:
-            logging.warning(f"[{ex_name.upper()} Fallback Error]: {ex_err}")
+        except Exception:
+            continue
 
-    logging.error(f"All market data providers failed for {symbol}.")
     return pd.DataFrame()
 
 
 def calc_ema(series: pd.Series, period: int) -> pd.Series:
-    """Calculates Exponential Moving Average."""
     return series.ewm(span=period, adjust=False).mean()
 
 
 def calc_tema(series: pd.Series, period: int) -> pd.Series:
-    """Calculates Triple Exponential Moving Average (TEMA)."""
     ema1 = calc_ema(series, period)
     ema2 = calc_ema(ema1, period)
     ema3 = calc_ema(ema2, period)
@@ -173,7 +167,6 @@ def calc_tema(series: pd.Series, period: int) -> pd.Series:
 
 
 def calc_rsi(series: pd.Series, period: int = 14) -> pd.Series:
-    """Calculates Relative Strength Index (RSI)."""
     delta = series.diff()
     gain = delta.clip(lower=0)
     loss = -1 * delta.clip(upper=0)
@@ -185,39 +178,26 @@ def calc_rsi(series: pd.Series, period: int = 14) -> pd.Series:
 
 
 def calc_adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
-    """Calculates Average Directional Index (ADX)."""
-    high = df['high']
-    low = df['low']
-    close = df['close']
+    high, low, close = df['high'], df['low'], df['close']
+    plus_dm = np.where(high.diff() > (-low.diff()), high.diff().clip(lower=0), 0.0)
+    minus_dm = np.where((-low.diff()) > high.diff(), (-low.diff()).clip(lower=0), 0.0)
 
-    plus_dm = high.diff().clip(lower=0)
-    minus_dm = (-low.diff()).clip(lower=0)
-
-    plus_dm = np.where(plus_dm > minus_dm, plus_dm, 0.0)
-    minus_dm = np.where(minus_dm > plus_dm, minus_dm, 0.0)
-
-    tr1 = high - low
-    tr2 = (high - close.shift(1)).abs()
-    tr3 = (low - close.shift(1)).abs()
-    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-
+    tr = pd.concat([high - low, (high - close.shift(1)).abs(), (low - close.shift(1)).abs()], axis=1).max(axis=1)
     atr = tr.ewm(alpha=1/period, min_periods=period, adjust=False).mean()
+
     plus_di = 100 * (pd.Series(plus_dm).ewm(alpha=1/period, min_periods=period, adjust=False).mean() / atr)
     minus_di = 100 * (pd.Series(minus_dm).ewm(alpha=1/period, min_periods=period, adjust=False).mean() / atr)
 
     dx = (abs(plus_di - minus_di) / (plus_di + minus_di).replace(0, np.nan)) * 100
-    adx = dx.ewm(alpha=1/period, min_periods=period, adjust=False).mean()
-    return adx.fillna(0.0)
+    return dx.ewm(alpha=1/period, min_periods=period, adjust=False).mean().fillna(0.0)
 
 
 def compute_volume_profile(df: pd.DataFrame, num_bins: int = 100, lookback_bars: int = 500, va_pct: float = 0.70):
-    """Computes POC, VAH, and VAL over lookback window."""
     if df.empty or len(df) < 10:
         return None, None, None
 
     df_sub = df.tail(lookback_bars)
-    price_min = df_sub['low'].min()
-    price_max = df_sub['high'].max()
+    price_min, price_max = df_sub['low'].min(), df_sub['high'].max()
 
     if price_min == price_max:
         return None, None, None
@@ -226,19 +206,15 @@ def compute_volume_profile(df: pd.DataFrame, num_bins: int = 100, lookback_bars:
     vol_profile = np.zeros(num_bins)
 
     for _, row in df_sub.iterrows():
-        b_idx = np.digitize([row['close']], bins) - 1
-        b_idx = np.clip(b_idx, 0, num_bins - 1)[0]
+        b_idx = np.clip(np.digitize([row['close']], bins) - 1, 0, num_bins - 1)[0]
         vol_profile[b_idx] += row['volume']
 
     poc_idx = np.argmax(vol_profile)
     poc = (bins[poc_idx] + bins[poc_idx + 1]) / 2.0
-
-    total_vol = vol_profile.sum()
-    target_vol = total_vol * va_pct
+    target_vol = vol_profile.sum() * va_pct
 
     current_vol = vol_profile[poc_idx]
-    left = poc_idx
-    right = poc_idx
+    left = right = poc_idx
 
     while current_vol < target_vol and (left > 0 or right < num_bins - 1):
         v_left = vol_profile[left - 1] if left > 0 else -1
@@ -251,20 +227,15 @@ def compute_volume_profile(df: pd.DataFrame, num_bins: int = 100, lookback_bars:
             right += 1
             current_vol += vol_profile[right]
 
-    val = bins[left]
-    vah = bins[right + 1]
-    return float(poc), float(vah), float(val)
+    return float(poc), float(bins[right + 1]), float(bins[left])
 
 
 def calculate_volume_profile_gaps(df: pd.DataFrame, num_bins: int = 100, lookback_bars: int = 500, detection_pct: float = 0.07):
-    """Identifies low-volume gaps across price distribution."""
     if df.empty or len(df) < 10:
         return []
 
     df_sub = df.tail(lookback_bars)
-    price_min = df_sub['low'].min()
-    price_max = df_sub['high'].max()
-
+    price_min, price_max = df_sub['low'].min(), df_sub['high'].max()
     if price_min == price_max:
         return []
 
@@ -272,30 +243,14 @@ def calculate_volume_profile_gaps(df: pd.DataFrame, num_bins: int = 100, lookbac
     vol_profile = np.zeros(num_bins)
 
     for _, row in df_sub.iterrows():
-        b_idx = np.digitize([row['close']], bins) - 1
-        b_idx = np.clip(b_idx, 0, num_bins - 1)[0]
+        b_idx = np.clip(np.digitize([row['close']], bins) - 1, 0, num_bins - 1)[0]
         vol_profile[b_idx] += row['volume']
 
-    avg_vol = np.mean(vol_profile)
-    threshold = avg_vol * detection_pct
-    gap_prices = []
-
-    for i in range(1, num_bins - 1):
-        if vol_profile[i] < threshold:
-            mid_p = (bins[i] + bins[i + 1]) / 2.0
-            gap_prices.append(float(mid_p))
-
-    return gap_prices
+    threshold = np.mean(vol_profile) * detection_pct
+    return [float((bins[i] + bins[i + 1]) / 2.0) for i in range(1, num_bins - 1) if vol_profile[i] < threshold]
 
 
-def evaluate_signals(
-    df: pd.DataFrame,
-    symbol: str = "ETH/USDT",
-    account_balance: float = 10000.0,
-    sentiment_score: float = 0.5,
-    **kwargs
-) -> dict:
-    """Evaluates entry signals based on TEMA, RSI, ADX, and Volume Profile."""
+def evaluate_signals(df: pd.DataFrame, symbol: str = "ETH/USDT", account_balance: float = 10000.0, sentiment_score: float = 0.5, **kwargs) -> dict:
     if df.empty or len(df) < 30:
         return {"action": "HOLD", "reason": "Insufficient market data"}
 
@@ -315,66 +270,46 @@ def evaluate_signals(
     max_sl_pct = float(config.get("max_sl_pct", 0.02))
 
     df_calc = df.copy()
-    df_calc['tema'] = calc_tema(df_calc['close'], tema_p) if 'tema' not in df_calc else df_calc['tema']
-    df_calc['rsi'] = calc_rsi(df_calc['close'], rsi_p) if 'rsi' not in df_calc else df_calc['rsi']
-    df_calc['adx'] = calc_adx(df_calc, adx_p) if 'adx' not in df_calc else df_calc['adx']
+    df_calc['tema'] = calc_tema(df_calc['close'], tema_p)
+    df_calc['rsi'] = calc_rsi(df_calc['close'], rsi_p)
+    df_calc['adx'] = calc_adx(df_calc, adx_p)
 
-    curr = df_calc.iloc[-1]
-    prev = df_calc.iloc[-2]
+    curr, prev = df_calc.iloc[-1], df_calc.iloc[-2]
+    curr_close, curr_tema, curr_rsi, curr_adx = float(curr['close']), float(curr['tema']), float(curr['rsi']), float(curr['adx'])
 
-    curr_close = float(curr['close'])
-    curr_tema = float(curr['tema'])
-    curr_rsi = float(curr['rsi'])
-    curr_adx = float(curr['adx'])
-
-    # Guardrail ADX Filter
     if use_adx and curr_adx < adx_thresh:
         return {"action": "HOLD", "reason": f"ADX below threshold ({curr_adx:.2f} < {adx_thresh})"}
 
-    # Bullish Setup
     if curr_close > curr_tema:
         if use_rsi and curr_rsi < rsi_thresh:
-            return {"action": "HOLD", "reason": f"RSI momentum low ({curr_rsi:.2f} < {rsi_thresh})"}
-        
+            return {"action": "HOLD", "reason": "RSI momentum low"}
         if use_candlestick and not (curr['close'] > curr['open'] and prev['close'] <= prev['open']):
-            return {"action": "HOLD", "reason": "Awaiting bullish confirmation candle"}
+            return {"action": "HOLD", "reason": "Awaiting confirmation candle"}
 
         stop_loss = curr_close * (1.0 - max_sl_pct)
         take_profit = curr_close + ((curr_close - stop_loss) * min_rr)
-        risk_amount = account_balance * (risk_pct / 100.0)
-        pos_size = risk_amount / (curr_close - stop_loss) if (curr_close - stop_loss) > 0 else 1.0
+        pos_size = (account_balance * (risk_pct / 100.0)) / (curr_close - stop_loss) if (curr_close - stop_loss) > 0 else 1.0
 
         return {
-            "action": "BUY",
-            "direction": "LONG",
-            "entry_price": curr_close,
-            "stop_loss": round(stop_loss, 4),
-            "take_profit": round(take_profit, 4),
-            "position_size": round(pos_size, 4),
-            "risk_reward_ratio": min_rr
+            "action": "BUY", "direction": "LONG", "symbol": symbol, "entry_price": curr_close,
+            "stop_loss": round(stop_loss, 4), "take_profit": round(take_profit, 4),
+            "position_size": round(pos_size, 4), "risk_reward_ratio": min_rr
         }
 
-    # Bearish Setup
     elif curr_close < curr_tema:
         if use_rsi and curr_rsi > (100.0 - rsi_thresh):
-            return {"action": "HOLD", "reason": f"RSI momentum high for short ({curr_rsi:.2f})"}
-
+            return {"action": "HOLD", "reason": "RSI momentum high"}
         if use_candlestick and not (curr['close'] < curr['open'] and prev['close'] >= prev['open']):
-            return {"action": "HOLD", "reason": "Awaiting bearish confirmation candle"}
+            return {"action": "HOLD", "reason": "Awaiting confirmation candle"}
 
         stop_loss = curr_close * (1.0 + max_sl_pct)
         take_profit = curr_close - ((stop_loss - curr_close) * min_rr)
-        risk_amount = account_balance * (risk_pct / 100.0)
-        pos_size = risk_amount / (stop_loss - curr_close) if (stop_loss - curr_close) > 0 else 1.0
+        pos_size = (account_balance * (risk_pct / 100.0)) / (stop_loss - curr_close) if (stop_loss - curr_close) > 0 else 1.0
 
         return {
-            "action": "SELL",
-            "direction": "SHORT",
-            "entry_price": curr_close,
-            "stop_loss": round(stop_loss, 4),
-            "take_profit": round(take_profit, 4),
-            "position_size": round(pos_size, 4),
-            "risk_reward_ratio": min_rr
+            "action": "SELL", "direction": "SHORT", "symbol": symbol, "entry_price": curr_close,
+            "stop_loss": round(stop_loss, 4), "take_profit": round(take_profit, 4),
+            "position_size": round(pos_size, 4), "risk_reward_ratio": min_rr
         }
 
     return {"action": "HOLD", "reason": "No entry criteria met"}
