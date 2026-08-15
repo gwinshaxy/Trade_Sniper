@@ -1,12 +1,18 @@
 #!/usr/bin/env bash
 
-# Start background services in the background without inheriting web PORT
-unset PORT
+# Store Render's assigned port (defaults to 10000 if not set)
+APP_PORT="${PORT:-10000}"
+
+# Launch background microservices
 python worker.py &
 python price_monitor.py &
 python optimizer.py &
 python webhook_engine.py &
 
-# Start main Streamlit app on assigned Render port
-export PORT=${PORT:-8000}
-exec streamlit run dashboard.py --server.port=$PORT --server.address=0.0.0.0 --server.enableCORS=false --server.enableXsrfProtection=false
+# Start Streamlit directly bound to Render's assigned port
+exec streamlit run dashboard.py \
+    --server.port="$APP_PORT" \
+    --server.address=0.0.0.0 \
+    --server.enableCORS=false \
+    --server.enableXsrfProtection=false \
+    --server.headless=true
