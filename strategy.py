@@ -27,7 +27,7 @@ except ImportError:
 
 
 def normalize_symbol(symbol: str) -> str:
-    """Normalizes exchange symbol formats (e.g. BTCUSDT to BTC/USDT)."""
+    """Normalizes exchange symbol formats (e.g., BTCUSDT or BTC/USDT)."""
     if not symbol:
         return ""
     s = str(symbol).replace('"', '').replace("'", "").strip().upper()
@@ -35,11 +35,13 @@ def normalize_symbol(symbol: str) -> str:
         return s
     if s.endswith("USDT") and len(s) > 4:
         return f"{s[:-4]}/{s[-4:]}"
+    if s.endswith("USD") and len(s) > 3:
+        return f"{s[:-3]}/{s[-3:]}"
     return s
 
 
 def load_symbol_config(symbol: str) -> dict:
-    """Loads dynamic strategy parameters from PostgreSQL database with safe fallback defaults[cite: 25]."""
+    """Loads dynamic strategy parameters from PostgreSQL database with safe fallback defaults."""
     clean_symbol = normalize_symbol(symbol).replace("/", "").upper()
     db_url = os.getenv("DATABASE_URL")
     
@@ -90,7 +92,7 @@ def load_symbol_config(symbol: str) -> dict:
 
 
 def get_ai_sentiment_score(text: str) -> float:
-    """Evaluates text market sentiment using Gemini 2.5 Flash[cite: 25]."""
+    """Evaluates text market sentiment using Gemini 2.5 Flash."""
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key or not GENAI_AVAILABLE:
         return 0.5
@@ -108,16 +110,16 @@ def get_ai_sentiment_score(text: str) -> float:
 
 
 def fetch_binance_and_ccxt_klines(symbol: str = "ETH/USDT", interval: str = "1h", limit: int = 1000) -> pd.DataFrame:
-    """Fetches market data using Binance Public REST API as primary, with CCXT library as fallback."""
-    clean = str(symbol).replace('/', '').replace('"', '').replace("'", "").strip().upper()
-    
+    """Fetches market data with automatic geo-unrestricted exchange fallbacks (Kraken, Binance US, Coinbase)."""
+    norm_symbol = normalize_symbol(symbol)
+    clean = norm_symbol.replace('/', '').replace('"', '').replace("'", "").strip().upper()
+
     # 1. Primary: Binance Public REST API
     try:
         url = f"https://api.binance.com/api/v3/klines?symbol={clean}&interval={interval}&limit={min(limit, 1000)}"
-        headers = {"User-Agent": "Mozilla/5.0"}
-        req = urllib.request.Request(url, headers=headers)
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
         
-        with urllib.request.urlopen(req, timeout=10) as resp:
+        with urllib.request.urlopen(req, timeout=5) as resp:
             raw_data = json.loads(resp.read().decode('utf-8'))
 
         if isinstance(raw_data, list) and len(raw_data) > 0:
@@ -131,35 +133,39 @@ def fetch_binance_and_ccxt_klines(symbol: str = "ETH/USDT", interval: str = "1h"
                 df[col] = df[col].astype(float)
             return df[['time', 'open', 'high', 'low', 'close', 'volume']].sort_values('time').drop_duplicates(subset=['time']).reset_index(drop=True)
     except Exception as e:
-        logging.warning(f"[Binance Public API Error]: {e}. Falling back to CCXT...")
+        logging.warning(f"[Binance Primary Blocked/Failed]: {e}. Attempting geo-unrestricted fallbacks...")
 
-    # 2. Backup/Fallback: CCXT Library
-    try:
-        exchange = ccxt.binance({
-            'enableRateLimit': True,
-            'options': {'defaultType': 'spot'}
-        })
-        formatted_symbol = normalize_symbol(symbol)
-        ohlcv = exchange.fetch_ohlcv(formatted_symbol, timeframe=interval, limit=limit)
-        if ohlcv:
-            df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-            df['time'] = pd.to_datetime(df['timestamp'], unit='ms', utc=True)
-            for col in ['open', 'high', 'low', 'close', 'volume']:
-                df[col] = df[col].astype(float)
-            return df[['time', 'open', 'high', 'low', 'close', 'volume']].sort_values('time').drop_duplicates(subset=['time']).reset_index(drop=True)
-    except Exception as e2:
-        logging.error(f"[CCXT Fallback Error]: {e2}")
+    # 2. Resilient CCXT Fallbacks (Kraken, BinanceUS, Coinbase)
+    exchanges_to_try = [
+        ('kraken', ccxt.kraken({'enableRateLimit': True})),
+        ('binanceus', ccxt.binanceus({'enableRateLimit': True})),
+        ('coinbase', ccxt.coinbase({'enableRateLimit': True}))
+    ]
 
+    for ex_name, exchange in exchanges_to_try:
+        try:
+            ohlcv = exchange.fetch_ohlcv(norm_symbol, timeframe=interval, limit=limit)
+            if ohlcv and len(ohlcv) > 0:
+                df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+                df['time'] = pd.to_datetime(df['timestamp'], unit='ms', utc=True)
+                for col in ['open', 'high', 'low', 'close', 'volume']:
+                    df[col] = df[col].astype(float)
+                logging.info(f"[Market Data Success]: Fetched {len(df)} candles via {ex_name.upper()}")
+                return df[['time', 'open', 'high', 'low', 'close', 'volume']].sort_values('time').drop_duplicates(subset=['time']).reset_index(drop=True)
+        except Exception as ex_err:
+            logging.warning(f"[{ex_name.upper()} Fallback Error]: {ex_err}")
+
+    logging.error(f"All market data providers failed for {symbol}.")
     return pd.DataFrame()
 
 
 def calc_ema(series: pd.Series, period: int) -> pd.Series:
-    """Calculates Exponential Moving Average[cite: 25]."""
+    """Calculates Exponential Moving Average."""
     return series.ewm(span=period, adjust=False).mean()
 
 
 def calc_tema(series: pd.Series, period: int) -> pd.Series:
-    """Calculates Triple Exponential Moving Average (TEMA)[cite: 25]."""
+    """Calculates Triple Exponential Moving Average (TEMA)."""
     ema1 = calc_ema(series, period)
     ema2 = calc_ema(ema1, period)
     ema3 = calc_ema(ema2, period)
@@ -167,7 +173,7 @@ def calc_tema(series: pd.Series, period: int) -> pd.Series:
 
 
 def calc_rsi(series: pd.Series, period: int = 14) -> pd.Series:
-    """Calculates Relative Strength Index (RSI)[cite: 25]."""
+    """Calculates Relative Strength Index (RSI)."""
     delta = series.diff()
     gain = delta.clip(lower=0)
     loss = -1 * delta.clip(upper=0)
@@ -179,7 +185,7 @@ def calc_rsi(series: pd.Series, period: int = 14) -> pd.Series:
 
 
 def calc_adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
-    """Calculates Average Directional Index (ADX)[cite: 25]."""
+    """Calculates Average Directional Index (ADX)."""
     high = df['high']
     low = df['low']
     close = df['close']
@@ -205,7 +211,7 @@ def calc_adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
 
 
 def compute_volume_profile(df: pd.DataFrame, num_bins: int = 100, lookback_bars: int = 500, va_pct: float = 0.70):
-    """Computes POC, VAH, and VAL over lookback window[cite: 25]."""
+    """Computes POC, VAH, and VAL over lookback window."""
     if df.empty or len(df) < 10:
         return None, None, None
 
@@ -251,7 +257,7 @@ def compute_volume_profile(df: pd.DataFrame, num_bins: int = 100, lookback_bars:
 
 
 def calculate_volume_profile_gaps(df: pd.DataFrame, num_bins: int = 100, lookback_bars: int = 500, detection_pct: float = 0.07):
-    """Identifies low-volume gaps across the price distribution[cite: 25]."""
+    """Identifies low-volume gaps across price distribution."""
     if df.empty or len(df) < 10:
         return []
 
@@ -289,7 +295,7 @@ def evaluate_signals(
     sentiment_score: float = 0.5,
     **kwargs
 ) -> dict:
-    """Evaluates entry signals based on TEMA, RSI, ADX, and Volume Profile[cite: 25]."""
+    """Evaluates entry signals based on TEMA, RSI, ADX, and Volume Profile."""
     if df.empty or len(df) < 30:
         return {"action": "HOLD", "reason": "Insufficient market data"}
 
@@ -374,5 +380,4 @@ def evaluate_signals(
     return {"action": "HOLD", "reason": "No entry criteria met"}
 
 
-# Export functions explicitly
 fetch_klines = fetch_binance_and_ccxt_klines
