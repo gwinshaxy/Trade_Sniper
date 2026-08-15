@@ -104,14 +104,23 @@ def get_ai_sentiment_score(text: str) -> float:
         return 0.5
 
 
-def fetch_cryptocompare_klines(symbol: str = "ETH/USDT", limit: int = 1000) -> pd.DataFrame:
+def fetch_cryptocompare_klines(symbol: str = "ETH/USDT", interval: str = "1h", limit: int = 1000) -> pd.DataFrame:
     """Fallback market data provider via CryptoCompare REST API."""
     try:
         clean = symbol.replace("/", "").upper()
         fsym = clean[:-4] if clean.endswith("USDT") else clean[:-3]
         tsym = "USDT" if clean.endswith("USDT") else "USD"
 
-        url = f"https://min-api.cryptocompare.com/data/v2/histohour?fsym={fsym}&tsym={tsym}&limit={min(limit, 2000)}"
+        # Determine target REST endpoint based on requested timeframe
+        interval_lower = str(interval).lower()
+        if "m" in interval_lower:
+            endpoint = "histominute"
+        elif "d" in interval_lower:
+            endpoint = "histoday"
+        else:
+            endpoint = "histohour"
+
+        url = f"https://min-api.cryptocompare.com/data/v2/{endpoint}?fsym={fsym}&tsym={tsym}&limit={min(limit, 2000)}"
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
         
         with urllib.request.urlopen(req, timeout=8) as resp:
@@ -260,3 +269,7 @@ def calculate_volume_profile_gaps(df: pd.DataFrame, num_bins: int = 100, lookbac
             gap_prices.append(float(mid_p))
 
     return gap_prices
+
+
+# Zero-overhead module alias to satisfy dashboard calls without redundant stack frames
+fetch_klines = fetch_cryptocompare_klines
