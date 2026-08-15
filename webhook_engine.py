@@ -12,16 +12,29 @@ from common import (
 )
 
 load_dotenv()
+
 app = FastAPI(title="Trade Settlement Webhook Engine")
 ensure_schema_updated()
+
 
 class SettlementPayload(BaseModel):
     trade_id: int
     exit_price: float
 
+
+# Render Health Check Endpoints
+@app.get("/")
+@app.get("/health")
+def health_check():
+    return {"status": "ok", "service": "webhook_engine"}
+
+
 @app.post("/settle-trade")
 def settle_trade(payload: SettlementPayload):
     conn = get_db_connection()
+    if not conn:
+        raise HTTPException(status_code=500, detail="Database connection failed.")
+    
     cursor = conn.cursor()
     try:
         cursor.execute(
@@ -59,7 +72,8 @@ def settle_trade(payload: SettlementPayload):
         cursor.close()
         conn.close()
 
+
 if __name__ == "__main__":
-    # Dynamically pull WEBHOOK_PORT or default to 8080 (ignoring primary PORT=8000)
-    webhook_port = int(os.getenv("WEBHOOK_PORT", 8080))
+    # Standardize port resolution to prevent port collisions on Render
+    webhook_port = int(os.getenv("WEBHOOK_PORT") or os.getenv("PORT") or 8080)
     uvicorn.run("webhook_engine:app", host="0.0.0.0", port=webhook_port, reload=False)
