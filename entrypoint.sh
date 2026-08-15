@@ -5,7 +5,7 @@ APP_PORT="${PORT:-10000}"
 # Disable heavy processes temporarily to stay under 512MB RAM
 python worker.py &
 python price_monitor.py &
-webhook_engine.py &
+python webhook_engine.py &
 
 # Launch Streamlit bound to Render's assigned port
 exec streamlit run dashboard.py \
