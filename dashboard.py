@@ -16,6 +16,9 @@ from lightweight_charts.widgets import StreamlitChart
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
+# --- RENDER PORT BINDING & ENVIRONMENT CONFIGURATION ---
+PORT = int(os.getenv("PORT", 8000))
+
 # --- SINGLETON PROCESS GUARD FOR RENDER 512MB RAM ---
 @st.cache_resource
 def ensure_background_services_once():
@@ -109,18 +112,18 @@ if database_url:
     database_url = database_url.strip('"').strip("'")
 
 conn = get_db_connection()
-try:
-    with conn.cursor() as cur:
-        cur.execute("""UPDATE trade_setups SET pair = REPLACE(REPLACE(pair::text, '"', ''), '''', '') WHERE pair IS NOT NULL;""")
-        conn.commit()
-except Exception:
-    pass
-finally:
-    if conn:
+if conn:
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""UPDATE trade_setups SET pair = REPLACE(REPLACE(pair::text, '"', ''), '''', '') WHERE pair IS NOT NULL;""")
+            conn.commit()
+    except Exception as db_err:
+        logging.warning(f"Failed to normalize DB pairs on startup: {db_err}")
+    finally:
         conn.close()
 
 df_all_trades = pd.read_sql("SELECT * FROM trade_setups ORDER BY id DESC;", database_url) if database_url else pd.DataFrame()
-db_pairs = [normalize_symbol(p) for p in df_all_trades['pair'].unique().tolist()] if not df_all_trades.empty else []
+db_pairs = [normalize_symbol(p) for p in df_all_trades['pair'].unique().tolist()] if not df_all_trades.empty and 'pair' in df_all_trades.columns else []
 available_pairs = list(dict.fromkeys(env_symbols + db_pairs))
 for default_pair in ["ETH/USDT", "BNB/USDT", "SOL/USDT"]:
     if default_pair not in available_pairs:
@@ -178,28 +181,31 @@ calc_position_size = round((account_balance * (risk_pct / 100.0)) / risk, 4) if 
 if st.sidebar.button("🚀 Execute Order", width="stretch"):
     clean_executed_pair = normalize_symbol(pair)
     conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute(
-        """
-            INSERT INTO trade_setups 
-            (pair, direction, entry_price, stop_loss, take_profit, risk_reward_ratio, position_size, account_balance, risk_pct, status, trade_state)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 'EXECUTED', 'OPEN');
-        """,
-        (clean_executed_pair, direction, entry_price, stop_loss, take_profit, rr_ratio, calc_position_size, account_balance, risk_pct)
-    )
-    conn.commit()
-    cursor.close()
-    conn.close()
-    st.success("Trade executed successfully!")
-    send_telegram_notification(f"<b>🚀 NEW MANUAL TRADE EXECUTED</b>\n\n<b>Pair:</b> <code>{clean_executed_pair}</code>\n<b>Direction:</b> <code>{direction}</code>")
-    st.rerun()
+    if conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+                INSERT INTO trade_setups 
+                (pair, direction, entry_price, stop_loss, take_profit, risk_reward_ratio, position_size, account_balance, risk_pct, status, trade_state)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 'EXECUTED', 'OPEN');
+            """,
+            (clean_executed_pair, direction, entry_price, stop_loss, take_profit, rr_ratio, calc_position_size, account_balance, risk_pct)
+        )
+        conn.commit()
+        cursor.close()
+        conn.close()
+        st.success("Trade executed successfully!")
+        send_telegram_notification(f"<b>🚀 NEW MANUAL TRADE EXECUTED</b>\n\n<b>Pair:</b> <code>{clean_executed_pair}</code>\n<b>Direction:</b> <code>{direction}</code>")
+        st.rerun()
+    else:
+        st.error("Database connection failed. Could not execute order.")
 
 st.title("📊 Forex & Crypto Trading Terminal")
 
-closed_trades = df_all_trades[df_all_trades['status'] == 'CLOSED'] if not df_all_trades.empty else pd.DataFrame()
+closed_trades = df_all_trades[df_all_trades['status'] == 'CLOSED'] if not df_all_trades.empty and 'status' in df_all_trades.columns else pd.DataFrame()
 net_realized_pnl = float(closed_trades['pnl_usd'].sum()) if not closed_trades.empty and 'pnl_usd' in closed_trades.columns else 0.0
 profit_factor_val = 0.0
-if not closed_trades.empty and 'pnl_usd' in closed_trades.columns:
+if not closed_trades.empty and 'pnl_usd' in closed_trades.columns and 'outcome' in closed_trades.columns:
     wins_sum = float(closed_trades[closed_trades['outcome'] == 'WIN']['pnl_usd'].sum())
     loss_sum = abs(float(closed_trades[closed_trades['outcome'] == 'LOSS']['pnl_usd'].sum()))
     profit_factor_val = round(wins_sum / loss_sum, 2) if loss_sum > 0 else 0.0
@@ -274,7 +280,7 @@ if df_ohlc is not None and not df_ohlc.empty:
                         text=f"GAP: {gap_price:.2f}"
                     )
 
-        if overlay_chart and not df_all_trades.empty:
+        if overlay_chart and not df_all_trades.empty and 'pair' in df_all_trades.columns and 'status' in df_all_trades.columns:
             symbol_trades = df_all_trades[(df_all_trades['pair'].apply(normalize_symbol) == normalize_symbol(chart_symbol)) & (df_all_trades['status'].isin(['EXECUTED', 'PENDING']))]
             for _, tr in symbol_trades.iterrows():
                 chart.horizontal_line(float(tr['entry_price']), color="blue", text=f"ENTRY ({tr['direction']})")
@@ -306,25 +312,27 @@ with tab_pending:
             new_sl = st.number_input("Update SL ($)", value=float(selected_trade_row['stop_loss']), format="%.5f")
             if st.button("Update Stop Loss"):
                 conn = get_db_connection()
-                cur = conn.cursor()
-                cur.execute("UPDATE trade_setups SET stop_loss = %s WHERE id = %s;", (new_sl, selected_trade_id))
-                conn.commit()
-                cur.close()
-                conn.close()
-                st.success(f"Updated SL for Trade #{selected_trade_id} to ${new_sl:.5f}")
-                st.rerun()
+                if conn:
+                    cur = conn.cursor()
+                    cur.execute("UPDATE trade_setups SET stop_loss = %s WHERE id = %s;", (new_sl, selected_trade_id))
+                    conn.commit()
+                    cur.close()
+                    conn.close()
+                    st.success(f"Updated SL for Trade #{selected_trade_id} to ${new_sl:.5f}")
+                    st.rerun()
 
         with col_m2:
             new_tp = st.number_input("Update TP ($)", value=float(selected_trade_row['take_profit']), format="%.5f")
             if st.button("Update Take Profit"):
                 conn = get_db_connection()
-                cur = conn.cursor()
-                cur.execute("UPDATE trade_setups SET take_profit = %s WHERE id = %s;", (new_tp, selected_trade_id))
-                conn.commit()
-                cur.close()
-                conn.close()
-                st.success(f"Updated TP for Trade #{selected_trade_id} to ${new_tp:.5f}")
-                st.rerun()
+                if conn:
+                    cur = conn.cursor()
+                    cur.execute("UPDATE trade_setups SET take_profit = %s WHERE id = %s;", (new_tp, selected_trade_id))
+                    conn.commit()
+                    cur.close()
+                    conn.close()
+                    st.success(f"Updated TP for Trade #{selected_trade_id} to ${new_tp:.5f}")
+                    st.rerun()
 
         with col_m3:
             exit_price_input = st.number_input("Manual Exit Price ($)", value=float(selected_trade_row['entry_price']), format="%.5f")
@@ -351,7 +359,7 @@ col_eq, col_hm = st.columns(2)
 
 with col_eq:
     st.subheader("📈 Cumulative Equity Curve")
-    if not closed_trades.empty and 'pnl_usd' in closed_trades.columns:
+    if not closed_trades.empty and 'pnl_usd' in closed_trades.columns and 'closed_at' in closed_trades.columns:
         df_eq = closed_trades.sort_values('closed_at').copy()
         df_eq['pnl_usd'] = pd.to_numeric(df_eq['pnl_usd'], errors='coerce').fillna(0.0)
         df_eq['cumulative_pnl'] = df_eq['pnl_usd'].cumsum()
@@ -399,7 +407,7 @@ with col_log:
     st.markdown("*Live Worker Logs:*")
     log_messages = [
         "[INFO] Database connection established...",
-        "[INFO] Real-time chart WebSocket connected.",
+        "[INFO] Dynamic port binding active.",
         "[INFO] Pending setups tab in sync with PostgreSQL.",
         "[STATUS] Waiting for price action triggers."
     ]
