@@ -105,22 +105,34 @@ def get_ai_sentiment_score(text: str) -> float:
 
 
 def fetch_cryptocompare_klines(symbol: str = "ETH/USDT", interval: str = "1h", limit: int = 1000) -> pd.DataFrame:
-    """Fallback market data provider via CryptoCompare REST API."""
+    """Robust market data provider via CryptoCompare REST API."""
     try:
-        clean = symbol.replace("/", "").upper()
-        fsym = clean[:-4] if clean.endswith("USDT") else clean[:-3]
-        tsym = "USDT" if clean.endswith("USDT") else "USD"
+        clean = str(symbol).replace('"', '').replace("'", "").strip().upper()
+        if "/" in clean:
+            fsym, tsym = clean.split("/")
+        elif clean.endswith("USDT") and len(clean) > 4:
+            fsym, tsym = clean[:-4], "USDT"
+        elif clean.endswith("USD") and len(clean) > 3:
+            fsym, tsym = clean[:-3], "USD"
+        else:
+            fsym, tsym = clean, "USDT"
 
-        # Determine target REST endpoint based on requested timeframe
-        interval_lower = str(interval).lower()
-        if "m" in interval_lower:
+        interval_lower = str(interval).lower().strip()
+        
+        if interval_lower in ["1m", "5m", "15m", "30m"]:
             endpoint = "histominute"
-        elif "d" in interval_lower:
+            aggregate = int(interval_lower.replace("m", "")) if interval_lower != "1m" else 1
+        elif interval_lower in ["1h", "4h"]:
+            endpoint = "histohour"
+            aggregate = 4 if interval_lower == "4h" else 1
+        elif interval_lower in ["1d", "1w"]:
             endpoint = "histoday"
+            aggregate = 7 if interval_lower == "1w" else 1
         else:
             endpoint = "histohour"
+            aggregate = 1
 
-        url = f"https://min-api.cryptocompare.com/data/v2/{endpoint}?fsym={fsym}&tsym={tsym}&limit={min(limit, 2000)}"
+        url = f"https://min-api.cryptocompare.com/data/v2/{endpoint}?fsym={fsym}&tsym={tsym}&aggregate={aggregate}&limit={min(limit, 2000)}"
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
         
         with urllib.request.urlopen(req, timeout=8) as resp:
@@ -129,15 +141,16 @@ def fetch_cryptocompare_klines(symbol: str = "ETH/USDT", interval: str = "1h", l
         if data.get("Response") == "Success" and "Data" in data and "Data" in data["Data"]:
             candles = data["Data"]["Data"]
             df = pd.DataFrame(candles)
-            df.rename(columns={"time": "open_time", "volumeto": "volume"}, inplace=True)
-            df['time'] = pd.to_datetime(df['open_time'], unit='s', utc=True)
-            
-            for col in ['open', 'high', 'low', 'close', 'volume']:
-                df[col] = df[col].astype(float)
+            if not df.empty and "time" in df.columns:
+                df.rename(columns={"time": "open_time", "volumeto": "volume"}, inplace=True)
+                df['time'] = pd.to_datetime(df['open_time'], unit='s', utc=True)
                 
-            return df[['time', 'open', 'high', 'low', 'close', 'volume']].sort_values('time').drop_duplicates(subset=['time']).reset_index(drop=True)
+                for col in ['open', 'high', 'low', 'close', 'volume']:
+                    df[col] = df[col].astype(float)
+                    
+                return df[['time', 'open', 'high', 'low', 'close', 'volume']].sort_values('time').drop_duplicates(subset=['time']).reset_index(drop=True)
     except Exception as e:
-        logging.debug(f"[CryptoCompare Fallback Error]: {e}")
+        logging.error(f"[CryptoCompare Fetch Error]: {e}")
         
     return pd.DataFrame()
 
@@ -271,5 +284,4 @@ def calculate_volume_profile_gaps(df: pd.DataFrame, num_bins: int = 100, lookbac
     return gap_prices
 
 
-# Zero-overhead module alias to satisfy dashboard calls without redundant stack frames
 fetch_klines = fetch_cryptocompare_klines
