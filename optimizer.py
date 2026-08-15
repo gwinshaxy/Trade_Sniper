@@ -18,7 +18,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 GLOBAL_DATA = None
 
 def save_optimized_parameters(symbol, best_params, fitness_score):
-    """Saves or updates optimized strategy parameters in the database."""
+    """Saves or updates optimized strategy parameters in the database[cite: 24]."""
     ensure_schema_updated()
     conn = get_db_connection()
     if not conn:
