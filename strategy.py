@@ -110,10 +110,11 @@ def get_ai_sentiment_score(text: str) -> float:
 
 
 def fetch_binance_and_ccxt_klines(symbol: str = "ETH/USDT", interval: str = "1h", limit: int = 500) -> pd.DataFrame:
-    """Fetches market data with quiet failover handling."""
+    """Fetches market data with fallback and formats timestamps in seconds for Lightweight Charts."""
     norm_symbol = normalize_symbol(symbol)
     clean = norm_symbol.replace('/', '').replace('"', '').replace("'", "").strip().upper()
 
+    # Try Binance REST API first
     try:
         url = f"https://api.binance.com/api/v3/klines?symbol={clean}&interval={interval}&limit={min(limit, 1000)}"
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
@@ -127,13 +128,15 @@ def fetch_binance_and_ccxt_klines(symbol: str = "ETH/USDT", interval: str = "1h"
                 'close_time', 'quote_asset_volume', 'number_of_trades',
                 'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'
             ])
-            df['time'] = pd.to_datetime(df['open_time'], unit='ms', utc=True)
+            # Convert milliseconds to Unix timestamp in seconds
+            df['time'] = (df['open_time'] // 1000).astype(int)
             for col in ['open', 'high', 'low', 'close', 'volume']:
                 df[col] = df[col].astype(float)
             return df[['time', 'open', 'high', 'low', 'close', 'volume']].sort_values('time').drop_duplicates(subset=['time']).reset_index(drop=True)
     except Exception:
-        pass  # Quiet fallback to Kraken / Coinbase
+        pass
 
+    # CCXT Fallbacks
     exchanges_to_try = [
         ('kraken', ccxt.kraken({'enableRateLimit': True})),
         ('binanceus', ccxt.binanceus({'enableRateLimit': True})),
@@ -145,7 +148,8 @@ def fetch_binance_and_ccxt_klines(symbol: str = "ETH/USDT", interval: str = "1h"
             ohlcv = exchange.fetch_ohlcv(norm_symbol, timeframe=interval, limit=limit)
             if ohlcv and len(ohlcv) > 0:
                 df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-                df['time'] = pd.to_datetime(df['timestamp'], unit='ms', utc=True)
+                # Convert milliseconds to Unix timestamp in seconds
+                df['time'] = (df['timestamp'] // 1000).astype(int)
                 for col in ['open', 'high', 'low', 'close', 'volume']:
                     df[col] = df[col].astype(float)
                 return df[['time', 'open', 'high', 'low', 'close', 'volume']].sort_values('time').drop_duplicates(subset=['time']).reset_index(drop=True)
@@ -153,7 +157,6 @@ def fetch_binance_and_ccxt_klines(symbol: str = "ETH/USDT", interval: str = "1h"
             continue
 
     return pd.DataFrame()
-
 
 def calc_ema(series: pd.Series, period: int) -> pd.Series:
     return series.ewm(span=period, adjust=False).mean()
