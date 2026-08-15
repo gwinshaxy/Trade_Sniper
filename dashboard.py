@@ -77,7 +77,7 @@ df_all_trades = load_all_trades(database_url)
 db_pairs = [normalize_symbol(p) for p in df_all_trades['pair'].unique().tolist()] if not df_all_trades.empty and 'pair' in df_all_trades.columns else []
 available_pairs = list(dict.fromkeys(env_symbols + db_pairs))
 
-st.sidebar.subheader("🎛️ Dashboard Controls & Strategy Tuning")
+st.sidebar.subheader("⚙️ Dashboard Controls & Strategy Tuning")
 config_target_pair = st.sidebar.selectbox("Load Config For:", available_pairs, index=0)
 dyn_cfg = strategy.load_symbol_config(config_target_pair)
 
@@ -126,8 +126,8 @@ else:
 st.markdown("---")
 tab_active, tab_hist = st.tabs(["⏳ Active Positions", "📜 History"])
 with tab_active:
-    st.dataframe(load_active_trades(database_url), use_container_width=True)
+    st.dataframe(load_active_trades(database_url), width="stretch")
 with tab_hist:
-    st.dataframe(load_closed_trades_log(database_url), use_container_width=True)
+    st.dataframe(load_closed_trades_log(database_url), width="stretch")
 
 gc.collect()
