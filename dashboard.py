@@ -16,41 +16,6 @@ from lightweight_charts.widgets import StreamlitChart
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
-# --- RENDER PORT BINDING & ENVIRONMENT CONFIGURATION ---
-PORT = int(os.getenv("PORT", 8000))
-
-# --- SINGLETON PROCESS GUARD FOR RENDER 512MB RAM ---
-@st.cache_resource
-def ensure_background_services_once():
-    """Ensures background scripts run as single background processes without blocking UI boot."""
-    services = ["worker.py", "price_monitor.py", "optimizer.py", "webhook_engine.py"]
-    
-    running_scripts = set()
-    for proc in psutil.process_iter(['cmdline']):
-        try:
-            cmd = proc.info.get('cmdline') or []
-            cmd_str = " ".join(cmd)
-            for script in services:
-                if script in cmd_str:
-                    running_scripts.add(script)
-        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
-            continue
-
-    # Prevent background processes from inheriting primary web PORT=8000
-    env = os.environ.copy()
-    if "PORT" in env:
-        del env["PORT"]
-
-    for script_name in services:
-        if script_name not in running_scripts:
-            logging.info(f"Starting background process: {script_name}...")
-            subprocess.Popen([sys.executable, script_name], env=env)
-        else:
-            logging.info(f"Process '{script_name}' is already running. Skipping spawn.")
-
-# Spawn background services safely without repeated executions on UI interactions
-ensure_background_services_once()
-
 st.set_page_config(page_title="Trading Terminal", layout="wide")
 
 HTTP_PROXY = os.getenv("HTTP_PROXY") or os.getenv("PROXY_URL")
@@ -61,9 +26,7 @@ if HTTP_PROXY or HTTPS_PROXY:
     os.environ["HTTPS_PROXY"] = HTTPS_PROXY or HTTP_PROXY
     os.environ["NO_PROXY"] = "localhost,127.0.0.1,.supabase.co"
 
-
 def check_password():
-    # Retrieve password from .env, falling back to securepass123 if omitted
     raw_env_pass = os.getenv("DASHBOARD_PASSWORD", "securepass123")
     expected_password = raw_env_pass.strip().strip('"').strip("'")
     
@@ -84,10 +47,10 @@ def check_password():
             st.error("😕 Password incorrect")
     return False
 
-
 if not check_password():
     st.stop()
 
+# --- REMAINDER OF DASHBOARD SCRIPT ---
 from common import (
     calculate_pnl,
     ensure_schema_updated,
