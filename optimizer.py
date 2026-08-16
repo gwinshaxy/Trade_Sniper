@@ -6,6 +6,7 @@ import logging
 import pandas as pd
 import numpy as np
 import psycopg2
+from multiprocessing import Pool
 from deap import base, creator, tools
 from dotenv import load_dotenv
 
@@ -18,7 +19,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 GLOBAL_DATA = None
 
 def save_optimized_parameters(symbol, best_params, fitness_score):
-    """Saves or updates optimized strategy parameters in the database[cite: 24]."""
+    """Saves or updates optimized strategy parameters in the database."""
     ensure_schema_updated()
     conn = get_db_connection()
     if not conn:
@@ -67,9 +68,13 @@ if not hasattr(creator, "FitnessMax"):
 if not hasattr(creator, "Individual"):
     creator.create("Individual", list, fitness=creator.FitnessMax)
 
+def init_worker(data):
+    global GLOBAL_DATA
+    GLOBAL_DATA = data
+
 def evaluate_strategy(individual):
     global GLOBAL_DATA
-    if GLOBAL_DATA is None or GLOBAL_DATA.empty or len(GLOBAL_DATA) < 200:
+    if GLOBAL_DATA is None or GLOBAL_DATA.empty or len(GLOBAL_DATA) < 300:
         return (-999.0,)
 
     (
@@ -90,7 +95,8 @@ def evaluate_strategy(individual):
     short_signal = (df_close < lower_zone) & (rsi_series < (100.0 - rsi_thresh)) & (adx_series > adx_threshold)
     combined_signal = np.where(long_signal, 1.0, np.where(short_signal, -1.0, 0.0))
 
-    if np.count_nonzero(np.diff(combined_signal)) < 10:
+    # Reject strategies with insufficient trading frequency
+    if np.count_nonzero(np.diff(combined_signal)) < 15:
         return (-999.0,)
 
     returns = df_close.pct_change().fillna(0)
@@ -140,22 +146,25 @@ toolbox.register("select", tools.selTournament, tournsize=3)
 
 def run_optimization(symbol="BTC/USDT"):
     global GLOBAL_DATA
-    data_df = strategy.fetch_klines(symbol=symbol, interval="1h", limit=1000)
+    data_df = strategy.fetch_klines(symbol=symbol, interval="1h", limit=3000)
     if data_df.empty:
         logging.warning(f"Could not fetch historical klines for {symbol}. Skipping optimization.")
         return None
 
     GLOBAL_DATA = data_df
 
-    pop = toolbox.population(n=20)
+    pool = Pool(processes=2, initializer=init_worker, initargs=(data_df,))
+    toolbox.register("map", pool.map)
+
+    pop = toolbox.population(n=30)
     hof = tools.HallOfFame(maxsize=1)
 
     invalid_ind = [ind for ind in pop if not ind.fitness.valid]
-    for ind in invalid_ind:
-        ind.fitness.values = evaluate_strategy(ind)
+    for ind, fit in zip(invalid_ind, toolbox.map(toolbox.evaluate, invalid_ind)):
+        ind.fitness.values = fit
     hof.update(pop)
 
-    for gen in range(1, 6):
+    for gen in range(1, 11):
         offspring = list(map(toolbox.clone, toolbox.select(pop, len(pop))))
         for c1, c2 in zip(offspring[::2], offspring[1::2]):
             if random.random() < 0.6:
@@ -167,12 +176,16 @@ def run_optimization(symbol="BTC/USDT"):
                 del mutant.fitness.values
 
         invalid_ind = [ind for ind in offspring if not ind.fitness.valid]
-        for ind in invalid_ind:
-            ind.fitness.values = evaluate_strategy(ind)
+        for ind, fit in zip(invalid_ind, toolbox.map(toolbox.evaluate, invalid_ind)):
+            ind.fitness.values = fit
 
         pop[:] = offspring
         hof.update(pop)
         gc.collect()
+
+    pool.close()
+    pool.join()
+    toolbox.unregister("map")
 
     if len(hof) > 0:
         best_params = hof[0]
@@ -195,7 +208,6 @@ if __name__ == "__main__":
             for symbol in symbols:
                 logging.info(f"Starting DEAP optimization run for {symbol}...")
                 run_optimization(symbol=symbol)
-                time.sleep(15)
         except Exception as e:
             logging.error(f"Error in optimization cycle: {e}")
-        time.sleep(14400)
+        time.sleep(86400)

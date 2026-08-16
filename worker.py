@@ -1,7 +1,6 @@
 import time
 import logging
 import os
-import gc
 import pandas as pd
 from dotenv import load_dotenv
 
@@ -13,6 +12,7 @@ from common import get_db_connection, ensure_schema_updated, send_telegram_notif
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
+# Ensure PostgreSQL schema constraints match active parameters
 ensure_schema_updated()
 
 symbols_env = os.getenv("SYMBOLS") or os.getenv("SYMBOL", "ETH/USDT,BNB/USDT,SOL/USDT")
@@ -34,7 +34,7 @@ def run_worker_loop():
                 # --- PHASE 1: EVALUATE NEW TRADING SIGNALS ---
                 for symbol in SYMBOLS:
                     try:
-                        df = fetch_klines(symbol=symbol, interval="1h", limit=150)
+                        df = fetch_klines(symbol=symbol, interval="1h", limit=300)
                         if not df.empty:
                             signal = evaluate_signals(df, symbol=symbol, account_balance=ACCOUNT_BALANCE)
                             if signal.get("action") in ["BUY", "SELL"]:
@@ -47,6 +47,7 @@ def run_worker_loop():
                                 pos_size = signal["position_size"]
                                 risk_pct = signal.get("risk_pct", DEFAULT_RISK_PCT)
 
+                                # Prevent duplicate active orders on the same pair
                                 with conn.cursor() as cur:
                                     cur.execute(
                                         "SELECT id FROM trade_setups WHERE pair = %s AND status = 'EXECUTED' AND trade_state != 'CLOSED';",
@@ -70,7 +71,7 @@ def run_worker_loop():
                                             f"<b>Direction:</b> <code>{direction}</code>\n"
                                             f"<b>Entry:</b> ${entry:.5f}\n"
                                             f"<b>SL:</b> ${sl:.5f} | <b>TP:</b> ${tp:.5f}\n"
-                                            f"<b>Dynamic Risk:</b> {risk_pct}%"
+                                            f"<b>Risk:</b> {risk_pct}%"
                                         )
                     except Exception as sym_err:
                         logging.error(f"[PHASE 1] Error evaluating signal for {symbol}: {sym_err}")
@@ -84,7 +85,7 @@ def run_worker_loop():
                     for tr in open_trades:
                         trade_id, pair, direction, entry, sl, tp, pos_size, acct_bal, state = tr
 
-                        df = fetch_klines(symbol=pair, interval="1h", limit=150)
+                        df = fetch_klines(symbol=pair, interval="1h", limit=300)
                         if not df.empty:
                             config = load_symbol_config(pair)
                             tema_period = int(config.get("tema_period", 200))
@@ -94,18 +95,17 @@ def run_worker_loop():
 
                             trade_row = pd.Series({
                                 'id': trade_id,
-                                'pair': pair,
                                 'direction': direction,
-                                'entry_price': float(entry),
-                                'stop_loss': float(sl),
-                                'take_profit': float(tp),
-                                'position_size': float(pos_size),
-                                'trade_state': state or 'OPEN'
+                                'entry_price': entry,
+                                'stop_loss': sl,
+                                'take_profit': tp,
+                                'trade_state': state
                             })
 
                             action_res = trade_manager.process_trade(trade_row, latest_candle)
                             action = action_res.get("action")
 
+                            # Handle Stop Loss or Take Profit Settlement
                             if action in ["CLOSE_SL", "CLOSE_TP"]:
                                 exit_price = action_res["exit_price"]
                                 pnl_usd, pnl_pct, outcome = calculate_pnl(
@@ -129,6 +129,7 @@ def run_worker_loop():
                                     f"<b>Exit Price:</b> ${exit_price:.5f}"
                                 )
 
+                            # Handle Trailing Stop or Break-Even SL Update
                             elif action == "UPDATE_SL":
                                 with conn.cursor() as cur:
                                     cur.execute(
@@ -149,7 +150,6 @@ def run_worker_loop():
                     conn.close()
                 except Exception:
                     pass
-            gc.collect()
 
         time.sleep(POLL_INTERVAL_SECONDS)
 

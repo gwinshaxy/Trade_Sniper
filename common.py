@@ -1,6 +1,5 @@
 import os
 import psycopg2
-from psycopg2 import pool
 import requests
 from dotenv import load_dotenv
 
@@ -9,64 +8,14 @@ env_path = os.path.join(base_dir, ".env")
 load_dotenv(dotenv_path=env_path)
 
 DB_URL = os.getenv("DATABASE_URL") or os.getenv("DB_URL")
-if DB_URL:
-    DB_URL = DB_URL.strip('"').strip("'")
-
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-# Global Connection Pool
-_db_pool = None
-
-def get_db_pool():
-    global _db_pool
-    if _db_pool is None:
-        if not DB_URL:
-            raise ValueError("Neither DATABASE_URL nor DB_URL environment variable is set in .env.")
-        _db_pool = pool.ThreadedConnectionPool(1, 20, DB_URL)
-    return _db_pool
-
-
-class PooledConnectionWrapper:
-    """Wrapper around psycopg2 connection to handle pool release cleanly."""
-    def __init__(self, conn, db_pool):
-        self._conn = conn
-        self._pool = db_pool
-
-    def close(self):
-        """Returns connection back to the pool instead of destroying it."""
-        if self._conn and self._pool:
-            try:
-                self._pool.putconn(self._conn)
-            except Exception:
-                try:
-                    self._conn.close()
-                except Exception:
-                    pass
-            self._conn = None
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        if exc_type:
-            try:
-                self._conn.rollback()
-            except Exception:
-                pass
-        self.close()
-
-    def __getattr__(self, name):
-        """Delegates all unhandled attributes/methods directly to the underlying psycopg2 connection."""
-        return getattr(self._conn, name)
-
-
 def get_db_connection():
-    """Retrieves a connection from the pool wrapped in PooledConnectionWrapper."""
-    p = get_db_pool()
-    conn = p.getconn()
-    return PooledConnectionWrapper(conn, p)
-
+    """Establishes and returns a PostgreSQL database connection."""
+    if not DB_URL:
+        raise ValueError("Neither DATABASE_URL nor DB_URL environment variable is set in .env.")
+    return psycopg2.connect(DB_URL)
 
 def ensure_schema_updated():
     """Ensures trade_setups and strategy_parameters tables exist with fully synchronized schemas."""
@@ -145,7 +94,6 @@ def ensure_schema_updated():
     cursor.close()
     conn.close()
 
-
 def calculate_pnl(direction: str, entry_price: float, exit_price: float, position_size: float, account_balance: float):
     """Calculates realized PnL in USD and Percentage."""
     if direction.upper() == "LONG":
@@ -156,7 +104,6 @@ def calculate_pnl(direction: str, entry_price: float, exit_price: float, positio
     pnl_pct = (pnl_usd / account_balance) * 100 if account_balance > 0 else 0.0
     outcome = "WIN" if pnl_usd >= 0 else "LOSS"
     return round(pnl_usd, 2), round(pnl_pct, 2), outcome
-
 
 def send_telegram_notification(message: str) -> bool:
     """Sends an HTML formatted Telegram alert if credentials exist."""
@@ -170,7 +117,6 @@ def send_telegram_notification(message: str) -> bool:
     except Exception as e:
         print(f"[Telegram Alert Error]: {e}")
         return False
-
 
 def close_trade_manually(trade_id: int, exit_price: float, reason: str = "MANUAL_CLOSE"):
     """Manually closes an active trade, updates PnL, and notifies via Telegram."""

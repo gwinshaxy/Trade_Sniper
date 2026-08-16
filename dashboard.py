@@ -1,23 +1,14 @@
 import os
-import sys
 import json
-import logging
-import subprocess
-import psutil
-import gc
 import numpy as np
 import pandas as pd
 import streamlit as st
 from dotenv import load_dotenv
-
-# Force .env file variables to override pre-existing environment variables
-load_dotenv(override=True)
-
 from lightweight_charts.widgets import StreamlitChart
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
 st.set_page_config(page_title="Trading Terminal", layout="wide")
+load_dotenv()
 
 HTTP_PROXY = os.getenv("HTTP_PROXY") or os.getenv("PROXY_URL")
 HTTPS_PROXY = os.getenv("HTTPS_PROXY") or os.getenv("PROXY_URL")
@@ -27,10 +18,9 @@ if HTTP_PROXY or HTTPS_PROXY:
     os.environ["HTTPS_PROXY"] = HTTPS_PROXY or HTTP_PROXY
     os.environ["NO_PROXY"] = "localhost,127.0.0.1,.supabase.co"
 
+
 def check_password():
-    raw_env_pass = os.getenv("DASHBOARD_PASSWORD", "securepass123")
-    expected_password = raw_env_pass.strip().strip('"').strip("'")
-    
+    expected_password = os.getenv("DASHBOARD_PASSWORD", "securepass123")
     if "password_correct" not in st.session_state:
         st.session_state["password_correct"] = False
     if st.session_state["password_correct"]:
@@ -39,19 +29,18 @@ def check_password():
     st.markdown("## 🔒 Restricted Access")
     st.markdown("Please enter the password to access the Trading Terminal.")
     password_input = st.text_input("Password", type="password")
-    
     if st.button("Login", width="stretch"):
-        if password_input.strip() == expected_password:
+        if password_input == expected_password:
             st.session_state["password_correct"] = True
             st.rerun()
         else:
             st.error("😕 Password incorrect")
     return False
 
+
 if not check_password():
     st.stop()
 
-# --- REMAINDER OF DASHBOARD SCRIPT ---
 from common import (
     calculate_pnl,
     ensure_schema_updated,
@@ -83,55 +72,16 @@ if database_url:
     database_url = database_url.strip('"').strip("'")
 
 conn = get_db_connection()
-if conn:
-    try:
-        with conn.cursor() as cur:
-            cur.execute("""UPDATE trade_setups SET pair = REPLACE(REPLACE(pair::text, '"', ''), '''', '') WHERE pair IS NOT NULL;""")
-            conn.commit()
-    except Exception as db_err:
-        logging.warning(f"Failed to normalize DB pairs on startup: {db_err}")
-    finally:
-        conn.close()
+try:
+    with conn.cursor() as cur:
+        cur.execute("""UPDATE trade_setups SET pair = REPLACE(REPLACE(pair, '"', ''), '''org.postgresql.util.PSQLException''', '');""")
+        conn.commit()
+except Exception:
+    pass
+conn.close()
 
-# --- CACHED DATA LOADERS WITH STRICT MEMORY CONTROL ---
-@st.cache_data(ttl=10, max_entries=20)
-def load_all_trades(db_url):
-    if not db_url:
-        return pd.DataFrame()
-    try:
-        return pd.read_sql("SELECT * FROM trade_setups ORDER BY id DESC;", db_url)
-    except Exception as err:
-        logging.error(f"Error reading trade setups from DB: {err}")
-        return pd.DataFrame()
-
-@st.cache_data(ttl=10, max_entries=20)
-def load_active_trades(db_url):
-    if not db_url:
-        return pd.DataFrame()
-    try:
-        return pd.read_sql(
-            "SELECT id, pair, direction, entry_price, stop_loss, take_profit, risk_reward_ratio AS rrr, risk_pct AS risk_p, position_size, status, trade_state, created_at FROM trade_setups WHERE status IN ('EXECUTED', 'PENDING');",
-            db_url
-        )
-    except Exception as err:
-        logging.error(f"Error reading active setups: {err}")
-        return pd.DataFrame()
-
-@st.cache_data(ttl=10, max_entries=20)
-def load_closed_trades_log(db_url):
-    if not db_url:
-        return pd.DataFrame()
-    try:
-        return pd.read_sql(
-            "SELECT id, pair, direction, entry_price, exit_price, pnl_usd, pnl_pct, outcome, closed_at FROM trade_setups WHERE status = 'CLOSED';",
-            db_url
-        )
-    except Exception as err:
-        logging.error(f"Error reading closed setups: {err}")
-        return pd.DataFrame()
-
-df_all_trades = load_all_trades(database_url)
-db_pairs = [normalize_symbol(p) for p in df_all_trades['pair'].unique().tolist()] if not df_all_trades.empty and 'pair' in df_all_trades.columns else []
+df_all_trades = pd.read_sql("SELECT * FROM trade_setups ORDER BY id DESC;", database_url) if database_url else pd.DataFrame()
+db_pairs = [normalize_symbol(p) for p in df_all_trades['pair'].unique().tolist()] if not df_all_trades.empty else []
 available_pairs = list(dict.fromkeys(env_symbols + db_pairs))
 for default_pair in ["ETH/USDT", "BNB/USDT", "SOL/USDT"]:
     if default_pair not in available_pairs:
@@ -147,7 +97,7 @@ st.sidebar.subheader("🎯 Strategy Parameters (Harmonized)")
 config_target_pair = st.sidebar.selectbox("Load Dynamic Config For:", available_pairs, index=0)
 dyn_cfg = strategy.load_symbol_config(config_target_pair)
 
-lookback_bars = st.sidebar.number_input("Lookback Bars (Range)", value=500, min_value=100, max_value=1000, step=50)
+lookback_bars = st.sidebar.number_input("Lookback Bars (Range)", value=1000, min_value=100, max_value=2000, step=50)
 tema_period = st.sidebar.number_input("TEMA Period", value=int(dyn_cfg.get("tema_period", 200)), min_value=10, max_value=500)
 rsi_period = st.sidebar.number_input("RSI Period", value=int(dyn_cfg.get("rsi_period", 14)), min_value=2, max_value=50)
 rsi_thresh = st.sidebar.slider("RSI Threshold", min_value=20, max_value=80, value=int(dyn_cfg.get("rsi_thresh", 42)))
@@ -189,32 +139,28 @@ calc_position_size = round((account_balance * (risk_pct / 100.0)) / risk, 4) if 
 if st.sidebar.button("🚀 Execute Order", width="stretch"):
     clean_executed_pair = normalize_symbol(pair)
     conn = get_db_connection()
-    if conn:
-        cursor = conn.cursor()
-        cursor.execute(
-            """
-                INSERT INTO trade_setups 
-                (pair, direction, entry_price, stop_loss, take_profit, risk_reward_ratio, position_size, account_balance, risk_pct, status, trade_state)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 'EXECUTED', 'OPEN');
-            """,
-            (clean_executed_pair, direction, entry_price, stop_loss, take_profit, rr_ratio, calc_position_size, account_balance, risk_pct)
-        )
-        conn.commit()
-        cursor.close()
-        conn.close()
-        st.cache_data.clear()
-        st.success("Trade executed successfully!")
-        send_telegram_notification(f"<b>🚀 NEW MANUAL TRADE EXECUTED</b>\n\n<b>Pair:</b> <code>{clean_executed_pair}</code>\n<b>Direction:</b> <code>{direction}</code>")
-        st.rerun()
-    else:
-        st.error("Database connection failed. Could not execute order.")
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+            INSERT INTO trade_setups 
+            (pair, direction, entry_price, stop_loss, take_profit, risk_reward_ratio, position_size, account_balance, risk_pct, status, trade_state)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 'EXECUTED', 'OPEN');
+        """,
+        (clean_executed_pair, direction, entry_price, stop_loss, take_profit, rr_ratio, calc_position_size, account_balance, risk_pct)
+    )
+    conn.commit()
+    cursor.close()
+    conn.close()
+    st.success("Trade executed successfully!")
+    send_telegram_notification(f"<b>🚀 NEW MANUAL TRADE EXECUTED</b>\n\n<b>Pair:</b> <code>{clean_executed_pair}</code>\n<b>Direction:</b> <code>{direction}</code>")
+    st.rerun()
 
 st.title("📊 Forex & Crypto Trading Terminal")
 
-closed_trades = df_all_trades[df_all_trades['status'] == 'CLOSED'] if not df_all_trades.empty and 'status' in df_all_trades.columns else pd.DataFrame()
+closed_trades = df_all_trades[df_all_trades['status'] == 'CLOSED'] if not df_all_trades.empty else pd.DataFrame()
 net_realized_pnl = float(closed_trades['pnl_usd'].sum()) if not closed_trades.empty and 'pnl_usd' in closed_trades.columns else 0.0
 profit_factor_val = 0.0
-if not closed_trades.empty and 'pnl_usd' in closed_trades.columns and 'outcome' in closed_trades.columns:
+if not closed_trades.empty and 'pnl_usd' in closed_trades.columns:
     wins_sum = float(closed_trades[closed_trades['outcome'] == 'WIN']['pnl_usd'].sum())
     loss_sum = abs(float(closed_trades[closed_trades['outcome'] == 'LOSS']['pnl_usd'].sum()))
     profit_factor_val = round(wins_sum / loss_sum, 2) if loss_sum > 0 else 0.0
@@ -289,7 +235,7 @@ if df_ohlc is not None and not df_ohlc.empty:
                         text=f"GAP: {gap_price:.2f}"
                     )
 
-        if overlay_chart and not df_all_trades.empty and 'pair' in df_all_trades.columns and 'status' in df_all_trades.columns:
+        if overlay_chart and not df_all_trades.empty:
             symbol_trades = df_all_trades[(df_all_trades['pair'].apply(normalize_symbol) == normalize_symbol(chart_symbol)) & (df_all_trades['status'].isin(['EXECUTED', 'PENDING']))]
             for _, tr in symbol_trades.iterrows():
                 chart.horizontal_line(float(tr['entry_price']), color="blue", text=f"ENTRY ({tr['direction']})")
@@ -306,7 +252,7 @@ st.markdown("---")
 tab_pending, tab_history = st.tabs(["⏳ Active / Manual Management", "📜 Cumulative Trades History"])
 with tab_pending:
     st.subheader("🛠️ Active Trade Management & Manual Overrides")
-    df_active = load_active_trades(database_url)
+    df_active = pd.read_sql("SELECT id, pair, direction, entry_price, stop_loss, take_profit, risk_reward_ratio AS rrr, risk_pct AS risk_p, position_size, status, trade_state, created_at FROM trade_setups WHERE status IN ('EXECUTED', 'PENDING');", database_url) if database_url else pd.DataFrame()
     
     if not df_active.empty:
         df_active['pair'] = df_active['pair'].apply(normalize_symbol)
@@ -321,35 +267,30 @@ with tab_pending:
             new_sl = st.number_input("Update SL ($)", value=float(selected_trade_row['stop_loss']), format="%.5f")
             if st.button("Update Stop Loss"):
                 conn = get_db_connection()
-                if conn:
-                    cur = conn.cursor()
-                    cur.execute("UPDATE trade_setups SET stop_loss = %s WHERE id = %s;", (new_sl, selected_trade_id))
-                    conn.commit()
-                    cur.close()
-                    conn.close()
-                    st.cache_data.clear()
-                    st.success(f"Updated SL for Trade #{selected_trade_id} to ${new_sl:.5f}")
-                    st.rerun()
+                cur = conn.cursor()
+                cur.execute("UPDATE trade_setups SET stop_loss = %s WHERE id = %s;", (new_sl, selected_trade_id))
+                conn.commit()
+                cur.close()
+                conn.close()
+                st.success(f"Updated SL for Trade #{selected_trade_id} to ${new_sl:.5f}")
+                st.rerun()
 
         with col_m2:
             new_tp = st.number_input("Update TP ($)", value=float(selected_trade_row['take_profit']), format="%.5f")
             if st.button("Update Take Profit"):
                 conn = get_db_connection()
-                if conn:
-                    cur = conn.cursor()
-                    cur.execute("UPDATE trade_setups SET take_profit = %s WHERE id = %s;", (new_tp, selected_trade_id))
-                    conn.commit()
-                    cur.close()
-                    conn.close()
-                    st.cache_data.clear()
-                    st.success(f"Updated TP for Trade #{selected_trade_id} to ${new_tp:.5f}")
-                    st.rerun()
+                cur = conn.cursor()
+                cur.execute("UPDATE trade_setups SET take_profit = %s WHERE id = %s;", (new_tp, selected_trade_id))
+                conn.commit()
+                cur.close()
+                conn.close()
+                st.success(f"Updated TP for Trade #{selected_trade_id} to ${new_tp:.5f}")
+                st.rerun()
 
         with col_m3:
             exit_price_input = st.number_input("Manual Exit Price ($)", value=float(selected_trade_row['entry_price']), format="%.5f")
             if st.button("🚨 Market Close Trade Now", type="primary"):
                 if close_trade_manually(selected_trade_id, exit_price_input, reason="MANUAL_OVERRIDE"):
-                    st.cache_data.clear()
                     st.success(f"Trade #{selected_trade_id} successfully closed manually.")
                     st.rerun()
                 else:
@@ -359,7 +300,7 @@ with tab_pending:
         st.info("No active setups found.")
 
 with tab_history:
-    df_closed_log = load_closed_trades_log(database_url)
+    df_closed_log = pd.read_sql("SELECT id, pair, direction, entry_price, exit_price, pnl_usd, pnl_pct, outcome, closed_at FROM trade_setups WHERE status = 'CLOSED';", database_url) if database_url else pd.DataFrame()
     if not df_closed_log.empty:
         df_closed_log['pair'] = df_closed_log['pair'].apply(normalize_symbol)
         st.dataframe(df_closed_log, width="stretch")
@@ -371,7 +312,7 @@ col_eq, col_hm = st.columns(2)
 
 with col_eq:
     st.subheader("📈 Cumulative Equity Curve")
-    if not closed_trades.empty and 'pnl_usd' in closed_trades.columns and 'closed_at' in closed_trades.columns:
+    if not closed_trades.empty and 'pnl_usd' in closed_trades.columns:
         df_eq = closed_trades.sort_values('closed_at').copy()
         df_eq['pnl_usd'] = pd.to_numeric(df_eq['pnl_usd'], errors='coerce').fillna(0.0)
         df_eq['cumulative_pnl'] = df_eq['pnl_usd'].cumsum()
@@ -419,12 +360,9 @@ with col_log:
     st.markdown("*Live Worker Logs:*")
     log_messages = [
         "[INFO] Database connection established...",
-        "[INFO] Dynamic port binding active.",
+        "[INFO] Real-time chart WebSocket connected.",
         "[INFO] Pending setups tab in sync with PostgreSQL.",
         "[STATUS] Waiting for price action triggers."
     ]
     for log in log_messages:
         st.code(log, language="text")
-
-# Reclaim unused RAM at end of execution cycle
-gc.collect()
