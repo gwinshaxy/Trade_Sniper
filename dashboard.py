@@ -175,7 +175,7 @@ st.markdown("---")
 
 col_hdr, col_tf = st.columns([3, 1])
 with col_hdr:
-    st.subheader("📈 Real-Time Chart & Volume Profile")
+    st.subheader("📈 Real-Time Chart & Sub-Indicators")
 with col_tf:
     selected_timeframe = st.selectbox("Select Timeframe:", ["5m", "15m", "30m", "1h", "4h", "1d"], index=3, key="chart_timeframe_select")
 
@@ -198,8 +198,22 @@ if df_ohlc is not None and not df_ohlc.empty:
             df_ohlc.rename(columns={df_ohlc.columns[0]: 'time'}, inplace=True)
             df_ohlc['time'] = pd.to_datetime(df_ohlc['time']).dt.strftime('%Y-%m-%d %H:%M:%S')
 
+        # Step 1: Calculate TEMA, RSI, and ADX indicators
         df_ohlc['tema_custom'] = strategy.calc_tema(df_ohlc['close'], period=min(int(tema_period), len(df_ohlc)))
-        
+        df_ohlc['rsi'] = strategy.calc_rsi(df_ohlc['close'], period=int(rsi_period))
+        df_ohlc['adx'] = strategy.calc_adx(df_ohlc, period=int(adx_period))
+
+        # Step 2: Display Current Metric Cards
+        latest_rsi = float(df_ohlc['rsi'].dropna().iloc[-1]) if not df_ohlc['rsi'].dropna().empty else 50.0
+        latest_adx = float(df_ohlc['adx'].dropna().iloc[-1]) if not df_ohlc['adx'].dropna().empty else 0.0
+
+        adx_status = "Trending Strong" if latest_adx >= adx_threshold else "Choppy / Ranging"
+        rsi_status = "Bullish Momentum" if latest_rsi >= rsi_thresh else ("Bearish Momentum" if latest_rsi <= (100 - rsi_thresh) else "Neutral")
+
+        ind_col1, ind_col2 = st.columns(2)
+        ind_col1.metric("Current ADX Trend Strength", f"{latest_adx:.2f}", delta=adx_status, delta_color="normal" if latest_adx >= adx_threshold else "off")
+        ind_col2.metric("Current RSI Momentum", f"{latest_rsi:.2f}", delta=rsi_status, delta_color="normal" if latest_rsi >= rsi_thresh else "inverse")
+
         poc, vah, val = strategy.compute_volume_profile(
             df_ohlc, 
             num_bins=100, 
@@ -213,22 +227,27 @@ if df_ohlc is not None and not df_ohlc.empty:
             detection_pct=node_detection_pct
         )
 
-        chart = StreamlitChart(width=1100, height=500)
-        chart.layout(background_color='#131722', text_color='#d1d4dc')
-        chart.volume_config(scale_margin_top=0.85, scale_margin_bottom=0.0, up_color='#26a69a', down_color='#ef5350')
-        chart.set(df_ohlc[['time', 'open', 'high', 'low', 'close', 'volume']].dropna())
+        rsi_line_name = f"RSI ({rsi_period})"
+        adx_line_name = f"ADX ({adx_period})"
+
+        # Step 3: Render Main Chart and Indicators independently[cite: 23]
+        # 1) Main Candlestick Chart
+        chart_main = StreamlitChart(width=1100, height=600)
+        chart_main.layout(background_color='#131722', text_color='#d1d4dc')
+        chart_main.volume_config(scale_margin_top=0.85, scale_margin_bottom=0.0, up_color='#26a69a', down_color='#ef5350')
+        chart_main.set(df_ohlc[['time', 'open', 'high', 'low', 'close', 'volume']].dropna())
 
         tema_df = df_ohlc[['time', 'tema_custom']].dropna().rename(columns={'tema_custom': f'{tema_period} TEMA'})
         if not tema_df.empty:
-            tema_line = chart.create_line(name=f"{tema_period} TEMA", color="orange", width=2)
+            tema_line = chart_main.create_line(name=f"{tema_period} TEMA", color="orange", width=2)
             tema_line.set(tema_df)
 
         if pd.notnull(vah) and vah > 0:
-            chart.horizontal_line(float(vah), color="#2962ff", style="solid", width=2, text=f"VAH: {vah:.2f}")
+            chart_main.horizontal_line(float(vah), color="#2962ff", style="solid", width=2, text=f"VAH: {vah:.2f}")
         if pd.notnull(val) and val > 0:
-            chart.horizontal_line(float(val), color="#2962ff", style="solid", width=2, text=f"VAL: {val:.2f}")
+            chart_main.horizontal_line(float(val), color="#2962ff", style="solid", width=2, text=f"VAL: {val:.2f}")
         if pd.notnull(poc) and poc > 0:
-            chart.horizontal_line(float(poc), color="#f44336", style="solid", width=2, text=f"POC: {poc:.2f}")
+            chart_main.horizontal_line(float(poc), color="#f44336", style="solid", width=2, text=f"POC: {poc:.2f}")
 
         if overlay_gaps and detected_gaps:
             df_lookback = df_ohlc.tail(int(lookback_bars))
@@ -237,7 +256,7 @@ if df_ohlc is not None and not df_ohlc.empty:
 
             for gap_price in detected_gaps:
                 if pd.notnull(gap_price) and min_chart_p <= float(gap_price) <= max_chart_p:
-                    chart.horizontal_line(
+                    chart_main.horizontal_line(
                         float(gap_price), 
                         color="#ff9800", 
                         style="dashed", 
@@ -248,11 +267,42 @@ if df_ohlc is not None and not df_ohlc.empty:
         if overlay_chart and not df_all_trades.empty:
             symbol_trades = df_all_trades[(df_all_trades['pair'].apply(normalize_symbol) == normalize_symbol(chart_symbol)) & (df_all_trades['status'].isin(['EXECUTED', 'PENDING']))]
             for _, tr in symbol_trades.iterrows():
-                chart.horizontal_line(float(tr['entry_price']), color="blue", text=f"ENTRY ({tr['direction']})")
-                if pd.notnull(tr['stop_loss']) and float(tr['stop_loss']) > 0: chart.horizontal_line(float(tr['stop_loss']), color="red", text="SL")
-                if pd.notnull(tr['take_profit']) and float(tr['take_profit']) > 0: chart.horizontal_line(float(tr['take_profit']), color="green", text="TP")
+                chart_main.horizontal_line(float(tr['entry_price']), color="blue", text=f"ENTRY ({tr['direction']})")
+                if pd.notnull(tr['stop_loss']) and float(tr['stop_loss']) > 0: chart_main.horizontal_line(float(tr['stop_loss']), color="red", text="SL")
+                if pd.notnull(tr['take_profit']) and float(tr['take_profit']) > 0: chart_main.horizontal_line(float(tr['take_profit']), color="green", text="TP")
 
-        chart.load()
+        # Render Main Chart
+        chart_main.load()
+
+        # 2) RSI Subchart Instance
+        st.caption(f"📉 Relative Strength Index — {rsi_line_name}")
+        chart_rsi = StreamlitChart(width=1100, height=180)
+        chart_rsi.layout(background_color='#131722', text_color='#d1d4dc')
+        
+        rsi_df = df_ohlc[['time', 'rsi']].dropna().rename(columns={'rsi': rsi_line_name})
+        if not rsi_df.empty:
+            rsi_line = chart_rsi.create_line(name=rsi_line_name, color="#ab47bc", width=2)
+            rsi_line.set(rsi_df)
+            chart_rsi.horizontal_line(float(rsi_thresh), color="#26a69a", style="dashed", width=1)
+            chart_rsi.horizontal_line(float(100 - rsi_thresh), color="#ef5350", style="dashed", width=1)
+
+        # Render RSI Chart
+        chart_rsi.load()
+
+        # 3) ADX Subchart Instance
+        st.caption(f"📊 Average Directional Index — {adx_line_name}")
+        chart_adx = StreamlitChart(width=1100, height=180)
+        chart_adx.layout(background_color='#131722', text_color='#d1d4dc')
+        
+        adx_df = df_ohlc[['time', 'adx']].dropna().rename(columns={'adx': adx_line_name})
+        if not adx_df.empty:
+            adx_line = chart_adx.create_line(name=adx_line_name, color="#29b6f6", width=2)
+            adx_line.set(adx_df)
+            chart_adx.horizontal_line(float(adx_threshold), color="#ffca28", style="solid", width=1)
+
+        # Render ADX Chart
+        chart_adx.load()
+
     except Exception as chart_err:
         st.error(f"Lightweight Chart Rendering Exception: {chart_err}")
 else:
