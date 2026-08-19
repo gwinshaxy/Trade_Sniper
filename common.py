@@ -19,7 +19,7 @@ def get_db_connection():
     return psycopg2.connect(clean_db_url)
 
 def ensure_schema_updated():
-    """Ensures trade_setups and strategy_parameters tables exist with fully synchronized DEAP schemas."""
+    """Ensures trade_setups and strategy_parameters tables exist with fully synchronized DEAP schemas and RLS enabled."""
     conn = get_db_connection()
     cursor = conn.cursor()
     
@@ -92,6 +92,11 @@ def ensure_schema_updated():
     for col in param_columns:
         cursor.execute(f"ALTER TABLE strategy_parameters ADD COLUMN IF NOT EXISTS {col};")
         
+    # Enforce Row Level Security (RLS) across public tables
+    rls_tables = ["candles", "strategy_config", "strategy_parameters", "trade_setups"]
+    for tbl in rls_tables:
+        cursor.execute(f"ALTER TABLE IF EXISTS public.{tbl} ENABLE ROW LEVEL SECURITY;")
+
     conn.commit()
     cursor.close()
     conn.close()
