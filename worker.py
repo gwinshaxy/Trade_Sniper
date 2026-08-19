@@ -12,7 +12,6 @@ from common import get_db_connection, ensure_schema_updated, send_telegram_notif
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
-# Ensure PostgreSQL schema constraints match active parameters
 ensure_schema_updated()
 
 symbols_env = os.getenv("SYMBOLS") or os.getenv("SYMBOL", "ETH/USDT,BNB/USDT,SOL/USDT")
@@ -47,7 +46,6 @@ def run_worker_loop():
                                 pos_size = signal["position_size"]
                                 risk_pct = signal.get("risk_pct", DEFAULT_RISK_PCT)
 
-                                # Prevent duplicate active orders on the same pair
                                 with conn.cursor() as cur:
                                     cur.execute(
                                         "SELECT id FROM trade_setups WHERE pair = %s AND status = 'EXECUTED' AND trade_state != 'CLOSED';",
@@ -99,13 +97,13 @@ def run_worker_loop():
                                 'entry_price': entry,
                                 'stop_loss': sl,
                                 'take_profit': tp,
-                                'trade_state': state
+                                'trade_state': state,
+                                'pair': pair
                             })
 
                             action_res = trade_manager.process_trade(trade_row, latest_candle)
                             action = action_res.get("action")
 
-                            # Handle Stop Loss or Take Profit Settlement
                             if action in ["CLOSE_SL", "CLOSE_TP"]:
                                 exit_price = action_res["exit_price"]
                                 pnl_usd, pnl_pct, outcome = calculate_pnl(
@@ -129,7 +127,6 @@ def run_worker_loop():
                                     f"<b>Exit Price:</b> ${exit_price:.5f}"
                                 )
 
-                            # Handle Trailing Stop or Break-Even SL Update
                             elif action == "UPDATE_SL":
                                 with conn.cursor() as cur:
                                     cur.execute(

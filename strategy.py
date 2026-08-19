@@ -17,7 +17,6 @@ logging.basicConfig(
 try:
     import psycopg2
     from psycopg2.extras import RealDictCursor
-
     PSYCOPG2_AVAILABLE = True
 except ImportError:
     PSYCOPG2_AVAILABLE = False
@@ -35,9 +34,9 @@ def normalize_symbol(symbol: str) -> str:
 
 
 def load_symbol_config(symbol: str) -> dict:
-    """Loads optimized strategy parameters from PostgreSQL database safely closing connections in a finally block."""
+    """Loads optimized DEAP strategy parameters from PostgreSQL database safely closing connections."""
     clean_symbol = normalize_symbol(symbol).replace("/", "").upper()
-    db_url = os.getenv("DATABASE_URL")
+    db_url = os.getenv("DATABASE_URL") or os.getenv("DB_URL")
 
     if db_url:
         db_url = db_url.strip('"').strip("'").strip()
@@ -59,14 +58,21 @@ def load_symbol_config(symbol: str) -> dict:
                 row = cur.fetchone()
                 if row:
                     config = dict(row)
-                    config.setdefault("rsi_thresh", 42.0)
+                    config.setdefault("tema_period", int(config.get("tema_period", 200)))
+                    config.setdefault("rsi_period", int(config.get("rsi_period", 14)))
+                    config.setdefault("rsi_thresh", float(config.get("rsi_thresh", 42.0)))
+                    config.setdefault("adx_period", int(config.get("adx_period", 14)))
+                    config.setdefault("adx_threshold", float(config.get("adx_threshold", 20.0)))
+                    config.setdefault("max_sl_pct", float(config.get("max_sl_pct", 0.02)))
+                    config.setdefault("zone_tolerance", float(config.get("zone_tolerance", 0.0075)))
+                    config.setdefault("min_sentiment", float(config.get("min_sentiment", 0.0)))
+                    config.setdefault("risk_pct", float(config.get("risk_pct", 1.0)))
+                    config.setdefault("min_rr", float(config.get("min_rr", 2.0)))
                     config.setdefault("use_rsi_filter", True)
                     config.setdefault("use_candlestick_confirm", True)
                     config.setdefault("use_adx_filter", True)
-                    config.setdefault("adx_period", 14)
-                    config.setdefault("adx_threshold", 20.0)
-                    config.setdefault("max_sl_pct", 0.02)
                     config.setdefault("lookback_bars", 600)
+                    config.setdefault("vp_detection_pct", 0.07)
                     config.setdefault("vp_va_pct", 0.70)
                     logging.debug(
                         f"[load_symbol_config] Loaded dynamic DEAP params for {clean_symbol}"
@@ -618,7 +624,7 @@ def evaluate_signals(
     )
 
     rsi_long_ok = (current_rsi >= rsi_thresh) if use_rsi else True
-    rsi_short_ok = (current_rsi <= (100 - rsi_thresh)) if use_rsi else True
+    rsi_short_ok = (current_rsi <= (100.0 - rsi_thresh)) if use_rsi else True
 
     overhead_gaps = sorted([g for g in vp_gaps if g > current_close])
     underneath_gaps = sorted(

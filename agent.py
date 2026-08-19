@@ -8,6 +8,7 @@ class DynamicTradeManager:
     def process_trade(self, trade_row: pd.Series, latest_candle: pd.Series) -> dict:
         trade_id = trade_row['id']
         direction = trade_row['direction']
+        pair = trade_row.get('pair', 'N/A')
         entry = float(trade_row['entry_price'])
         curr_sl = float(trade_row['stop_loss'])
         curr_tp = float(trade_row['take_profit'])
@@ -26,7 +27,13 @@ class DynamicTradeManager:
                 "action": "CLOSE_SL",
                 "trade_id": trade_id,
                 "exit_price": curr_sl,
-                "msg": f"🔴 <b>STOP LOSS HIT</b>\n\nTrade #{trade_id} hit Stop Loss at ${curr_sl:.5f}!"
+                "msg": (
+                    f"🛑 <b>STOP LOSS HIT</b>\n\n"
+                    f"<b>Trade ID:</b> <code>#{trade_id}</code>\n"
+                    f"<b>Pair:</b> <code>{pair}</code>\n"
+                    f"<b>Direction:</b> <code>{direction}</code>\n"
+                    f"<b>Exit Price:</b> ${curr_sl:.5f}"
+                )
             }
 
         # -------------------------------------------------------------
@@ -38,7 +45,13 @@ class DynamicTradeManager:
                 "action": "CLOSE_TP",
                 "trade_id": trade_id,
                 "exit_price": curr_tp,
-                "msg": f"🟢 <b>TAKE PROFIT HIT</b>\n\nTrade #{trade_id} hit Take Profit at ${curr_tp:.5f}!"
+                "msg": (
+                    f"🎯 <b>TAKE PROFIT HIT</b>\n\n"
+                    f"<b>Trade ID:</b> <code>#{trade_id}</code>\n"
+                    f"<b>Pair:</b> <code>{pair}</code>\n"
+                    f"<b>Direction:</b> <code>{direction}</code>\n"
+                    f"<b>Exit Price:</b> ${curr_tp:.5f}"
+                )
             }
 
         # -------------------------------------------------------------
@@ -55,7 +68,12 @@ class DynamicTradeManager:
                     "trade_id": trade_id,
                     "new_sl": round(be_price, 5),
                     "new_state": "BE_LOCKED",
-                    "msg": f"🎯 Trade #{trade_id} hit 1:1 R:R. Moving Stop Loss to Break-Even (${be_price:.5f})."
+                    "msg": (
+                        f"🛡️ <b>BREAK-EVEN TRIGGERED</b>\n\n"
+                        f"<b>Trade ID:</b> <code>#{trade_id}</code>\n"
+                        f"<b>Pair:</b> <code>{pair}</code>\n"
+                        f"<b>New Stop Loss:</b> ${be_price:.5f} (1:1 R:R achieved)"
+                    )
                 }
 
         # -------------------------------------------------------------
@@ -70,7 +88,13 @@ class DynamicTradeManager:
                         "trade_id": trade_id,
                         "new_sl": round(proposed_sl, 5),
                         "new_state": "TRAILING",
-                        "msg": f"📈 Trade #{trade_id} Trailing SL updated to ${proposed_sl:.5f} along TEMA (${tema:.5f})."
+                        "msg": (
+                            f"📈 <b>TRAILING STOP LOSS UPDATED</b>\n\n"
+                            f"<b>Trade ID:</b> <code>#{trade_id}</code>\n"
+                            f"<b>Pair:</b> <code>{pair}</code>\n"
+                            f"<b>New Trailing SL:</b> ${proposed_sl:.5f}\n"
+                            f"<b>TEMA Anchor:</b> ${tema:.5f}"
+                        )
                     }
             elif direction == 'SHORT':
                 proposed_sl = tema * (1 + self.tema_offset_pct)
@@ -80,7 +104,13 @@ class DynamicTradeManager:
                         "trade_id": trade_id,
                         "new_sl": round(proposed_sl, 5),
                         "new_state": "TRAILING",
-                        "msg": f"📉 Trade #{trade_id} Trailing SL updated to ${proposed_sl:.5f} along TEMA (${tema:.5f})."
+                        "msg": (
+                            f"📉 <b>TRAILING STOP LOSS UPDATED</b>\n\n"
+                            f"<b>Trade ID:</b> <code>#{trade_id}</code>\n"
+                            f"<b>Pair:</b> <code>{pair}</code>\n"
+                            f"<b>New Trailing SL:</b> ${proposed_sl:.5f}\n"
+                            f"<b>TEMA Anchor:</b> ${tema:.5f}"
+                        )
                     }
 
         return {"action": "NONE"}

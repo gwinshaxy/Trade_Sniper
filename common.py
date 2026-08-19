@@ -15,10 +15,11 @@ def get_db_connection():
     """Establishes and returns a PostgreSQL database connection."""
     if not DB_URL:
         raise ValueError("Neither DATABASE_URL nor DB_URL environment variable is set in .env.")
-    return psycopg2.connect(DB_URL)
+    clean_db_url = DB_URL.strip('"').strip("'").strip()
+    return psycopg2.connect(clean_db_url)
 
 def ensure_schema_updated():
-    """Ensures trade_setups and strategy_parameters tables exist with fully synchronized schemas."""
+    """Ensures trade_setups and strategy_parameters tables exist with fully synchronized DEAP schemas."""
     conn = get_db_connection()
     cursor = conn.cursor()
     
@@ -85,7 +86,8 @@ def ensure_schema_updated():
         "adx_period INT DEFAULT 14",
         "adx_threshold FLOAT DEFAULT 20.0",
         "use_adx_filter BOOLEAN DEFAULT TRUE",
-        "max_sl_pct FLOAT DEFAULT 0.02"
+        "max_sl_pct FLOAT DEFAULT 0.02",
+        "fitness_score NUMERIC DEFAULT 0.0"
     ]
     for col in param_columns:
         cursor.execute(f"ALTER TABLE strategy_parameters ADD COLUMN IF NOT EXISTS {col};")
@@ -150,13 +152,15 @@ def close_trade_manually(trade_id: int, exit_price: float, reason: str = "MANUAL
         cursor.close()
         conn.close()
 
-        emoji = "🔴" if pnl_usd < 0 else "🟢"
+        emoji = "🟢" if pnl_usd >= 0 else "🔴"
         send_telegram_notification(
             f"<b>{emoji} MANUAL TRADE CLOSED ({reason})</b>\n\n"
             f"<b>Trade ID:</b> <code>#{trade_id}</code>\n"
             f"<b>Pair:</b> <code>{pair}</code>\n"
+            f"<b>Direction:</b> <code>{direction}</code>\n"
+            f"<b>Entry Price:</b> ${float(entry_price):.5f}\n"
             f"<b>Exit Price:</b> ${exit_price:.5f}\n"
-            f"<b>PnL:</b> ${pnl_usd:,.2f} ({pnl_pct:.2f}%)"
+            f"<b>PnL:</b> ${pnl_usd:,.2f} ({pnl_pct:.2f}%) | <b>Outcome:</b> {outcome}"
         )
         return True
     except Exception as e:

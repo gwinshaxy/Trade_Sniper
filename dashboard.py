@@ -6,7 +6,6 @@ import streamlit as st
 from dotenv import load_dotenv
 from lightweight_charts.widgets import StreamlitChart
 
-
 st.set_page_config(page_title="Trading Terminal", layout="wide")
 load_dotenv()
 
@@ -17,7 +16,6 @@ if HTTP_PROXY or HTTPS_PROXY:
     os.environ["HTTP_PROXY"] = HTTP_PROXY or HTTPS_PROXY
     os.environ["HTTPS_PROXY"] = HTTPS_PROXY or HTTP_PROXY
     os.environ["NO_PROXY"] = "localhost,127.0.0.1,.supabase.co"
-
 
 def check_password():
     expected_password = os.getenv("DASHBOARD_PASSWORD", "securepass123")
@@ -37,7 +35,6 @@ def check_password():
             st.error("😕 Password incorrect")
     return False
 
-
 if not check_password():
     st.stop()
 
@@ -52,7 +49,6 @@ import strategy
 
 ensure_schema_updated()
 
-
 def normalize_symbol(symbol: str) -> str:
     if not symbol:
         return ""
@@ -63,11 +59,10 @@ def normalize_symbol(symbol: str) -> str:
         return f"{s[:-4]}/{s[-4:]}"
     return s
 
-
 symbols_env = os.getenv("SYMBOLS") or os.getenv("SYMBOL", "ETH/USDT,BNB/USDT,SOL/USDT")
 env_symbols = [normalize_symbol(s) for s in symbols_env.split(",")]
 
-database_url = os.getenv("DATABASE_URL")
+database_url = os.getenv("DATABASE_URL") or os.getenv("DB_URL")
 if database_url:
     database_url = database_url.strip('"').strip("'")
 
@@ -104,7 +99,7 @@ rsi_thresh = st.sidebar.slider("RSI Threshold", min_value=20, max_value=80, valu
 
 adx_period = st.sidebar.number_input("ADX Period", value=int(dyn_cfg.get("adx_period", 14)), min_value=2, max_value=50)
 adx_threshold = st.sidebar.slider("ADX Threshold", min_value=10.0, max_value=50.0, value=float(dyn_cfg.get("adx_threshold", 20.0)), step=1.0)
-max_sl_pct = st.sidebar.slider("Max SL Distance (%)", min_value=0.5, max_value=10.0, value=float(dyn_cfg.get("max_sl_pct", 0.02)) * 100.0, step=0.1) / 100.0
+max_sl_pct = st.sidebar.slider("Max SL Distance (%)", min_value=0.5, max_value=3.0, value=float(dyn_cfg.get("max_sl_pct", 0.02)) * 100.0, step=0.1) / 100.0
 
 zone_tolerance_pct = st.sidebar.slider("Volume Zone Proximity (%)", min_value=0.1, max_value=3.0, value=float(dyn_cfg.get("zone_tolerance", 0.0075)) * 100.0, step=0.05)
 
@@ -133,7 +128,7 @@ rr_ratio = round(reward / risk, 2) if risk > 0 else 0.0
 st.sidebar.markdown(f"**Risk : Reward Ratio:** `1:{rr_ratio}`")
 
 account_balance = st.sidebar.number_input("Account Balance ($)", min_value=1.0, value=float(os.getenv("ACCOUNT_BALANCE", 10000.0)))
-risk_pct = st.sidebar.number_input("Risk Per Trade (%)", min_value=0.01, max_value=100.0, value=0.5)
+risk_pct = st.sidebar.number_input("Risk Per Trade (%)", min_value=0.01, max_value=1.5, value=0.5)
 calc_position_size = round((account_balance * (risk_pct / 100.0)) / risk, 4) if risk > 0 else 0.0
 
 if st.sidebar.button("🚀 Execute Order", width="stretch"):
@@ -144,15 +139,24 @@ if st.sidebar.button("🚀 Execute Order", width="stretch"):
         """
             INSERT INTO trade_setups 
             (pair, direction, entry_price, stop_loss, take_profit, risk_reward_ratio, position_size, account_balance, risk_pct, status, trade_state)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 'EXECUTED', 'OPEN');
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 'EXECUTED', 'OPEN') RETURNING id;
         """,
         (clean_executed_pair, direction, entry_price, stop_loss, take_profit, rr_ratio, calc_position_size, account_balance, risk_pct)
     )
+    new_trade_id = cursor.fetchone()[0]
     conn.commit()
     cursor.close()
     conn.close()
     st.success("Trade executed successfully!")
-    send_telegram_notification(f"<b>🚀 NEW MANUAL TRADE EXECUTED</b>\n\n<b>Pair:</b> <code>{clean_executed_pair}</code>\n<b>Direction:</b> <code>{direction}</code>")
+    send_telegram_notification(
+        f"<b>🚀 NEW MANUAL TRADE EXECUTED</b>\n\n"
+        f"<b>Trade ID:</b> <code>#{new_trade_id}</code>\n"
+        f"<b>Pair:</b> <code>{clean_executed_pair}</code>\n"
+        f"<b>Direction:</b> <code>{direction}</code>\n"
+        f"<b>Entry Price:</b> ${entry_price:.5f}\n"
+        f"<b>SL:</b> ${stop_loss:.5f} | <b>TP:</b> ${take_profit:.5f}\n"
+        f"<b>Risk:</b> {risk_pct}% | <b>R:R:</b> 1:{rr_ratio}"
+    )
     st.rerun()
 
 st.title("📊 Forex & Crypto Trading Terminal")
@@ -198,17 +202,15 @@ if df_ohlc is not None and not df_ohlc.empty:
             df_ohlc.rename(columns={df_ohlc.columns[0]: 'time'}, inplace=True)
             df_ohlc['time'] = pd.to_datetime(df_ohlc['time']).dt.strftime('%Y-%m-%d %H:%M:%S')
 
-        # Step 1: Calculate TEMA, RSI, and ADX indicators
         df_ohlc['tema_custom'] = strategy.calc_tema(df_ohlc['close'], period=min(int(tema_period), len(df_ohlc)))
         df_ohlc['rsi'] = strategy.calc_rsi(df_ohlc['close'], period=int(rsi_period))
         df_ohlc['adx'] = strategy.calc_adx(df_ohlc, period=int(adx_period))
 
-        # Step 2: Display Current Metric Cards
         latest_rsi = float(df_ohlc['rsi'].dropna().iloc[-1]) if not df_ohlc['rsi'].dropna().empty else 50.0
         latest_adx = float(df_ohlc['adx'].dropna().iloc[-1]) if not df_ohlc['adx'].dropna().empty else 0.0
 
         adx_status = "Trending Strong" if latest_adx >= adx_threshold else "Choppy / Ranging"
-        rsi_status = "Bullish Momentum" if latest_rsi >= rsi_thresh else ("Bearish Momentum" if latest_rsi <= (100 - rsi_thresh) else "Neutral")
+        rsi_status = "Bullish Momentum" if latest_rsi >= rsi_thresh else ("Bearish Momentum" if latest_rsi <= (100.0 - rsi_thresh) else "Neutral")
 
         ind_col1, ind_col2 = st.columns(2)
         ind_col1.metric("Current ADX Trend Strength", f"{latest_adx:.2f}", delta=adx_status, delta_color="normal" if latest_adx >= adx_threshold else "off")
@@ -230,8 +232,6 @@ if df_ohlc is not None and not df_ohlc.empty:
         rsi_line_name = f"RSI ({rsi_period})"
         adx_line_name = f"ADX ({adx_period})"
 
-        # Step 3: Render Main Chart and Indicators independently[cite: 23]
-        # 1) Main Candlestick Chart
         chart_main = StreamlitChart(width=1100, height=600)
         chart_main.layout(background_color='#131722', text_color='#d1d4dc')
         chart_main.volume_config(scale_margin_top=0.85, scale_margin_bottom=0.0, up_color='#26a69a', down_color='#ef5350')
@@ -271,10 +271,8 @@ if df_ohlc is not None and not df_ohlc.empty:
                 if pd.notnull(tr['stop_loss']) and float(tr['stop_loss']) > 0: chart_main.horizontal_line(float(tr['stop_loss']), color="red", text="SL")
                 if pd.notnull(tr['take_profit']) and float(tr['take_profit']) > 0: chart_main.horizontal_line(float(tr['take_profit']), color="green", text="TP")
 
-        # Render Main Chart
         chart_main.load()
 
-        # 2) RSI Subchart Instance
         st.caption(f"📉 Relative Strength Index — {rsi_line_name}")
         chart_rsi = StreamlitChart(width=1100, height=180)
         chart_rsi.layout(background_color='#131722', text_color='#d1d4dc')
@@ -284,12 +282,10 @@ if df_ohlc is not None and not df_ohlc.empty:
             rsi_line = chart_rsi.create_line(name=rsi_line_name, color="#ab47bc", width=2)
             rsi_line.set(rsi_df)
             chart_rsi.horizontal_line(float(rsi_thresh), color="#26a69a", style="dashed", width=1)
-            chart_rsi.horizontal_line(float(100 - rsi_thresh), color="#ef5350", style="dashed", width=1)
+            chart_rsi.horizontal_line(float(100.0 - rsi_thresh), color="#ef5350", style="dashed", width=1)
 
-        # Render RSI Chart
         chart_rsi.load()
 
-        # 3) ADX Subchart Instance
         st.caption(f"📊 Average Directional Index — {adx_line_name}")
         chart_adx = StreamlitChart(width=1100, height=180)
         chart_adx.layout(background_color='#131722', text_color='#d1d4dc')
@@ -300,7 +296,6 @@ if df_ohlc is not None and not df_ohlc.empty:
             adx_line.set(adx_df)
             chart_adx.horizontal_line(float(adx_threshold), color="#ffca28", style="solid", width=1)
 
-        # Render ADX Chart
         chart_adx.load()
 
     except Exception as chart_err:

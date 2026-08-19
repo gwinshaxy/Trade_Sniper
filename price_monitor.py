@@ -27,7 +27,7 @@ def fetch_active_trades():
             cur.execute("""
                 SELECT id, pair, direction, entry_price, stop_loss, take_profit, position_size, account_balance
                 FROM trade_setups
-                WHERE status = 'EXECUTED';
+                WHERE status = 'EXECUTED' AND trade_state != 'CLOSED';
             """)
             return cur.fetchall()
     except Exception as e:
@@ -63,7 +63,15 @@ def execute_auto_settlement(trade_id, exit_price, reason):
             conn.commit()
 
             emoji = "🟢" if outcome == "WIN" else "🔴"
-            send_telegram_notification(f"<b>{emoji} REAL-TIME SETTLEMENT ({reason})</b>\n\n<b>Trade ID:</b> <code>#{trade_id}</code>\n<b>PnL:</b> ${pnl_usd:,.2f} ({outcome})")
+            send_telegram_notification(
+                f"<b>{emoji} REAL-TIME SETTLEMENT ({reason})</b>\n\n"
+                f"<b>Trade ID:</b> <code>#{trade_id}</code>\n"
+                f"<b>Pair:</b> <code>{trade['pair']}</code>\n"
+                f"<b>Direction:</b> <code>{trade['direction']}</code>\n"
+                f"<b>Entry Price:</b> ${float(trade['entry_price']):.5f}\n"
+                f"<b>Exit Price:</b> ${exit_price:.5f}\n"
+                f"<b>PnL:</b> ${pnl_usd:,.2f} ({pnl_pct:.2f}%) | <b>Outcome:</b> {outcome}"
+            )
     except Exception as e:
         conn.rollback()
         logging.error(f"Failed auto-settlement for trade #{trade_id}: {e}")

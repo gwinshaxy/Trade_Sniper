@@ -5,7 +5,6 @@ import random
 import logging
 import pandas as pd
 import numpy as np
-import psycopg2
 from multiprocessing import Pool
 from deap import base, creator, tools
 from dotenv import load_dotenv
@@ -18,8 +17,12 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 
 GLOBAL_DATA = None
 
-def save_optimized_parameters(symbol, best_params, fitness_score):
-    """Saves or updates optimized strategy parameters in the database."""
+# Baseline exchange friction
+FEE_RATE = 0.00075          # 0.075% trading fee per turn
+SLIPPAGE_PCT = 0.0005       # 0.05% standard slippage per turn
+SLIPPAGE_PCT_STRESS = 0.0010 # 0.10% stress-test slippage per turn
+
+def save_optimized_parameters(symbol: str, best_params: list, fitness_score: float):
     ensure_schema_updated()
     conn = get_db_connection()
     if not conn:
@@ -59,115 +62,247 @@ def save_optimized_parameters(symbol, best_params, fitness_score):
         conn.commit()
         cursor.close()
         conn.close()
-        logging.info(f"Successfully saved DEAP optimization parameters for {clean_symbol} (Fitness: {fitness_score:.4f})")
+        logging.info(f"Successfully saved validated parameters for {clean_symbol} (Walk-Forward Fitness: {fitness_score:.4f})")
     except Exception as e:
         logging.error(f"Failed to save parameters for {symbol}: {e}")
+
 
 if not hasattr(creator, "FitnessMax"):
     creator.create("FitnessMax", base.Fitness, weights=(1.0,))
 if not hasattr(creator, "Individual"):
     creator.create("Individual", list, fitness=creator.FitnessMax)
 
-def init_worker(data):
-    global GLOBAL_DATA
-    GLOBAL_DATA = data
 
-def evaluate_strategy(individual):
+def init_worker(data_df: pd.DataFrame):
     global GLOBAL_DATA
-    if GLOBAL_DATA is None or GLOBAL_DATA.empty or len(GLOBAL_DATA) < 300:
-        return (-999.0,)
+    GLOBAL_DATA = data_df
+
+
+def confirm_market_structure(df_close: pd.Series, lookback: int = 5) -> tuple:
+    """Soft Structure Confirmation: Evaluates trend momentum without locking out trades."""
+    roll_max = df_close.rolling(window=lookback).max()
+    roll_min = df_close.rolling(window=lookback).min()
+
+    struct_long = (roll_max >= roll_max.shift(1)) | (roll_min > roll_min.shift(1))
+    struct_short = (roll_max < roll_max.shift(1)) | (roll_min <= roll_min.shift(1))
+
+    return struct_long.fillna(True).to_numpy(), struct_short.fillna(True).to_numpy()
+
+
+def run_backtest_with_friction(
+    df: pd.DataFrame, individual: list, min_trades: int = 1, stress_slippage: float = None
+) -> float:
+    if df is None or df.empty or len(df) < 50:
+        return -999.0
 
     (
         tema_period, rsi_period, rsi_thresh, adx_period, adx_threshold, 
         max_sl_pct, zone_tolerance, min_sentiment, risk_pct, min_rr
     ) = individual
 
-    df_close = GLOBAL_DATA["close"]
+    df_close = df["close"]
     
+    # Calculate indicators
     tema_series = strategy.calc_tema(df_close, period=int(tema_period))
     rsi_series = strategy.calc_rsi(df_close, period=int(rsi_period))
-    adx_series = strategy.calc_adx(GLOBAL_DATA, period=int(adx_period))
+    adx_series = strategy.calc_adx(df, period=int(adx_period))
 
-    upper_zone = tema_series * (1.0 + zone_tolerance)
-    lower_zone = tema_series * (1.0 - zone_tolerance)
+    struct_long, struct_short = confirm_market_structure(df_close, lookback=max(3, int(rsi_period // 2)))
 
-    long_signal = (df_close > upper_zone) & (rsi_series > rsi_thresh) & (adx_series > adx_threshold)
-    short_signal = (df_close < lower_zone) & (rsi_series < (100.0 - rsi_thresh)) & (adx_series > adx_threshold)
+    # Convert to pure NumPy arrays
+    close_arr = df_close.to_numpy()
+    tema_arr = tema_series.to_numpy()
+    rsi_arr = rsi_series.to_numpy()
+    adx_arr = adx_series.to_numpy()
+
+    upper_zone = tema_arr * (1.0 + zone_tolerance)
+    lower_zone = tema_arr * (1.0 - zone_tolerance)
+
+    long_signal = (close_arr > upper_zone) & (rsi_arr > rsi_thresh) & (adx_arr > adx_threshold) & struct_long
+    short_signal = (close_arr < lower_zone) & (rsi_arr < (100.0 - rsi_thresh)) & (adx_arr > adx_threshold) & struct_short
+    
     combined_signal = np.where(long_signal, 1.0, np.where(short_signal, -1.0, 0.0))
 
-    # Reject strategies with insufficient trading frequency
-    if np.count_nonzero(np.diff(combined_signal)) < 15:
-        return (-999.0,)
-
-    returns = df_close.pct_change().fillna(0)
-    strategy_returns = returns * pd.Series(combined_signal, index=returns.index).shift(1).fillna(0) * (risk_pct / 100.0)
-    std_dev = strategy_returns.std()
+    signal_changes = np.diff(combined_signal)
+    trades_count = np.count_nonzero(signal_changes)
     
-    if std_dev == 0 or np.isnan(std_dev):
-        return (-999.0,)
+    # Option A: Dynamic Fold-Aware Trade Minimum (~1 trade per 50 candles in slice)
+    dynamic_min_trades = max(min_trades, int(len(df) / 50))
+    if trades_count < dynamic_min_trades:
+        return -999.0
 
-    sharpe_ratio = (strategy_returns.mean() / std_dev) * np.sqrt(252 * 24)
-    return (float(sharpe_ratio),) if not np.isnan(sharpe_ratio) else (-999.0,)
+    # NumPy return & friction calculations
+    raw_returns = np.zeros_like(close_arr)
+    raw_returns[1:] = (close_arr[1:] - close_arr[:-1]) / close_arr[:-1]
+    
+    position = np.zeros_like(combined_signal)
+    position[1:] = combined_signal[:-1]
+    
+    strategy_returns = raw_returns * position
+    turnovers = np.abs(np.diff(position, prepend=0))
+    
+    # Use stress slippage if provided, otherwise default slippage
+    active_slippage = stress_slippage if stress_slippage is not None else SLIPPAGE_PCT
+    friction = turnovers * (FEE_RATE + active_slippage)
+    
+    # Strategy returns without scaling by risk_pct to avoid Sharpe distortion
+    net_strategy_returns = strategy_returns - friction
+
+    std_dev = np.std(net_strategy_returns)
+    if std_dev == 0 or np.isnan(std_dev):
+        return -999.0
+
+    sharpe_ratio = (np.mean(net_strategy_returns) / std_dev) * np.sqrt(252 * 24)
+    if np.isnan(sharpe_ratio):
+        return -999.0
+
+    # Turnover penalty
+    turnover_rate = np.sum(turnovers) / len(df)
+    regularization_penalty = max(0.0, turnover_rate * 1.0)
+    adjusted_sharpe = sharpe_ratio - regularization_penalty
+
+    # Penalize strategies with less than 20 execution turns
+    if trades_count < 20:
+        adjusted_sharpe *= (trades_count / 20.0)
+
+    return float(adjusted_sharpe)
+
+
+def run_walk_forward_backtest(df: pd.DataFrame, individual: list, stress_slippage: float = None) -> float:
+    """Robust Rolling Walk-Forward Validation across dynamic fold structures."""
+    if df is None or len(df) < 350:
+        return -999.0
+
+    for n_folds in [3, 2]:
+        fold_size = len(df) // n_folds
+        fold_scores = []
+
+        for fold in range(n_folds):
+            fold_df = df.iloc[fold * fold_size : (fold + 1) * fold_size].reset_index(drop=True)
+            
+            split_idx = int(len(fold_df) * 0.70)
+            train_sub = fold_df.iloc[:split_idx]
+            test_sub = fold_df.iloc[split_idx:]
+
+            train_score = run_backtest_with_friction(train_sub, individual, min_trades=1, stress_slippage=stress_slippage)
+            test_score = run_backtest_with_friction(test_sub, individual, min_trades=1, stress_slippage=stress_slippage)
+
+            if train_score > -999.0 and test_score > -999.0:
+                fold_scores.append(test_score)
+
+        if len(fold_scores) >= 1:
+            return float(np.mean(fold_scores))
+
+    return -999.0
+
+
+def evaluate_strategy_train(individual: list) -> tuple:
+    global GLOBAL_DATA
+    fitness = run_walk_forward_backtest(GLOBAL_DATA, individual)
+    return (fitness,)
+
+
+def check_parameter_stability(df: pd.DataFrame, individual: list, perturbations: int = 3) -> float:
+    scores = []
+    base_score = run_walk_forward_backtest(df, individual)
+    if base_score <= -999.0:
+        return -999.0
+    scores.append(base_score)
+
+    for _ in range(perturbations):
+        neighbor = list(individual)
+        neighbor[0] = int(np.clip(neighbor[0] + random.choice([-2, 2]), 10, 200))
+        neighbor[2] = round(float(np.clip(neighbor[2] + random.choice([-1.0, 1.0]), 10.0, 48.0)), 1)
+        
+        neighbor_score = run_walk_forward_backtest(df, neighbor)
+        if neighbor_score > -999.0:
+            scores.append(neighbor_score)
+
+    return float(np.mean(scores)) if len(scores) > 0 else -999.0
+
 
 def create_random_individual():
     return creator.Individual([
-        random.randint(50, 300),              # tema_period
-        random.randint(7, 30),                # rsi_period
-        round(random.uniform(30.0, 50.0), 1), # rsi_thresh
-        random.randint(7, 30),                # adx_period
-        round(random.uniform(15.0, 35.0), 1), # adx_threshold
-        round(random.uniform(0.01, 0.05), 3), # max_sl_pct
-        round(random.uniform(0.005, 0.030), 4),# zone_tolerance
-        round(random.uniform(-0.5, 0.5), 2),  # min_sentiment
-        round(random.uniform(0.5, 3.0), 2),    # risk_pct
-        round(random.uniform(1.2, 4.0), 2)     # min_rr
+        random.randint(10, 200),                 # tema_period
+        random.randint(5, 25),                    # rsi_period
+        round(random.uniform(10.0, 48.0), 1),     # rsi_thresh
+        random.randint(5, 25),                    # adx_period
+        round(random.uniform(3.0, 28.0), 1),      # adx_threshold
+        round(random.uniform(0.008, 0.03), 4),    # max_sl_pct (Up to 3.0%, 4 decimals precision)
+        round(random.uniform(0.00005, 0.02), 5),  # zone_tolerance
+        round(random.uniform(-0.5, 0.5), 2),      # min_sentiment
+        round(random.uniform(0.5, 1.5), 2),       # risk_pct (Up to 1.5%)
+        round(random.uniform(1.2, 4.0), 2)        # min_rr
     ])
 
-def mutate_individual(individual, indpb=0.25):
-    if random.random() < indpb: individual[0] = random.randint(50, 300)
-    if random.random() < indpb: individual[1] = random.randint(7, 30)
-    if random.random() < indpb: individual[2] = round(random.uniform(30.0, 50.0), 1)
-    if random.random() < indpb: individual[3] = random.randint(7, 30)
-    if random.random() < indpb: individual[4] = round(random.uniform(15.0, 35.0), 1)
-    if random.random() < indpb: individual[5] = round(random.uniform(0.01, 0.05), 3)
-    if random.random() < indpb: individual[6] = round(random.uniform(0.005, 0.030), 4)
-    if random.random() < indpb: individual[7] = round(random.uniform(-0.5, 0.5), 2)
-    if random.random() < indpb: individual[8] = round(random.uniform(0.5, 3.0), 2)
-    if random.random() < indpb: individual[9] = round(random.uniform(1.2, 4.0), 2)
+
+def mutate_individual(individual, indpb=0.20):
+    if random.random() < indpb:
+        individual[0] = int(np.clip(individual[0] + int(random.gauss(0, 8)), 10, 200))
+    if random.random() < indpb:
+        individual[1] = int(np.clip(individual[1] + int(random.gauss(0, 2)), 5, 25))
+    if random.random() < indpb:
+        individual[2] = round(float(np.clip(individual[2] + random.gauss(0, 1.2), 10.0, 48.0)), 1)
+    if random.random() < indpb:
+        individual[3] = int(np.clip(individual[3] + int(random.gauss(0, 2)), 5, 25))
+    if random.random() < indpb:
+        individual[4] = round(float(np.clip(individual[4] + random.gauss(0, 1.5), 3.0, 28.0)), 1)
+    if random.random() < indpb:
+        individual[5] = round(float(np.clip(individual[5] + random.gauss(0, 0.005), 0.008, 0.03)), 4)  # Upper bound capped strictly at 0.03 (3.0%)
+    if random.random() < indpb:
+        individual[6] = round(float(np.clip(individual[6] + random.gauss(0, 0.002), 0.00005, 0.02)), 5)
+    if random.random() < indpb:
+        individual[7] = round(float(np.clip(individual[7] + random.gauss(0, 0.1), -0.5, 0.5)), 2)
+    if random.random() < indpb:
+        individual[8] = round(float(np.clip(individual[8] + random.gauss(0, 0.2), 0.5, 1.5)), 2)       # Upper bound capped strictly at 1.5%
+    if random.random() < indpb:
+        individual[9] = round(float(np.clip(individual[9] + random.gauss(0, 0.3), 1.2, 4.0)), 2)
     return (individual,)
+
 
 toolbox = base.Toolbox()
 toolbox.register("individual", create_random_individual)
 toolbox.register("population", tools.initRepeat, list, toolbox.individual)
-toolbox.register("evaluate", evaluate_strategy)
+toolbox.register("evaluate", evaluate_strategy_train)
 toolbox.register("mate", tools.cxTwoPoint)
 toolbox.register("mutate", mutate_individual)
 toolbox.register("select", tools.selTournament, tournsize=3)
 
+
+def fetch_klines_with_retry(symbol: str, interval: str = "1h", limit: int = 5000, max_retries: int = 3):
+    for attempt in range(1, max_retries + 1):
+        df = strategy.fetch_klines(symbol=symbol, interval=interval, limit=limit)
+        if df is not None and not df.empty and len(df) >= 350:
+            return df
+        logging.info(f"Retrying kline fetch for {symbol} (Attempt {attempt}/{max_retries})...")
+        time.sleep(2 * attempt)
+    return pd.DataFrame()
+
+
 def run_optimization(symbol="BTC/USDT"):
     global GLOBAL_DATA
-    data_df = strategy.fetch_klines(symbol=symbol, interval="1h", limit=3000)
-    if data_df.empty:
-        logging.warning(f"Could not fetch historical klines for {symbol}. Skipping optimization.")
+    data_df = fetch_klines_with_retry(symbol=symbol, interval="1h", limit=5000)
+    if data_df.empty or len(data_df) < 350:
+        logging.warning(f"Insufficient historical klines for {symbol}. Skipping optimization.")
         return None
 
     GLOBAL_DATA = data_df
 
-    pool = Pool(processes=2, initializer=init_worker, initargs=(data_df,))
+    pool = Pool(processes=2, initializer=init_worker, initargs=(data_df,), maxtasksperchild=50)
     toolbox.register("map", pool.map)
 
-    pop = toolbox.population(n=30)
-    hof = tools.HallOfFame(maxsize=1)
+    pop = toolbox.population(n=100)
+    hof = tools.HallOfFame(maxsize=15)
 
     invalid_ind = [ind for ind in pop if not ind.fitness.valid]
     for ind, fit in zip(invalid_ind, toolbox.map(toolbox.evaluate, invalid_ind)):
         ind.fitness.values = fit
     hof.update(pop)
 
-    for gen in range(1, 11):
+    for gen in range(1, 30):
         offspring = list(map(toolbox.clone, toolbox.select(pop, len(pop))))
         for c1, c2 in zip(offspring[::2], offspring[1::2]):
-            if random.random() < 0.6:
+            if random.random() < 0.65:
                 toolbox.mate(c1, c2)
                 del c1.fitness.values, c2.fitness.values
         for mutant in offspring:
@@ -187,16 +322,42 @@ def run_optimization(symbol="BTC/USDT"):
     pool.join()
     toolbox.unregister("map")
 
-    if len(hof) > 0:
-        best_params = hof[0]
-        save_optimized_parameters(symbol, best_params, hof[0].fitness.values[0])
-        GLOBAL_DATA = None
-        gc.collect()
-        return best_params
+    validated_candidate = None
+    best_final_score = -999.0
+
+    # Walk-Forward Selection Gate
+    MIN_REQUIRED_SHARPE = 0.20  # Minimum unscaled Sharpe required for live persistence
+
+    for candidate in hof:
+        wf_score = candidate.fitness.values[0]
+        if wf_score < MIN_REQUIRED_SHARPE:
+            continue
+
+        plateau_score = check_parameter_stability(data_df, candidate)
+        if plateau_score < MIN_REQUIRED_SHARPE:
+            continue
+
+        # Stress-Test Slippage Validation (0.10% Slippage)
+        stress_score = run_walk_forward_backtest(data_df, candidate, stress_slippage=SLIPPAGE_PCT_STRESS)
+        if stress_score <= 0.0:
+            logging.info(f"Candidate for {symbol} failed 0.10% stress slippage check (Stress Sharpe: {stress_score:.4f}). Skipping.")
+            continue
+
+        validated_candidate = candidate
+        best_final_score = plateau_score
+        break
 
     GLOBAL_DATA = None
+    del data_df
     gc.collect()
+
+    if validated_candidate is not None:
+        save_optimized_parameters(symbol, validated_candidate, best_final_score)
+        return validated_candidate
+
+    logging.warning(f"No candidates passed walk-forward cross-validation, stability, and stress-test for {symbol}.")
     return None
+
 
 if __name__ == "__main__":
     ensure_schema_updated()
@@ -206,8 +367,9 @@ if __name__ == "__main__":
     while True:
         try:
             for symbol in symbols:
-                logging.info(f"Starting DEAP optimization run for {symbol}...")
+                logging.info(f"Starting DEAP Walk-Forward optimization run for {symbol}...")
                 run_optimization(symbol=symbol)
+                gc.collect()
         except Exception as e:
             logging.error(f"Error in optimization cycle: {e}")
         time.sleep(86400)
