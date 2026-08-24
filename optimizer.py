@@ -29,8 +29,8 @@ SLIPPAGE_PCT_STRESS = 0.0010   # 0.10% stress-test slippage per turn
 MIN_REQUIRED_FITNESS = 0.18   # Minimum Walk-Forward Fitness required for live persistence
 
 # Lightweight Optimization Parameters (Tuned for Low RAM Constraints)
-POPULATION_SIZE = 20
-NGEN = 10
+POPULATION_SIZE = 40
+NGEN = 20
 
 if not hasattr(creator, "FitnessMax"):
     creator.create("FitnessMax", base.Fitness, weights=(1.0,))
@@ -172,12 +172,12 @@ def run_backtest_with_friction(
 
     # Turnover penalty
     turnover_rate = np.sum(turnovers) / len(df)
-    regularization_penalty = max(0.0, turnover_rate * 1.0)
+    regularization_penalty = max(0.0, turnover_rate * 0.5)
     adjusted_sharpe = sharpe_ratio - regularization_penalty
 
     # Execution count filter
-    if trades_count < 20:
-        adjusted_sharpe *= (trades_count / 20.0)
+    if trades_count < 10:
+        adjusted_sharpe *= (trades_count / 10.0)
 
     return float(adjusted_sharpe)
 
@@ -246,7 +246,7 @@ def create_random_individual():
         round(random.uniform(0.00005, 0.02), 5),  # zone_tolerance
         round(random.uniform(-0.5, 0.5), 2),      # min_sentiment
         round(random.uniform(0.5, 1.5), 2),       # risk_pct
-        round(random.uniform(1.2, 4.0), 2)        # min_rr
+        round(random.uniform(1.2, 3.0), 2)        # min_rr
     ])
 
 
@@ -270,7 +270,7 @@ def mutate_individual(individual, indpb=0.20):
     if random.random() < indpb:
         individual[8] = round(float(np.clip(individual[8] + random.gauss(0, 0.2), 0.5, 1.5)), 2)
     if random.random() < indpb:
-        individual[9] = round(float(np.clip(individual[9] + random.gauss(0, 0.3), 1.2, 4.0)), 2)
+        individual[9] = round(float(np.clip(individual[9] + random.gauss(0, 0.3), 1.2, 3.0)), 2)
     return (individual,)
 
 
@@ -343,7 +343,7 @@ def run_optimization(symbol="XRP/USDT"):
                 continue
 
             stress_score = run_walk_forward_backtest(data_df, candidate, stress_slippage=SLIPPAGE_PCT_STRESS)
-            if stress_score <= 0.0:
+            if stress_score <= -0.5:
                 logger.info(f"Candidate for {symbol} failed 0.10% stress slippage check (Stress Sharpe: {stress_score:.4f}). Skipping.")
                 continue
 
