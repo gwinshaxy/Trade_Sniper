@@ -1,34 +1,46 @@
 import pandas as pd
+from common import logger
 
-class DynamicTradeManager:
-    def __init__(self, spread_buffer_pct=0.0005, tema_offset_pct=0.001, atr_trail_mult=1.5):
+
+class TradeManager:
+    """
+    Manages trade lifecycles, stop loss/take profit checks, break-even locking,
+    and dynamic TEMA/ATR trailing logic adhering to institutional risk rules.
+    """
+
+    def __init__(self, spread_buffer_pct: float = 0.0005, tema_offset_pct: float = 0.001, atr_trail_mult: float = 1.5):
         self.spread_buffer_pct = spread_buffer_pct
         self.tema_offset_pct = tema_offset_pct
         self.atr_trail_mult = atr_trail_mult
 
     def process_trade(self, trade_row: pd.Series, latest_candle: pd.Series) -> dict:
-        trade_id = trade_row['id']
-        direction = trade_row['direction']
+        trade_id = trade_row.get('id')
         pair = trade_row.get('pair', 'N/A')
-        entry = float(trade_row['entry_price'])
-        curr_sl = float(trade_row['stop_loss'])
-        curr_tp = float(trade_row['take_profit'])
-        state = trade_row.get('trade_state', 'OPEN')
+        direction = str(trade_row.get('direction', '')).upper()
         
-        curr_price = float(latest_candle['close'])
+        entry = float(trade_row.get('entry_price', 0.0))
+        curr_sl = float(trade_row.get('stop_loss', 0.0))
+        curr_tp = float(trade_row.get('take_profit', 0.0))
+        state = str(trade_row.get('trade_state', 'OPEN')).upper()
+
+        curr_price = float(latest_candle.get('close', 0.0))
         tema = float(latest_candle.get('200_TEMA', latest_candle.get('tema', curr_price)))
         atr = float(latest_candle.get('atr', 0.0))
+
+        if curr_price <= 0 or entry <= 0:
+            return {"action": "NONE"}
+
         initial_risk = abs(entry - curr_sl)
 
         # 1. STOP LOSS BREACH CHECK
-        sl_hit = (curr_price <= curr_sl) if direction == 'LONG' else (curr_price >= curr_sl)
+        sl_hit = (curr_price <= curr_sl) if direction in ['BUY', 'LONG'] else (curr_price >= curr_sl)
         if sl_hit:
             return {
                 "action": "CLOSE_SL",
                 "trade_id": trade_id,
                 "exit_price": curr_sl,
                 "msg": (
-                    f"🛑 <b>STOP LOSS HIT</b>\n\n"
+                    f"🚨 <b>STOP LOSS HIT</b>\n\n"
                     f"<b>Trade ID:</b> <code>#{trade_id}</code>\n"
                     f"<b>Pair:</b> <code>{pair}</code>\n"
                     f"<b>Direction:</b> <code>{direction}</code>\n"
@@ -37,7 +49,7 @@ class DynamicTradeManager:
             }
 
         # 2. TAKE PROFIT BREACH CHECK
-        tp_hit = (curr_price >= curr_tp) if direction == 'LONG' else (curr_price <= curr_tp)
+        tp_hit = (curr_price >= curr_tp) if direction in ['BUY', 'LONG'] else (curr_price <= curr_tp)
         if tp_hit:
             return {
                 "action": "CLOSE_TP",
@@ -52,30 +64,34 @@ class DynamicTradeManager:
                 )
             }
 
-        # 3. BREAK-EVEN CHECK (At 1:1 R:R)
+        # 3. BREAK-EVEN CHECK (1:1 R:R Achieved)
         if state == 'OPEN':
-            tp1_target = entry + initial_risk if direction == 'LONG' else entry - initial_risk
-            be_triggered = (curr_price >= tp1_target) if direction == 'LONG' else (curr_price <= tp1_target)
+            tp1_target = entry + initial_risk if direction in ['BUY', 'LONG'] else entry - initial_risk
+            be_triggered = (curr_price >= tp1_target) if direction in ['BUY', 'LONG'] else (curr_price <= tp1_target)
 
             if be_triggered:
-                be_price = entry * (1 + self.spread_buffer_pct) if direction == 'LONG' else entry * (1 - self.spread_buffer_pct)
-                return {
-                    "action": "UPDATE_SL",
-                    "trade_id": trade_id,
-                    "new_sl": round(be_price, 5),
-                    "new_state": "BE_LOCKED",
-                    "msg": (
-                        f"🔒 <b>BREAK-EVEN TRIGGERED</b>\n\n"
-                        f"<b>Trade ID:</b> <code>#{trade_id}</code>\n"
-                        f"<b>Pair:</b> <code>{pair}</code>\n"
-                        f"<b>New Stop Loss:</b> ${be_price:.5f} (1:1 R:R achieved)"
-                    )
-                }
+                be_price = entry * (1 + self.spread_buffer_pct) if direction in ['BUY', 'LONG'] else entry * (1 - self.spread_buffer_pct)
+                new_sl = round(be_price, 5)
+                
+                if (direction in ['BUY', 'LONG'] and new_sl > curr_sl) or (direction in ['SELL', 'SHORT'] and new_sl < curr_sl):
+                    return {
+                        "action": "UPDATE_SL",
+                        "trade_id": trade_id,
+                        "new_sl": new_sl,
+                        "new_state": "BE_LOCKED",
+                        "msg": (
+                            f"🔒 <b>BREAK-EVEN TRIGGERED</b>\n\n"
+                            f"<b>Trade ID:</b> <code>#{trade_id}</code>\n"
+                            f"<b>Pair:</b> <code>{pair}</code>\n"
+                            f"<b>New Stop Loss:</b> ${new_sl:.5f} (1:1 R:R achieved)"
+                        )
+                    }
 
-        # 4. DYNAMIC TRAILING STOP (TEMA & ATR TRAIL MULTIPLIER)
+        # 4. DYNAMIC TRAILING STOP (Hybrid TEMA & ATR Trailing Offset)
         elif state in ['BE_LOCKED', 'TRAILING']:
-            if direction == 'LONG':
-                atr_offset = (atr * self.atr_trail_mult) if atr > 0 else (tema * self.tema_offset_pct)
+            atr_offset = (atr * self.atr_trail_mult) if atr > 0 else (tema * self.tema_offset_pct)
+
+            if direction in ['BUY', 'LONG']:
                 proposed_sl = max(tema * (1 - self.tema_offset_pct), curr_price - atr_offset)
                 
                 if proposed_sl > curr_sl and curr_price > tema:
@@ -92,8 +108,8 @@ class DynamicTradeManager:
                             f"<b>Anchor Price:</b> ${curr_price:.5f}"
                         )
                     }
-            elif direction == 'SHORT':
-                atr_offset = (atr * self.atr_trail_mult) if atr > 0 else (tema * self.tema_offset_pct)
+
+            elif direction in ['SELL', 'SHORT']:
                 proposed_sl = min(tema * (1 + self.tema_offset_pct), curr_price + atr_offset)
                 
                 if proposed_sl < curr_sl and curr_price < tema:

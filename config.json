@@ -1,6 +1,6 @@
 {
   "account_balance": 100.0,
-  "risk_pct": 1.0,
+  "risk_pct": 0.5,
   "leverage": 100,
   "margin_mode": "isolated",
   "long_risk_multiplier": 1.0,
@@ -15,11 +15,12 @@
   "min_rr": 2.0,
   "scan_interval_minutes": 15,
   "alert_cooldown_hours": 4,
-  "enable_live_trading": false,
+  "enable_live_trading": true,
   "watchlist": [
-    "ETH/USDT",
-    "BNB/USDT",
-    "SOL/USDT"
+    "XRP/USDT"
+	"LINK/USDT"
+	"SOL/USDT"
+	"BNB/USDT"
   ],
   "use_mtf_tema_alignment": true,
   "htf_tema_period": 200,
@@ -29,23 +30,5 @@
   "use_equity_curve_filter": true,
   "eq_ma_period": 10,
   "reduced_risk_factor": 0.3,
-  "asset_overrides": {
-    "SOL/USDT": {
-      "max_sl_pct": 0.025,
-      "proximity_threshold_pct": 0.5,
-      "atr_trail_mult": 2.2
-    },
-    "BNB/USDT": {
-      "max_sl_pct": 0.02,
-      "proximity_threshold_pct": 0.75,
-      "min_atr_pct": 0.3,
-      "atr_trail_mult": 2.0
-    },
-    "ETH/USDT": {
-      "max_sl_pct": 0.02,
-      "proximity_threshold_pct": 0.75,
-      "min_atr_pct": 0.2,
-      "atr_trail_mult": 2.0
-    }
   }
 }

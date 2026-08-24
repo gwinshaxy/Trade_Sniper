@@ -83,6 +83,7 @@ realtime==2.31.0
 referencing==0.37.0
 requests==2.34.2
 rpds-py==2026.6.3
+schedule
 setuptools==83.0.0
 six==1.17.0
 smmap==5.0.3

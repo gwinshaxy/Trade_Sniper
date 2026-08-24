@@ -1,0 +1,16 @@
+version: '3.8'
+
+services:
+  trading-engine:
+    build: .
+    container_name: mexc_trading_engine
+    restart: always
+    env_file:
+      - .env
+    volumes:
+      - ./logs:/app/logs
+    healthcheck:
+      test: ["CMD-SHELL", "python -c 'import psycopg2; print(1)' || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3

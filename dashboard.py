@@ -1,13 +1,20 @@
 import os
+import sys
 import json
+import logging
+import subprocess
+import psutil
+import gc
 import numpy as np
 import pandas as pd
 import streamlit as st
 from dotenv import load_dotenv
+
+load_dotenv(override=True)
+
 from lightweight_charts.widgets import StreamlitChart
 
-st.set_page_config(page_title="Trading Terminal", layout="wide")
-load_dotenv()
+st.set_page_config(page_title="MEXC Trading Terminal", layout="wide")
 
 HTTP_PROXY = os.getenv("HTTP_PROXY") or os.getenv("PROXY_URL")
 HTTPS_PROXY = os.getenv("HTTPS_PROXY") or os.getenv("PROXY_URL")
@@ -17,37 +24,57 @@ if HTTP_PROXY or HTTPS_PROXY:
     os.environ["HTTPS_PROXY"] = HTTPS_PROXY or HTTP_PROXY
     os.environ["NO_PROXY"] = "localhost,127.0.0.1,.supabase.co"
 
+base_dir = os.path.dirname(os.path.abspath(__file__))
+if base_dir not in sys.path:
+    sys.path.insert(0, base_dir)
+
 def check_password():
-    expected_password = os.getenv("DASHBOARD_PASSWORD", "securepass123")
+    raw_env_pass = os.getenv("DASHBOARD_PASSWORD", "")
+    expected_password = raw_env_pass.strip().strip('"').strip("'")
+    if not expected_password:
+        st.error("🚨 CRITICAL CONFIG ERROR: DASHBOARD_PASSWORD environment variable is missing. Login disabled.")
+        st.stop()
+
     if "password_correct" not in st.session_state:
         st.session_state["password_correct"] = False
     if st.session_state["password_correct"]:
         return True
 
-    st.markdown("## 🔒 Restricted Access")
-    st.markdown("Please enter the password to access the Trading Terminal.")
+    st.markdown("## 🔒 Restricted Access Terminal")
     password_input = st.text_input("Password", type="password")
-    if st.button("Login", width="stretch"):
-        if password_input == expected_password:
+    if st.button("Login", use_container_width=True):
+        if password_input.strip() == expected_password:
             st.session_state["password_correct"] = True
             st.rerun()
         else:
-            st.error("😕 Password incorrect")
+            st.error("❌ Password incorrect")
     return False
 
 if not check_password():
     st.stop()
 
 from common import (
-    calculate_pnl,
     ensure_schema_updated,
-    get_db_connection,
-    send_telegram_notification,
     close_trade_manually,
+    get_db_connection,
+    release_db_connection,
+    send_telegram_notification,
+    logger
 )
-import strategy
+from live_executor import LiveExecutionEngine
 
-ensure_schema_updated()
+try:
+    import strategy
+except ModuleNotFoundError:
+    st.error("❌ Module Import Error: 'strategy.py' could not be located in directory paths.")
+    st.stop()
+
+try:
+    ensure_schema_updated()
+    executor = LiveExecutionEngine()
+except Exception as init_err:
+    st.error(f"Failed to initialize trading core engine: {init_err}")
+    st.stop()
 
 def normalize_symbol(symbol: str) -> str:
     if not symbol:
@@ -59,7 +86,7 @@ def normalize_symbol(symbol: str) -> str:
         return f"{s[:-4]}/{s[-4:]}"
     return s
 
-symbols_env = os.getenv("SYMBOLS") or os.getenv("SYMBOL", "ETH/USDT,BNB/USDT,SOL/USDT")
+symbols_env = os.getenv("SYMBOLS") or os.getenv("SYMBOL", "XRP/USDT")
 env_symbols = [normalize_symbol(s) for s in symbols_env.split(",")]
 
 database_url = os.getenv("DATABASE_URL") or os.getenv("DB_URL")
@@ -67,54 +94,137 @@ if database_url:
     database_url = database_url.strip('"').strip("'")
 
 conn = get_db_connection()
-try:
-    with conn.cursor() as cur:
-        cur.execute("""UPDATE trade_setups SET pair = REPLACE(REPLACE(pair, '"', ''), '''org.postgresql.util.PSQLException''', '');""")
-        conn.commit()
-except Exception:
-    pass
-conn.close()
+if conn:
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""UPDATE trade_setups SET pair = REPLACE(REPLACE(pair::text, '"', ''), '''', '') WHERE pair IS NOT NULL;""")
+            conn.commit()
+    except Exception as db_err:
+        logger.warning(f"Failed to normalize DB pairs on startup: {db_err}")
+    finally:
+        release_db_connection(conn)
 
-df_all_trades = pd.read_sql("SELECT * FROM trade_setups ORDER BY id DESC;", database_url) if database_url else pd.DataFrame()
-db_pairs = [normalize_symbol(p) for p in df_all_trades['pair'].unique().tolist()] if not df_all_trades.empty else []
+@st.cache_data(ttl=5, max_entries=20)
+def fetch_trades_from_db(db_url: str) -> pd.DataFrame:
+    if not db_url:
+        return pd.DataFrame()
+    try:
+        return pd.read_sql("SELECT * FROM trade_setups ORDER BY id DESC;", db_url)
+    except Exception as db_err:
+        logger.error(f"Error fetching trade records: {db_err}")
+        return pd.DataFrame()
+
+df_all_trades = fetch_trades_from_db(database_url)
+
+db_pairs = [normalize_symbol(p) for p in df_all_trades['pair'].unique().tolist()] if not df_all_trades.empty and 'pair' in df_all_trades.columns else []
 available_pairs = list(dict.fromkeys(env_symbols + db_pairs))
-for default_pair in ["ETH/USDT", "BNB/USDT", "SOL/USDT"]:
+for default_pair in ["XRP/USDT"]:
     if default_pair not in available_pairs:
         available_pairs.append(default_pair)
 
-st.sidebar.subheader("🎛️ Dashboard Controls & Strategy Tuning")
-select_all_pairs = st.sidebar.checkbox("Select All", value=True)
-selected_pairs = available_pairs if select_all_pairs else st.sidebar.multiselect("Filter Pairs", available_pairs, default=available_pairs)
+st.sidebar.subheader("🎛️ Terminal Controls & Tuning")
 
-st.sidebar.markdown("---")
-st.sidebar.subheader("🎯 Strategy Parameters (Harmonized)")
+# 1. Active Execution / Config Pair
+config_target_pair = st.sidebar.selectbox("Active Execution / Config Pair", available_pairs, index=0)
 
-config_target_pair = st.sidebar.selectbox("Load Dynamic Config For:", available_pairs, index=0)
+# Normalize key string for consistent strategy dict loading & widget session keys
+pair_key = config_target_pair.replace("/", "")
 dyn_cfg = strategy.load_symbol_config(config_target_pair)
 
-lookback_bars = st.sidebar.number_input("Lookback Bars (Range)", value=600, min_value=10, max_value=5000, step=10)
-tema_period = st.sidebar.number_input("TEMA Period", value=int(dyn_cfg.get("tema_period", 200)), min_value=10, max_value=500)
-rsi_period = st.sidebar.number_input("RSI Period", value=int(dyn_cfg.get("rsi_period", 14)), min_value=2, max_value=50)
-rsi_thresh = st.sidebar.slider("RSI Threshold", min_value=20, max_value=80, value=int(dyn_cfg.get("rsi_thresh", 42)))
+# 2. Attach pair-specific keys to widgets so values re-initialize dynamically on pair switch
+lookback_bars = st.sidebar.number_input("Lookback Bars (Range)", value=600, min_value=100, max_value=1000, step=50, key=f"lookback_{pair_key}")
 
-adx_period = st.sidebar.number_input("ADX Period", value=int(dyn_cfg.get("adx_period", 14)), min_value=2, max_value=50)
-adx_threshold = st.sidebar.slider("ADX Threshold", min_value=10.0, max_value=50.0, value=float(dyn_cfg.get("adx_threshold", 20.0)), step=1.0)
-max_sl_pct = st.sidebar.slider("Max SL Distance (%)", min_value=0.5, max_value=3.0, value=float(dyn_cfg.get("max_sl_pct", 0.02)) * 100.0, step=0.1) / 100.0
+tema_period = st.sidebar.number_input(
+    "TEMA Period", 
+    value=int(dyn_cfg.get("tema_period", 200)), 
+    min_value=10, 
+    max_value=500, 
+    key=f"tema_{pair_key}"
+)
 
-zone_tolerance_pct = st.sidebar.slider("Volume Zone Proximity (%)", min_value=0.1, max_value=3.0, value=float(dyn_cfg.get("zone_tolerance", 0.0075)) * 100.0, step=0.05)
+rsi_period = st.sidebar.number_input(
+    "RSI Period", 
+    value=int(dyn_cfg.get("rsi_period", 14)), 
+    min_value=2, 
+    max_value=50, 
+    key=f"rsi_p_{pair_key}"
+)
+
+rsi_thresh = st.sidebar.slider(
+    "RSI Threshold", 
+    min_value=20, 
+    max_value=80, 
+    value=int(dyn_cfg.get("rsi_thresh", 42)), 
+    key=f"rsi_t_{pair_key}"
+)
+
+adx_period = st.sidebar.number_input(
+    "ADX Period", 
+    value=int(dyn_cfg.get("adx_period", 14)), 
+    min_value=2, 
+    max_value=50, 
+    key=f"adx_p_{pair_key}"
+)
+
+adx_threshold = st.sidebar.slider(
+    "ADX Threshold", 
+    min_value=10.0, 
+    max_value=50.0, 
+    value=float(dyn_cfg.get("adx_threshold", 20.0)), 
+    step=1.0, 
+    key=f"adx_t_{pair_key}"
+)
+
+max_sl_pct = st.sidebar.slider(
+    "Max SL Distance (%)", 
+    min_value=0.5, 
+    max_value=3.0, 
+    value=float(dyn_cfg.get("max_sl_pct", 0.02)) * 100.0, 
+    step=0.1, 
+    key=f"sl_{pair_key}"
+) / 100.0
+
+zone_tolerance_pct = st.sidebar.slider(
+    "Volume Zone Proximity (%)", 
+    min_value=0.1, 
+    max_value=3.0, 
+    value=float(dyn_cfg.get("zone_tolerance", 0.0075)) * 100.0, 
+    step=0.05, 
+    key=f"zone_{pair_key}"
+)
 
 vp_cfg_val = float(dyn_cfg.get("vp_detection_pct", 0.07))
 vp_init_slider = (vp_cfg_val * 100.0) if vp_cfg_val <= 1.0 else vp_cfg_val
-node_detection_pct = st.sidebar.slider("Node Detection (%)", min_value=0.5, max_value=15.0, value=float(np.clip(vp_init_slider, 0.5, 15.0)), step=0.5) / 100.0
-va_pct_val = st.sidebar.slider("Value Area (%)", min_value=10, max_value=100, value=70, step=1) / 100.0
 
-use_adx_filter = st.sidebar.checkbox("Enable ADX Trend Filter", value=bool(dyn_cfg.get("use_adx_filter", True)))
-use_rsi_filter = st.sidebar.checkbox("Enable RSI Momentum Filter", value=bool(dyn_cfg.get("use_rsi_filter", True)))
-use_candlestick_confirm = st.sidebar.checkbox("Require Candlestick Confirmation", value=bool(dyn_cfg.get("use_candlestick_confirm", True)))
+node_detection_pct = st.sidebar.slider(
+    "Node Detection (%)", 
+    min_value=0.5, 
+    max_value=15.0, 
+    value=float(np.clip(vp_init_slider, 0.5, 15.0)), 
+    step=0.5, 
+    key=f"node_{pair_key}"
+) / 100.0
+
+use_adx_filter = st.sidebar.checkbox(
+    "Enable ADX Trend Filter", 
+    value=bool(dyn_cfg.get("use_adx_filter", True)), 
+    key=f"chk_adx_{pair_key}"
+)
+
+use_rsi_filter = st.sidebar.checkbox(
+    "Enable RSI Momentum Filter", 
+    value=bool(dyn_cfg.get("use_rsi_filter", True)), 
+    key=f"chk_rsi_{pair_key}"
+)
+
+use_candlestick_confirm = st.sidebar.checkbox(
+    "Require Candlestick Confirmation", 
+    value=bool(dyn_cfg.get("use_candlestick_confirm", True)), 
+    key=f"chk_candle_{pair_key}"
+)
 
 st.sidebar.markdown("---")
-pair = st.sidebar.text_input("Execution Pair", "BTC/USDT").upper()
-direction = st.sidebar.selectbox("Order Type / Direction", ["LONG", "SHORT"])
+direction = st.sidebar.selectbox("Order Direction", ["LONG", "SHORT"])
 overlay_chart = st.sidebar.checkbox("Overlay Trade Positions on Chart", value=True)
 overlay_gaps = st.sidebar.checkbox("Overlay Volume Profile Gaps", value=True)
 
@@ -127,44 +237,37 @@ reward = abs(take_profit - entry_price) if (take_profit and entry_price) else 0.
 rr_ratio = round(reward / risk, 2) if risk > 0 else 0.0
 st.sidebar.markdown(f"**Risk : Reward Ratio:** `1:{rr_ratio}`")
 
-account_balance = st.sidebar.number_input("Account Balance ($)", min_value=1.0, value=float(os.getenv("ACCOUNT_BALANCE", 10000.0)))
-risk_pct = st.sidebar.number_input("Risk Per Trade (%)", min_value=0.01, max_value=1.5, value=0.5)
+account_balance = st.sidebar.number_input("Account Balance ($)", min_value=1.0, value=float(os.getenv("ACCOUNT_BALANCE", 100.0)))
+risk_pct = st.sidebar.number_input("Risk Per Trade (%)", min_value=0.01, max_value=100.0, value=1.0)
 calc_position_size = round((account_balance * (risk_pct / 100.0)) / risk, 4) if risk > 0 else 0.0
 
-if st.sidebar.button("🚀 Execute Order", width="stretch"):
-    clean_executed_pair = normalize_symbol(pair)
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute(
-        """
-            INSERT INTO trade_setups 
-            (pair, direction, entry_price, stop_loss, take_profit, risk_reward_ratio, position_size, account_balance, risk_pct, status, trade_state)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 'EXECUTED', 'OPEN') RETURNING id;
-        """,
-        (clean_executed_pair, direction, entry_price, stop_loss, take_profit, rr_ratio, calc_position_size, account_balance, risk_pct)
-    )
-    new_trade_id = cursor.fetchone()[0]
-    conn.commit()
-    cursor.close()
-    conn.close()
-    st.success("Trade executed successfully!")
-    send_telegram_notification(
-        f"<b>🚀 NEW MANUAL TRADE EXECUTED</b>\n\n"
-        f"<b>Trade ID:</b> <code>#{new_trade_id}</code>\n"
-        f"<b>Pair:</b> <code>{clean_executed_pair}</code>\n"
-        f"<b>Direction:</b> <code>{direction}</code>\n"
-        f"<b>Entry Price:</b> ${entry_price:.5f}\n"
-        f"<b>SL:</b> ${stop_loss:.5f} | <b>TP:</b> ${take_profit:.5f}\n"
-        f"<b>Risk:</b> {risk_pct}% | <b>R:R:</b> 1:{rr_ratio}"
-    )
-    st.rerun()
+if st.sidebar.button("🚀 Execute Live Order via MEXC API", use_container_width=True):
+    with st.spinner("Submitting order..."):
+        try:
+            success = executor.execute_live_order(
+                pair=config_target_pair,
+                direction=direction,
+                entry_price=entry_price,
+                stop_loss=stop_loss,
+                take_profit=take_profit
+            )
+            if success:
+                st.cache_data.clear()
+                st.success(f"Live trade executed for {config_target_pair} on MEXC Futures!")
+                send_telegram_notification(f"<b>🚀 NEW LIVE ORDER EXECUTED</b>\n\n<b>Pair:</b> <code>{config_target_pair}</code>\n<b>Direction:</b> <code>{direction}</code>")
+                st.rerun()
+            else:
+                st.error("Order execution failed. Review engine logs.")
+        except Exception as exec_err:
+            st.error(f"Execution Error Encountered: {exec_err}")
 
-st.title("📊 Forex & Crypto Trading Terminal")
+st.title("📊 Live MEXC Trading Dashboard")
 
-closed_trades = df_all_trades[df_all_trades['status'] == 'CLOSED'] if not df_all_trades.empty else pd.DataFrame()
+closed_trades = df_all_trades[df_all_trades['status'] == 'CLOSED'] if not df_all_trades.empty and 'status' in df_all_trades.columns else pd.DataFrame()
 net_realized_pnl = float(closed_trades['pnl_usd'].sum()) if not closed_trades.empty and 'pnl_usd' in closed_trades.columns else 0.0
+
 profit_factor_val = 0.0
-if not closed_trades.empty and 'pnl_usd' in closed_trades.columns:
+if not closed_trades.empty and 'pnl_usd' in closed_trades.columns and 'outcome' in closed_trades.columns:
     wins_sum = float(closed_trades[closed_trades['outcome'] == 'WIN']['pnl_usd'].sum())
     loss_sum = abs(float(closed_trades[closed_trades['outcome'] == 'LOSS']['pnl_usd'].sum()))
     profit_factor_val = round(wins_sum / loss_sum, 2) if loss_sum > 0 else 0.0
@@ -179,195 +282,207 @@ st.markdown("---")
 
 col_hdr, col_tf = st.columns([3, 1])
 with col_hdr:
-    st.subheader("📈 Real-Time Chart & Sub-Indicators")
+    st.subheader("📈 Real-Time Interactive Chart & Volume Profile")
 with col_tf:
     selected_timeframe = st.selectbox("Select Timeframe:", ["5m", "15m", "30m", "1h", "4h", "1d"], index=3, key="chart_timeframe_select")
 
 chart_symbol = st.selectbox("Select Chart Asset", available_pairs, key="independent_chart_symbol")
 
 try:
-    df_ohlc = strategy.fetch_klines(symbol=chart_symbol, interval=selected_timeframe, limit=max(lookback_bars + 50, 500))
+    df_ohlc = strategy.fetch_klines(symbol=chart_symbol, interval=selected_timeframe)
 except Exception as fetch_err:
     df_ohlc = None
     st.error(f"API Fetch Error: {fetch_err}")
 
 if df_ohlc is not None and not df_ohlc.empty:
     try:
-        if 'time' in df_ohlc.columns:
-            df_ohlc['time'] = pd.to_datetime(df_ohlc['time']).dt.strftime('%Y-%m-%d %H:%M:%S')
-        elif 'timestamp' in df_ohlc.columns:
-            df_ohlc['time'] = pd.to_datetime(df_ohlc['timestamp']).dt.strftime('%Y-%m-%d %H:%M:%S')
-        elif isinstance(df_ohlc.index, pd.DatetimeIndex):
+        df_ohlc = df_ohlc.copy()
+
+        # Re-index datetime index or normalize timestamp column name
+        if isinstance(df_ohlc.index, pd.DatetimeIndex):
             df_ohlc = df_ohlc.reset_index()
             df_ohlc.rename(columns={df_ohlc.columns[0]: 'time'}, inplace=True)
-            df_ohlc['time'] = pd.to_datetime(df_ohlc['time']).dt.strftime('%Y-%m-%d %H:%M:%S')
+        elif 'timestamp' in df_ohlc.columns and 'time' not in df_ohlc.columns:
+            df_ohlc.rename(columns={'timestamp': 'time'}, inplace=True)
 
-        df_ohlc['tema_custom'] = strategy.calc_tema(df_ohlc['close'], period=min(int(tema_period), len(df_ohlc)))
-        df_ohlc['rsi'] = strategy.calc_rsi(df_ohlc['close'], period=int(rsi_period))
-        df_ohlc['adx'] = strategy.calc_adx(df_ohlc, period=int(adx_period))
+        # Deduplicate column names
+        df_ohlc = df_ohlc.loc[:, ~df_ohlc.columns.duplicated()].copy()
 
-        latest_rsi = float(df_ohlc['rsi'].dropna().iloc[-1]) if not df_ohlc['rsi'].dropna().empty else 50.0
-        latest_adx = float(df_ohlc['adx'].dropna().iloc[-1]) if not df_ohlc['adx'].dropna().empty else 0.0
+        # Parse time column as datetime pandas series safely
+        df_ohlc['time'] = pd.to_datetime(df_ohlc['time'], errors='coerce')
+        df_ohlc = df_ohlc.dropna(subset=['time'])
 
-        adx_status = "Trending Strong" if latest_adx >= adx_threshold else "Choppy / Ranging"
-        rsi_status = "Bullish Momentum" if latest_rsi >= rsi_thresh else ("Bearish Momentum" if latest_rsi <= (100.0 - rsi_thresh) else "Neutral")
+        # Ensure numeric OHLCV types
+        for col in ['open', 'high', 'low', 'close', 'volume']:
+            if col in df_ohlc.columns:
+                df_ohlc[col] = pd.to_numeric(df_ohlc[col], errors='coerce')
 
-        ind_col1, ind_col2 = st.columns(2)
-        ind_col1.metric("Current ADX Trend Strength", f"{latest_adx:.2f}", delta=adx_status, delta_color="normal" if latest_adx >= adx_threshold else "off")
-        ind_col2.metric("Current RSI Momentum", f"{latest_rsi:.2f}", delta=rsi_status, delta_color="normal" if latest_rsi >= rsi_thresh else "inverse")
+        df_ohlc['tema_custom'] = strategy.calc_tema(df_ohlc['close'], period=min(tema_period, len(df_ohlc)))
+        
+        poc, vah, val = strategy.compute_volume_profile(df_ohlc, num_bins=100, lookback_bars=lookback_bars, va_pct=0.70)
+        detected_gaps = strategy.calculate_volume_profile_gaps(df_ohlc, num_bins=100, lookback_bars=lookback_bars, detection_pct=node_detection_pct)
 
-        poc, vah, val = strategy.compute_volume_profile(
-            df_ohlc, 
-            num_bins=100, 
-            lookback_bars=int(lookback_bars), 
-            va_pct=va_pct_val
-        )
-        detected_gaps = strategy.calculate_volume_profile_gaps(
-            df_ohlc, 
-            num_bins=100, 
-            lookback_bars=int(lookback_bars), 
-            detection_pct=node_detection_pct
-        )
+        min_chart_p = float(df_ohlc['low'].min())
+        max_chart_p = float(df_ohlc['high'].max())
 
-        rsi_line_name = f"RSI ({rsi_period})"
-        adx_line_name = f"ADX ({adx_period})"
+        # Format string time depending on daily vs intraday resolution
+        df_chart = df_ohlc.copy()
+        if selected_timeframe in ['1d']:
+            df_chart['time'] = df_chart['time'].dt.strftime('%Y-%m-%d')
+        else:
+            df_chart['time'] = df_chart['time'].dt.strftime('%Y-%m-%d %H:%M:%S')
 
-        chart_main = StreamlitChart(width=1100, height=600)
-        chart_main.layout(background_color='#131722', text_color='#d1d4dc')
-        chart_main.volume_config(scale_margin_top=0.85, scale_margin_bottom=0.0, up_color='#26a69a', down_color='#ef5350')
-        chart_main.set(df_ohlc[['time', 'open', 'high', 'low', 'close', 'volume']].dropna())
+        df_chart = df_chart.drop_duplicates(subset=['time']).sort_values('time', ascending=True).reset_index(drop=True)
 
-        tema_df = df_ohlc[['time', 'tema_custom']].dropna().rename(columns={'tema_custom': f'{tema_period} TEMA'})
+        chart = StreamlitChart(width=None, height=650)
+        chart.layout(background_color='#131722', text_color='#d1d4dc')
+        chart.volume_config(scale_margin_top=0.85, scale_margin_bottom=0.0, up_color='#26a69a', down_color='#ef5350')
+        
+        # Pass standardized dataframe into chart
+        ohlcv_data = df_chart[['time', 'open', 'high', 'low', 'close', 'volume']].dropna()
+        chart.set(ohlcv_data)
+
+        line_name = f"{tema_period} TEMA"
+        tema_df = df_chart[['time', 'tema_custom']].dropna().rename(columns={'tema_custom': line_name})
         if not tema_df.empty:
-            tema_line = chart_main.create_line(name=f"{tema_period} TEMA", color="orange", width=2)
+            tema_line = chart.create_line(name=line_name, color="orange", width=2)
             tema_line.set(tema_df)
 
-        if pd.notnull(vah) and vah > 0:
-            chart_main.horizontal_line(float(vah), color="#2962ff", style="solid", width=2, text=f"VAH: {vah:.2f}")
-        if pd.notnull(val) and val > 0:
-            chart_main.horizontal_line(float(val), color="#2962ff", style="solid", width=2, text=f"VAL: {val:.2f}")
-        if pd.notnull(poc) and poc > 0:
-            chart_main.horizontal_line(float(poc), color="#f44336", style="solid", width=2, text=f"POC: {poc:.2f}")
+        if pd.notnull(vah) and min_chart_p <= float(vah) <= max_chart_p:
+            chart.horizontal_line(float(vah), color="#2962ff", style="solid", width=2, text=f"VAH: {vah:.2f}")
+        if pd.notnull(val) and min_chart_p <= float(val) <= max_chart_p:
+            chart.horizontal_line(float(val), color="#2962ff", style="solid", width=2, text=f"VAL: {val:.2f}")
+        if pd.notnull(poc) and min_chart_p <= float(poc) <= max_chart_p:
+            chart.horizontal_line(float(poc), color="#f44336", style="solid", width=2, text=f"POC: {poc:.2f}")
 
         if overlay_gaps and detected_gaps:
-            df_lookback = df_ohlc.tail(int(lookback_bars))
-            min_chart_p = float(df_lookback['low'].min())
-            max_chart_p = float(df_lookback['high'].max())
-
             for gap_price in detected_gaps:
                 if pd.notnull(gap_price) and min_chart_p <= float(gap_price) <= max_chart_p:
-                    chart_main.horizontal_line(
-                        float(gap_price), 
-                        color="#ff9800", 
-                        style="dashed", 
-                        width=1,
-                        text=f"GAP: {gap_price:.2f}"
-                    )
+                    chart.horizontal_line(float(gap_price), color="#ff9800", style="dashed", width=1, text=f"GAP: {gap_price:.2f}")
 
-        if overlay_chart and not df_all_trades.empty:
+        if overlay_chart and not df_all_trades.empty and 'pair' in df_all_trades.columns and 'status' in df_all_trades.columns:
             symbol_trades = df_all_trades[(df_all_trades['pair'].apply(normalize_symbol) == normalize_symbol(chart_symbol)) & (df_all_trades['status'].isin(['EXECUTED', 'PENDING']))]
             for _, tr in symbol_trades.iterrows():
-                chart_main.horizontal_line(float(tr['entry_price']), color="blue", text=f"ENTRY ({tr['direction']})")
-                if pd.notnull(tr['stop_loss']) and float(tr['stop_loss']) > 0: chart_main.horizontal_line(float(tr['stop_loss']), color="red", text="SL")
-                if pd.notnull(tr['take_profit']) and float(tr['take_profit']) > 0: chart_main.horizontal_line(float(tr['take_profit']), color="green", text="TP")
+                entry_p = float(tr['entry_price']) if pd.notnull(tr['entry_price']) else 0.0
+                sl_p = float(tr['stop_loss']) if pd.notnull(tr['stop_loss']) else 0.0
+                tp_p = float(tr['take_profit']) if pd.notnull(tr['take_profit']) else 0.0
 
-        chart_main.load()
+                if min_chart_p * 0.5 <= entry_p <= max_chart_p * 1.5:
+                    chart.horizontal_line(entry_p, color="blue", text=f"ENTRY ({tr['direction']})")
+                if sl_p > 0 and (min_chart_p * 0.5 <= sl_p <= max_chart_p * 1.5):
+                    chart.horizontal_line(sl_p, color="red", text="SL")
+                if tp_p > 0 and (min_chart_p * 0.5 <= tp_p <= max_chart_p * 1.5):
+                    chart.horizontal_line(tp_p, color="green", text="TP")
 
-        st.caption(f"📉 Relative Strength Index — {rsi_line_name}")
-        chart_rsi = StreamlitChart(width=1100, height=180)
-        chart_rsi.layout(background_color='#131722', text_color='#d1d4dc')
-        
-        rsi_df = df_ohlc[['time', 'rsi']].dropna().rename(columns={'rsi': rsi_line_name})
-        if not rsi_df.empty:
-            rsi_line = chart_rsi.create_line(name=rsi_line_name, color="#ab47bc", width=2)
-            rsi_line.set(rsi_df)
-            chart_rsi.horizontal_line(float(rsi_thresh), color="#26a69a", style="dashed", width=1)
-            chart_rsi.horizontal_line(float(100.0 - rsi_thresh), color="#ef5350", style="dashed", width=1)
-
-        chart_rsi.load()
-
-        st.caption(f"📊 Average Directional Index — {adx_line_name}")
-        chart_adx = StreamlitChart(width=1100, height=180)
-        chart_adx.layout(background_color='#131722', text_color='#d1d4dc')
-        
-        adx_df = df_ohlc[['time', 'adx']].dropna().rename(columns={'adx': adx_line_name})
-        if not adx_df.empty:
-            adx_line = chart_adx.create_line(name=adx_line_name, color="#29b6f6", width=2)
-            adx_line.set(adx_df)
-            chart_adx.horizontal_line(float(adx_threshold), color="#ffca28", style="solid", width=1)
-
-        chart_adx.load()
-
+        chart.load()
     except Exception as chart_err:
         st.error(f"Lightweight Chart Rendering Exception: {chart_err}")
 else:
     st.warning(f"Could not load market chart for {chart_symbol}.")
 
 st.markdown("---")
-tab_pending, tab_history = st.tabs(["⏳ Active / Manual Management", "📜 Cumulative Trades History"])
-with tab_pending:
-    st.subheader("🛠️ Active Trade Management & Manual Overrides")
-    df_active = pd.read_sql("SELECT id, pair, direction, entry_price, stop_loss, take_profit, risk_reward_ratio AS rrr, risk_pct AS risk_p, position_size, status, trade_state, created_at FROM trade_setups WHERE status IN ('EXECUTED', 'PENDING');", database_url) if database_url else pd.DataFrame()
-    
+
+tab_active, tab_history = st.tabs(["⏳ Active Positions & Management", "📜 Trade History Log"])
+
+with tab_active:
+    df_active = df_all_trades[df_all_trades['status'].isin(['EXECUTED', 'PENDING'])] if not df_all_trades.empty and 'status' in df_all_trades.columns else pd.DataFrame()
+
     if not df_active.empty:
         df_active['pair'] = df_active['pair'].apply(normalize_symbol)
-        st.dataframe(df_active, width="stretch")
+        st.dataframe(df_active, use_container_width=True)
         
-        st.markdown("### 🔧 Manual Trade Control Action")
+        st.markdown("### 🔧 Live Trade Overrides & Modifications")
         selected_trade_id = st.selectbox("Select Trade ID to Manage:", df_active['id'].tolist())
-        selected_trade_row = df_active[df_active['id'] == selected_trade_id].iloc[0]
+        selected_row = df_active[df_active['id'] == selected_trade_id].iloc[0]
         
-        col_m1, col_m2, col_m3 = st.columns(3)
-        with col_m1:
-            new_sl = st.number_input("Update SL ($)", value=float(selected_trade_row['stop_loss']), format="%.5f")
-            if st.button("Update Stop Loss"):
-                conn = get_db_connection()
-                cur = conn.cursor()
-                cur.execute("UPDATE trade_setups SET stop_loss = %s WHERE id = %s;", (new_sl, selected_trade_id))
-                conn.commit()
-                cur.close()
-                conn.close()
-                st.success(f"Updated SL for Trade #{selected_trade_id} to ${new_sl:.5f}")
-                st.rerun()
+        col_sl, col_tp = st.columns(2)
+        with col_sl:
+            new_sl = st.number_input("Update Stop Loss ($)", value=float(selected_row['stop_loss']) if pd.notnull(selected_row['stop_loss']) else 0.0, format="%.5f")
+            if st.button("Update SL in Database", use_container_width=True):
+                conn_mod = get_db_connection()
+                if conn_mod:
+                    try:
+                        cur = conn_mod.cursor()
+                        cur.execute("UPDATE trade_setups SET stop_loss = %s WHERE id = %s;", (new_sl, selected_trade_id))
+                        conn_mod.commit()
+                        cur.close()
+                    except Exception as sl_err:
+                        logger.error(f"Error updating SL in DB: {sl_err}")
+                    finally:
+                        release_db_connection(conn_mod)
+                    st.cache_data.clear()
+                    st.success(f"Updated SL for Trade #{selected_trade_id} to ${new_sl:.5f}")
+                    st.rerun()
 
-        with col_m2:
-            new_tp = st.number_input("Update TP ($)", value=float(selected_trade_row['take_profit']), format="%.5f")
-            if st.button("Update Take Profit"):
-                conn = get_db_connection()
-                cur = conn.cursor()
-                cur.execute("UPDATE trade_setups SET take_profit = %s WHERE id = %s;", (new_tp, selected_trade_id))
-                conn.commit()
-                cur.close()
-                conn.close()
-                st.success(f"Updated TP for Trade #{selected_trade_id} to ${new_tp:.5f}")
-                st.rerun()
+        with col_tp:
+            new_tp = st.number_input("Update Take Profit ($)", value=float(selected_row['take_profit']) if pd.notnull(selected_row['take_profit']) else 0.0, format="%.5f")
+            if st.button("Update TP in Database", use_container_width=True):
+                conn_mod = get_db_connection()
+                if conn_mod:
+                    try:
+                        cur = conn_mod.cursor()
+                        cur.execute("UPDATE trade_setups SET take_profit = %s WHERE id = %s;", (new_tp, selected_trade_id))
+                        conn_mod.commit()
+                        cur.close()
+                    except Exception as tp_err:
+                        logger.error(f"Error updating TP in DB: {tp_err}")
+                    finally:
+                        release_db_connection(conn_mod)
+                    st.cache_data.clear()
+                    st.success(f"Updated TP for Trade #{selected_trade_id} to ${new_tp:.5f}")
+                    st.rerun()
 
-        with col_m3:
-            exit_price_input = st.number_input("Manual Exit Price ($)", value=float(selected_trade_row['entry_price']), format="%.5f")
-            if st.button("🚨 Market Close Trade Now", type="primary"):
-                if close_trade_manually(selected_trade_id, exit_price_input, reason="MANUAL_OVERRIDE"):
-                    st.success(f"Trade #{selected_trade_id} successfully closed manually.")
+        st.markdown("---")
+        manual_exit = st.number_input("Fallback Exit Price ($) [Used for Market Close/DB Override]", value=float(selected_row['entry_price']) if pd.notnull(selected_row['entry_price']) else 0.0, format="%.5f")
+        
+        col_mexc, col_db_only = st.columns(2)
+        with col_mexc:
+            if st.button("🚨 Market Close on MEXC Exchange", type="primary", use_container_width=True):
+                try:
+                    close_res = executor.close_live_position_mexc(
+                        pair=selected_row['pair'],
+                        position_size=float(selected_row['position_size']),
+                        direction=selected_row['direction']
+                    )
+                    
+                    if close_res.get("success") and float(close_res.get("exit_price", 0.0)) > 0.0:
+                        final_p = float(close_res["exit_price"])
+                        if close_trade_manually(selected_trade_id, final_p, reason="STREAMLIT_MEXC_MARKET_CLOSE"):
+                            st.cache_data.clear()
+                            st.success(f"Position #{selected_trade_id} closed on MEXC at ${final_p:.5f}.")
+                            st.rerun()
+                        else:
+                            st.error("Position closed on MEXC, but database update failed.")
+                    else:
+                        st.error("🚨 CRITICAL: MEXC close order failed or returned $0.00 price. Live position remains OPEN on exchange. DB was NOT modified.")
+                except Exception as close_err:
+                    st.error(f"Error attempting MEXC close: {close_err}")
+                    
+        with col_db_only:
+            if st.button("⚠️ Force DB Close Only (No MEXC Order)", use_container_width=True):
+                if close_trade_manually(selected_trade_id, manual_exit, reason="STREAMLIT_MANUAL_DB_ONLY_OVERRIDE"):
+                    st.cache_data.clear()
+                    st.warning(f"Position #{selected_trade_id} marked as closed in DB at ${manual_exit:.5f}. (Note: No exchange order sent).")
                     st.rerun()
                 else:
-                    st.error("Failed to close trade.")
-
+                    st.error("Failed to update position in database.")
     else:
-        st.info("No active setups found.")
+        st.info("No active positions currently running.")
 
 with tab_history:
-    df_closed_log = pd.read_sql("SELECT id, pair, direction, entry_price, exit_price, pnl_usd, pnl_pct, outcome, closed_at FROM trade_setups WHERE status = 'CLOSED';", database_url) if database_url else pd.DataFrame()
-    if not df_closed_log.empty:
-        df_closed_log['pair'] = df_closed_log['pair'].apply(normalize_symbol)
-        st.dataframe(df_closed_log, width="stretch")
+    if not closed_trades.empty:
+        closed_trades['pair'] = closed_trades['pair'].apply(normalize_symbol)
+        st.dataframe(closed_trades, use_container_width=True)
     else:
         st.info("No closed trade history available.")
 
 st.markdown("---")
+
 col_eq, col_hm = st.columns(2)
 
 with col_eq:
     st.subheader("📈 Cumulative Equity Curve")
-    if not closed_trades.empty and 'pnl_usd' in closed_trades.columns:
+    if not closed_trades.empty and 'pnl_usd' in closed_trades.columns and 'closed_at' in closed_trades.columns:
         df_eq = closed_trades.sort_values('closed_at').copy()
         df_eq['pnl_usd'] = pd.to_numeric(df_eq['pnl_usd'], errors='coerce').fillna(0.0)
         df_eq['cumulative_pnl'] = df_eq['pnl_usd'].cumsum()
@@ -384,7 +499,7 @@ with col_hm:
             closed_trades['hour'] = closed_trades['closed_at'].dt.hour
             closed_trades['pnl_usd'] = pd.to_numeric(closed_trades['pnl_usd'], errors='coerce').fillna(0.0)
             heatmap_data = closed_trades.pivot_table(index='day_of_week', columns='hour', values='pnl_usd', aggfunc='sum').fillna(0)
-            st.dataframe(heatmap_data, width="stretch")
+            st.dataframe(heatmap_data, use_container_width=True)
         except Exception:
             st.info("No heatmap data available.")
     else:
@@ -404,7 +519,7 @@ with col_per:
             period_rule = 'W' if group_interval == 'Weekly' else 'ME'
             periodic_summary = df_per.groupby(pd.Grouper(key='closed_at', freq=period_rule)).agg({'pnl_usd': ['sum', 'count']})
             periodic_summary.columns = ['Net PnL ($)', 'Trade Count']
-            st.dataframe(periodic_summary, width="stretch")
+            st.dataframe(periodic_summary, use_container_width=True)
         except Exception:
             st.info("No periodic data available.")
     else:
@@ -415,9 +530,11 @@ with col_log:
     st.markdown("*Live Worker Logs:*")
     log_messages = [
         "[INFO] Database connection established...",
-        "[INFO] Real-time chart WebSocket connected.",
-        "[INFO] Pending setups tab in sync with PostgreSQL.",
-        "[STATUS] Waiting for price action triggers."
+        "[INFO] Live Execution Engine bound to MEXC API.",
+        "[INFO] Pending setups tab synchronized with PostgreSQL.",
+        "[STATUS] Monitoring strategy triggers and active positions."
     ]
-    for log in log_messages:
-        st.code(log, language="text")
+    for log_item in log_messages:
+        st.code(log_item, language="text")
+
+gc.collect()

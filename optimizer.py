@@ -3,32 +3,90 @@ import gc
 import time
 import random
 import logging
+from multiprocessing import Pool
 import pandas as pd
 import numpy as np
-from multiprocessing import Pool
 from deap import base, creator, tools
 from dotenv import load_dotenv
 
-from common import get_db_connection, ensure_schema_updated
+from common import (
+    get_db_connection, 
+    release_db_connection, 
+    ensure_schema_updated, 
+    logger, 
+    normalize_symbol
+)
 import strategy
 
 load_dotenv()
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 GLOBAL_DATA = None
 
-# Baseline exchange friction
-FEE_RATE = 0.00075          # 0.075% trading fee per turn
-SLIPPAGE_PCT = 0.0005       # 0.05% standard slippage per turn
-SLIPPAGE_PCT_STRESS = 0.0010 # 0.10% stress-test slippage per turn
+# Friction and Gate Thresholds
+FEE_RATE = 0.00075            # 0.075% trading fee per turn
+SLIPPAGE_PCT = 0.0005         # 0.05% standard slippage per turn
+SLIPPAGE_PCT_STRESS = 0.0010   # 0.10% stress-test slippage per turn
+MIN_REQUIRED_FITNESS = 0.20   # Minimum Walk-Forward Fitness required for live persistence
+
+if not hasattr(creator, "FitnessMax"):
+    creator.create("FitnessMax", base.Fitness, weights=(1.0,))
+if not hasattr(creator, "Individual"):
+    creator.create("Individual", list, fitness=creator.FitnessMax)
+
+
+def init_worker(data_df: pd.DataFrame):
+    """Initializer for multiprocessing pool workers."""
+    global GLOBAL_DATA
+    GLOBAL_DATA = data_df
+
+
+def format_symbol_for_exchange(symbol: str) -> str:
+    """Ensures symbol is formatted with a slash for exchange calls (e.g., XRP/USDT)."""
+    clean = symbol.upper().replace("/", "").strip()
+    if clean.endswith("USDT"):
+        return f"{clean[:-4]}/USDT"
+    elif clean.endswith("BUSD"):
+        return f"{clean[:-4]}/BUSD"
+    elif clean.endswith("BTC"):
+        return f"{clean[:-3]}/BTC"
+    return symbol
+
+
+def fetch_klines_paginated(symbol: str, interval: str = "1h", total_limit: int = 5000) -> pd.DataFrame:
+    """Robust kline fetch attempting standard, continuous, and normalized pair formats."""
+    exchange_sym = format_symbol_for_exchange(symbol)
+    symbols_to_try = [exchange_sym, symbol.replace("/", ""), normalize_symbol(symbol)]
+    
+    for s in symbols_to_try:
+        try:
+            df = strategy.fetch_klines(symbol=s, timeframe=interval, limit=total_limit)
+            if df is None or df.empty:
+                df = strategy.fetch_klines(symbol=s, interval=interval, limit=total_limit)
+            if df is not None and not df.empty and len(df) >= 350:
+                if "timestamp" in df.columns:
+                    df = df.sort_values("timestamp").reset_index(drop=True)
+                return df
+        except Exception as e:
+            logger.debug(f"Attempt failed fetching klines for {s}: {e}")
+            continue
+
+    logger.warning(f"Could not fetch sufficient historical klines for {symbol} with any symbol variation.")
+    return pd.DataFrame()
+
 
 def save_optimized_parameters(symbol: str, best_params: list, fitness_score: float):
-    ensure_schema_updated()
+    if fitness_score < MIN_REQUIRED_FITNESS:
+        logger.warning(
+            f"Skipping save for {symbol}: Fitness score ({fitness_score:.4f}) "
+            f"did not meet minimum required threshold of {MIN_REQUIRED_FITNESS:.2f}."
+        )
+        return
+
     conn = get_db_connection()
     if not conn:
         return
     try:
-        clean_symbol = symbol.replace("/", "").strip().upper()
+        clean_symbol = normalize_symbol(symbol)
         cursor = conn.cursor()
         (
             tema_period, rsi_period, rsi_thresh, adx_period, adx_threshold, 
@@ -61,21 +119,14 @@ def save_optimized_parameters(symbol: str, best_params: list, fitness_score: flo
         ))
         conn.commit()
         cursor.close()
-        conn.close()
-        logging.info(f"Successfully saved validated parameters for {clean_symbol} (Walk-Forward Fitness: {fitness_score:.4f})")
+        logger.info(f"Successfully saved validated parameters for {clean_symbol} (Walk-Forward Fitness: {fitness_score:.4f})")
     except Exception as e:
-        logging.error(f"Failed to save parameters for {symbol}: {e}")
-
-
-if not hasattr(creator, "FitnessMax"):
-    creator.create("FitnessMax", base.Fitness, weights=(1.0,))
-if not hasattr(creator, "Individual"):
-    creator.create("Individual", list, fitness=creator.FitnessMax)
-
-
-def init_worker(data_df: pd.DataFrame):
-    global GLOBAL_DATA
-    GLOBAL_DATA = data_df
+        if conn:
+            conn.rollback()
+        logger.error(f"Failed to save parameters for {symbol}: {e}")
+    finally:
+        if conn:
+            release_db_connection(conn)
 
 
 def confirm_market_structure(df_close: pd.Series, lookback: int = 5) -> tuple:
@@ -109,7 +160,7 @@ def run_backtest_with_friction(
 
     struct_long, struct_short = confirm_market_structure(df_close, lookback=max(3, int(rsi_period // 2)))
 
-    # Convert to pure NumPy arrays
+    # Convert to NumPy arrays
     close_arr = df_close.to_numpy()
     tema_arr = tema_series.to_numpy()
     rsi_arr = rsi_series.to_numpy()
@@ -126,7 +177,7 @@ def run_backtest_with_friction(
     signal_changes = np.diff(combined_signal)
     trades_count = np.count_nonzero(signal_changes)
     
-    # Option A: Dynamic Fold-Aware Trade Minimum (~1 trade per 50 candles in slice)
+    # Dynamic fold-aware trade minimum (~1 trade per 50 candles in slice)
     dynamic_min_trades = max(min_trades, int(len(df) / 50))
     if trades_count < dynamic_min_trades:
         return -999.0
@@ -141,11 +192,9 @@ def run_backtest_with_friction(
     strategy_returns = raw_returns * position
     turnovers = np.abs(np.diff(position, prepend=0))
     
-    # Use stress slippage if provided, otherwise default slippage
     active_slippage = stress_slippage if stress_slippage is not None else SLIPPAGE_PCT
     friction = turnovers * (FEE_RATE + active_slippage)
     
-    # Strategy returns without scaling by risk_pct to avoid Sharpe distortion
     net_strategy_returns = strategy_returns - friction
 
     std_dev = np.std(net_strategy_returns)
@@ -161,7 +210,7 @@ def run_backtest_with_friction(
     regularization_penalty = max(0.0, turnover_rate * 1.0)
     adjusted_sharpe = sharpe_ratio - regularization_penalty
 
-    # Penalize strategies with less than 20 execution turns
+    # Execution count filter
     if trades_count < 20:
         adjusted_sharpe *= (trades_count / 20.0)
 
@@ -169,7 +218,7 @@ def run_backtest_with_friction(
 
 
 def run_walk_forward_backtest(df: pd.DataFrame, individual: list, stress_slippage: float = None) -> float:
-    """Robust Rolling Walk-Forward Validation across dynamic fold structures."""
+    """Rolling Walk-Forward Validation across dynamic fold structures."""
     if df is None or len(df) < 350:
         return -999.0
 
@@ -228,10 +277,10 @@ def create_random_individual():
         round(random.uniform(10.0, 48.0), 1),     # rsi_thresh
         random.randint(5, 25),                    # adx_period
         round(random.uniform(3.0, 28.0), 1),      # adx_threshold
-        round(random.uniform(0.008, 0.03), 4),    # max_sl_pct (Up to 3.0%, 4 decimals precision)
+        round(random.uniform(0.008, 0.03), 4),    # max_sl_pct
         round(random.uniform(0.00005, 0.02), 5),  # zone_tolerance
         round(random.uniform(-0.5, 0.5), 2),      # min_sentiment
-        round(random.uniform(0.5, 1.5), 2),       # risk_pct (Up to 1.5%)
+        round(random.uniform(0.5, 1.5), 2),       # risk_pct
         round(random.uniform(1.2, 4.0), 2)        # min_rr
     ])
 
@@ -248,13 +297,13 @@ def mutate_individual(individual, indpb=0.20):
     if random.random() < indpb:
         individual[4] = round(float(np.clip(individual[4] + random.gauss(0, 1.5), 3.0, 28.0)), 1)
     if random.random() < indpb:
-        individual[5] = round(float(np.clip(individual[5] + random.gauss(0, 0.005), 0.008, 0.03)), 4)  # Upper bound capped strictly at 0.03 (3.0%)
+        individual[5] = round(float(np.clip(individual[5] + random.gauss(0, 0.005), 0.008, 0.03)), 4)
     if random.random() < indpb:
         individual[6] = round(float(np.clip(individual[6] + random.gauss(0, 0.002), 0.00005, 0.02)), 5)
     if random.random() < indpb:
         individual[7] = round(float(np.clip(individual[7] + random.gauss(0, 0.1), -0.5, 0.5)), 2)
     if random.random() < indpb:
-        individual[8] = round(float(np.clip(individual[8] + random.gauss(0, 0.2), 0.5, 1.5)), 2)       # Upper bound capped strictly at 1.5%
+        individual[8] = round(float(np.clip(individual[8] + random.gauss(0, 0.2), 0.5, 1.5)), 2)
     if random.random() < indpb:
         individual[9] = round(float(np.clip(individual[9] + random.gauss(0, 0.3), 1.2, 4.0)), 2)
     return (individual,)
@@ -269,21 +318,11 @@ toolbox.register("mutate", mutate_individual)
 toolbox.register("select", tools.selTournament, tournsize=3)
 
 
-def fetch_klines_with_retry(symbol: str, interval: str = "1h", limit: int = 5000, max_retries: int = 3):
-    for attempt in range(1, max_retries + 1):
-        df = strategy.fetch_klines(symbol=symbol, interval=interval, limit=limit)
-        if df is not None and not df.empty and len(df) >= 350:
-            return df
-        logging.info(f"Retrying kline fetch for {symbol} (Attempt {attempt}/{max_retries})...")
-        time.sleep(2 * attempt)
-    return pd.DataFrame()
-
-
-def run_optimization(symbol="BTC/USDT"):
+def run_optimization(symbol="XRP/USDT"):
     global GLOBAL_DATA
-    data_df = fetch_klines_with_retry(symbol=symbol, interval="1h", limit=5000)
+    data_df = fetch_klines_paginated(symbol=symbol, interval="1h", total_limit=5000)
     if data_df.empty or len(data_df) < 350:
-        logging.warning(f"Insufficient historical klines for {symbol}. Skipping optimization.")
+        logger.warning(f"Insufficient historical klines for {symbol}. Skipping optimization.")
         return None
 
     GLOBAL_DATA = data_df
@@ -326,21 +365,19 @@ def run_optimization(symbol="BTC/USDT"):
     best_final_score = -999.0
 
     # Walk-Forward Selection Gate
-    MIN_REQUIRED_SHARPE = 0.20  # Minimum unscaled Sharpe required for live persistence
-
     for candidate in hof:
         wf_score = candidate.fitness.values[0]
-        if wf_score < MIN_REQUIRED_SHARPE:
+        if wf_score < MIN_REQUIRED_FITNESS:
             continue
 
         plateau_score = check_parameter_stability(data_df, candidate)
-        if plateau_score < MIN_REQUIRED_SHARPE:
+        if plateau_score < MIN_REQUIRED_FITNESS:
             continue
 
         # Stress-Test Slippage Validation (0.10% Slippage)
         stress_score = run_walk_forward_backtest(data_df, candidate, stress_slippage=SLIPPAGE_PCT_STRESS)
         if stress_score <= 0.0:
-            logging.info(f"Candidate for {symbol} failed 0.10% stress slippage check (Stress Sharpe: {stress_score:.4f}). Skipping.")
+            logger.info(f"Candidate for {symbol} failed 0.10% stress slippage check (Stress Sharpe: {stress_score:.4f}). Skipping.")
             continue
 
         validated_candidate = candidate
@@ -355,21 +392,26 @@ def run_optimization(symbol="BTC/USDT"):
         save_optimized_parameters(symbol, validated_candidate, best_final_score)
         return validated_candidate
 
-    logging.warning(f"No candidates passed walk-forward cross-validation, stability, and stress-test for {symbol}.")
+    logger.warning(f"No candidates passed walk-forward cross-validation, stability, and stress-test for {symbol}.")
     return None
 
 
 if __name__ == "__main__":
     ensure_schema_updated()
-    symbols_env = os.getenv("SYMBOLS") or os.getenv("SYMBOL", "ETH/USDT,BNB/USDT,SOL/USDT")
-    symbols = [s.strip().upper() for s in symbols_env.split(",")]
+    
+    env_symbols = os.getenv("TRACKED_SYMBOLS") or os.getenv("SYMBOLS") or os.getenv("SYMBOL", "XRP/USDT")
+    symbols = [s.strip() for s in env_symbols.split(",") if s.strip()]
 
     while True:
         try:
             for symbol in symbols:
-                logging.info(f"Starting DEAP Walk-Forward optimization run for {symbol}...")
+                logger.info(f"Starting DEAP Walk-Forward optimization run for {symbol}...")
                 run_optimization(symbol=symbol)
-                gc.collect()
+                time.sleep(3)
+            
+            logger.info("Optimization cycle complete. Sleeping for 24 hours...")
+            time.sleep(86400)
+            
         except Exception as e:
-            logging.error(f"Error in optimization cycle: {e}")
-        time.sleep(86400)
+            logger.error(f"Error in optimization cycle: {e}")
+            time.sleep(14400)
