@@ -267,7 +267,7 @@ def calculate_rsi(series: pd.Series, period: int = 14, **kwargs) -> pd.Series:
     delta = series.diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
-    rs = gain / loss.replace(0, np.nan)
+    rs = gain / (loss.replace(0, np.nan) + 1e-10)
     return (100 - (100 / (1 + rs))).fillna(50)
 
 
@@ -297,55 +297,55 @@ def calculate_adx(df, period: int = 14, **kwargs) -> pd.Series:
     minus_dm = pd.Series(np.where((down_move > up_move) & (down_move > 0), down_move, 0.0), index=df.index)
 
     tr = calculate_atr(df, period)
-    plus_di = 100 * (plus_dm.ewm(alpha=1 / period, adjust=False).mean() / tr.replace(0, np.nan))
-    minus_di = 100 * (minus_dm.ewm(alpha=1 / period, adjust=False).mean() / tr.replace(0, np.nan))
+    # Added explicit + 1e-10 to prevent division by zero / NaN propagation on flat candles
+    plus_di = 100 * (plus_dm.ewm(alpha=1 / period, adjust=False).mean() / (tr.replace(0, np.nan) + 1e-10))
+    minus_di = 100 * (minus_dm.ewm(alpha=1 / period, adjust=False).mean() / (tr.replace(0, np.nan) + 1e-10))
 
-    dx = (abs(plus_di - minus_di) / (plus_di + minus_di).replace(0, np.nan)) * 100
+    dx = (abs(plus_di - minus_di) / (plus_di + minus_di + 1e-10)) * 100
     return dx.ewm(alpha=1 / period, adjust=False).mean().fillna(0.0)
 
 
 def compute_volume_profile(df, num_bins: int = 100, lookback_bars: int = 600, va_pct: float = 0.70):
+    """Vectorized calculation of Volume Profile (POC, VAH, VAL) using NumPy arrays."""
     if isinstance(df, dict):
         df = pd.DataFrame(df)
     if is_empty_data(df) or not isinstance(df, pd.DataFrame) or "volume" not in df.columns or "high" not in df.columns or "low" not in df.columns:
         return np.nan, np.nan, np.nan
 
-    df_range = df.tail(lookback_bars).copy()
+    df_range = df.tail(lookback_bars)
     if is_empty_data(df_range):
         return np.nan, np.nan, np.nan
 
-    pLST, pHST = safe_float(df_range["low"].min()), safe_float(df_range["high"].max())
-    if pLST >= pHST or np.isnan(pLST) or np.isnan(pHST):
+    lows = df_range["low"].to_numpy(dtype=np.float64)
+    highs = df_range["high"].to_numpy(dtype=np.float64)
+    vols = df_range["volume"].to_numpy(dtype=np.float64)
+
+    pLST, pHST = np.nanmin(lows), np.nanmax(highs)
+    if np.isnan(pLST) or np.isnan(pHST) or pLST >= pHST:
         return np.nan, np.nan, np.nan
 
     pSTP = (pHST - pLST) / num_bins
     if pSTP <= 0:
         return np.nan, np.nan, np.nan
 
-    vD_vt = np.zeros(num_bins)
+    bin_edges = pLST + np.arange(num_bins + 1) * pSTP
+    bin_lows = bin_edges[:-1, np.newaxis]
+    bin_highs = bin_edges[1:, np.newaxis]
 
-    for _, row in df_range.iterrows():
-        lL, lH, lV = safe_float(row["low"]), safe_float(row["high"]), safe_float(row["volume"])
-        lR = max(lH - lL, 1e-8)
+    lL = lows[np.newaxis, :]
+    lH = highs[np.newaxis, :]
+    lV = vols[np.newaxis, :]
+    lR = np.maximum(lH - lL, 1e-8)
 
-        sSI = max(int(np.floor((lL - pLST) / pSTP)), 0)
-        eSI = min(int(np.floor((lH - pLST) / pSTP)), num_bins - 1)
+    o_start = np.maximum(lL, bin_lows)
+    o_end = np.minimum(lH, bin_highs)
+    overlap = np.maximum(0.0, o_end - o_start)
 
-        for pLI in range(sSI, eSI + 1):
-            pL = pLST + pLI * pSTP
-            if lL >= pL and lH > pL + pSTP:
-                vPOR = (pL + pSTP - lL) / lR
-            elif lH <= pL + pSTP and lL < pL:
-                vPOR = (lH - pL) / lR
-            elif lL >= pL and lH <= pL + pSTP:
-                vPOR = 1.0
-            else:
-                vPOR = pSTP / lR
-
-            vD_vt[pLI] += lV * max(vPOR, 0.0)
+    vPOR = overlap / lR
+    vD_vt = np.sum(lV * vPOR, axis=1)
 
     pcL = int(np.argmax(vD_vt))
-    poc = round(pLST + (pcL + 0.5) * pSTP, 4)
+    poc = round(float(pLST + (pcL + 0.5) * pSTP), 4)
 
     ttV = max(np.sum(vD_vt), 1e-10) * va_pct
     va = vD_vt[pcL]
@@ -369,77 +369,65 @@ def compute_volume_profile(df, num_bins: int = 100, lookback_bars: int = 600, va
             va += vbP
             lbP -= 1
 
-    vaH = round(pLST + (laP + 1.0) * pSTP, 4)
-    vaL = round(pLST + (lbP + 0.0) * pSTP, 4)
+    vaH = round(float(pLST + (laP + 1.0) * pSTP), 4)
+    vaL = round(float(pLST + (lbP + 0.0) * pSTP), 4)
 
     return float(poc), float(vaH), float(vaL)
 
 
 def calculate_volume_profile_gaps(df, num_bins: int = 100, lookback_bars: int = 600, detection_pct: float = 0.07) -> list:
+    """Vectorized calculation of Volume Profile Low-Volume Nodes (Gaps)."""
     if isinstance(df, dict):
         df = pd.DataFrame(df)
     if is_empty_data(df) or not isinstance(df, pd.DataFrame) or "volume" not in df.columns or "high" not in df.columns or "low" not in df.columns:
         return []
 
-    df_range = df.tail(lookback_bars).copy()
+    df_range = df.tail(lookback_bars)
     if is_empty_data(df_range):
         return []
 
-    pLST, pHST = safe_float(df_range["low"].min()), safe_float(df_range["high"].max())
-    if pLST >= pHST or np.isnan(pLST) or np.isnan(pHST):
+    lows = df_range["low"].to_numpy(dtype=np.float64)
+    highs = df_range["high"].to_numpy(dtype=np.float64)
+    vols = df_range["volume"].to_numpy(dtype=np.float64)
+
+    pLST, pHST = np.nanmin(lows), np.nanmax(highs)
+    if np.isnan(pLST) or np.isnan(pHST) or pLST >= pHST:
         return []
 
     pSTP = (pHST - pLST) / num_bins
     if pSTP <= 0:
         return []
 
-    vD_vt = np.zeros(num_bins)
+    bin_edges = pLST + np.arange(num_bins + 1) * pSTP
+    bin_lows = bin_edges[:-1, np.newaxis]
+    bin_highs = bin_edges[1:, np.newaxis]
 
-    for _, row in df_range.iterrows():
-        lL, lH, lV = safe_float(row["low"]), safe_float(row["high"]), safe_float(row["volume"])
-        lR = max(lH - lL, 1e-8)
+    lL = lows[np.newaxis, :]
+    lH = highs[np.newaxis, :]
+    lV = vols[np.newaxis, :]
+    lR = np.maximum(lH - lL, 1e-8)
 
-        sSI = max(int(np.floor((lL - pLST) / pSTP)), 0)
-        eSI = min(int(np.floor((lH - pLST) / pSTP)), num_bins - 1)
+    o_start = np.maximum(lL, bin_lows)
+    o_end = np.minimum(lH, bin_highs)
+    overlap = np.maximum(0.0, o_end - o_start)
 
-        for pLI in range(sSI, eSI + 1):
-            pL = pLST + pLI * pSTP
-            if lL >= pL and lH > pL + pSTP:
-                vPOR = (pL + pSTP - lL) / lR
-            elif lH <= pL + pSTP and lL < pL:
-                vPOR = (lH - pL) / lR
-            elif lL >= pL and lH <= pL + pSTP:
-                vPOR = 1.0
-            else:
-                vPOR = pSTP / lR
-
-            vD_vt[pLI] += lV * max(vPOR, 0.0)
+    vPOR = overlap / lR
+    vD_vt = np.sum(lV * vPOR, axis=1)
 
     noN = max(int(num_bins * detection_pct), 1)
-    max_val = np.max(vD_vt)
-    tVT = list(vD_vt)
+    max_val = np.max(vD_vt) if len(vD_vt) > 0 else 0.0
 
-    for _ in range(noN):
-        tVT.insert(0, max_val)
-        tVT.append(max_val)
+    padded_vt = np.pad(vD_vt, (noN, noN), mode='constant', constant_values=max_val)
 
     gap_prices = []
     for vn in range(2 * noN, num_bins + 2 * noN):
-        uNth = True
-        for cVN in range(vn - 2 * noN, vn - noN):
-            if tVT[vn - noN] >= tVT[cVN]:
-                uNth = False
-                break
+        center_val = padded_vt[vn - noN]
+        upper_neighbors = padded_vt[vn - 2 * noN : vn - noN]
+        lower_neighbors = padded_vt[vn - noN + 1 : vn + 1]
 
-        lNth = True
-        for cVN in range(vn - noN + 1, vn + 1):
-            if tVT[vn - noN] >= tVT[cVN]:
-                lNth = False
-                break
-
-        if uNth and lNth:
+        if np.all(center_val < upper_neighbors) and np.all(center_val < lower_neighbors):
             bin_idx = vn - 2 * noN
-            gap_price = round(pLST + (bin_idx + 0.5) * pSTP, 4)
+            gap_price = round(float(pLST + (bin_idx + 0.5) * pSTP), 4)
             if pLST <= gap_price <= pHST:
                 gap_prices.append(gap_price)
 
