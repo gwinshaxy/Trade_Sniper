@@ -18,20 +18,30 @@ echo "=================================================="
 # Run schema update check prior to process startup
 python -c "from common import ensure_schema_updated; ensure_schema_updated()"
 
-# 1. Launch Primary Engine Loop
+# 1. Launch Strategy Optimizer FIRST
+if [ -f "optimizer.py" ]; then
+    echo "Launching Optimizer first..."
+    python optimizer.py &
+    PID_OPT=$!
+    
+    # Wait 30 seconds for optimizer to finish initial kline fetching/population setup
+    echo "Waiting 30 seconds before starting main services..."
+    sleep 30
+fi
+
+# 2. Launch Primary Engine Loop
+echo "Launching Main Engine..."
 python main.py &
 PID_MAIN=$!
 
-# 2. Launch Real-time WebSocket Price Monitor (Optional/Auxiliary)
+# Wait 5 seconds before starting WS Monitor
+sleep 5
+
+# 3. Launch Real-time WebSocket Price Monitor
 if [ -f "ws_monitor.py" ]; then
+    echo "Launching WS Monitor..."
     python ws_monitor.py &
     PID_WS=$!
-fi
-
-# 3. Launch Strategy Optimizer (Optional/Auxiliary)
-if [ -f "optimizer.py" ]; then
-    python optimizer.py &
-    PID_OPT=$!
 fi
 
 echo "Services running: Main Engine [$PID_MAIN] | WS Monitor [${PID_WS:-N/A}] | Optimizer [${PID_OPT:-N/A}]"
