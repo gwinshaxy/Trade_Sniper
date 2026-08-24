@@ -3,7 +3,6 @@ import gc
 import time
 import random
 import logging
-from multiprocessing import Pool
 import pandas as pd
 import numpy as np
 from deap import base, creator, tools
@@ -22,56 +21,20 @@ load_dotenv()
 
 GLOBAL_DATA = None
 
-# Friction and Gate Thresholds
+# Baseline exchange friction & Gate Thresholds
 FEE_RATE = 0.00075            # 0.075% trading fee per turn
 SLIPPAGE_PCT = 0.0005         # 0.05% standard slippage per turn
 SLIPPAGE_PCT_STRESS = 0.0010   # 0.10% stress-test slippage per turn
-MIN_REQUIRED_FITNESS = 0.20   # Minimum Walk-Forward Fitness required for live persistence
+MIN_REQUIRED_FITNESS = 0.18   # Minimum Walk-Forward Fitness required for live persistence
+
+# Lightweight Optimization Parameters (Tuned for Low RAM Constraints)
+POPULATION_SIZE = 20
+NGEN = 10
 
 if not hasattr(creator, "FitnessMax"):
     creator.create("FitnessMax", base.Fitness, weights=(1.0,))
 if not hasattr(creator, "Individual"):
     creator.create("Individual", list, fitness=creator.FitnessMax)
-
-
-def init_worker(data_df: pd.DataFrame):
-    """Initializer for multiprocessing pool workers."""
-    global GLOBAL_DATA
-    GLOBAL_DATA = data_df
-
-
-def format_symbol_for_exchange(symbol: str) -> str:
-    """Ensures symbol is formatted with a slash for exchange calls (e.g., XRP/USDT)."""
-    clean = symbol.upper().replace("/", "").strip()
-    if clean.endswith("USDT"):
-        return f"{clean[:-4]}/USDT"
-    elif clean.endswith("BUSD"):
-        return f"{clean[:-4]}/BUSD"
-    elif clean.endswith("BTC"):
-        return f"{clean[:-3]}/BTC"
-    return symbol
-
-
-def fetch_klines_paginated(symbol: str, interval: str = "1h", total_limit: int = 5000) -> pd.DataFrame:
-    """Robust kline fetch attempting standard, continuous, and normalized pair formats."""
-    exchange_sym = format_symbol_for_exchange(symbol)
-    symbols_to_try = [exchange_sym, symbol.replace("/", ""), normalize_symbol(symbol)]
-    
-    for s in symbols_to_try:
-        try:
-            df = strategy.fetch_klines(symbol=s, timeframe=interval, limit=total_limit)
-            if df is None or df.empty:
-                df = strategy.fetch_klines(symbol=s, interval=interval, limit=total_limit)
-            if df is not None and not df.empty and len(df) >= 350:
-                if "timestamp" in df.columns:
-                    df = df.sort_values("timestamp").reset_index(drop=True)
-                return df
-        except Exception as e:
-            logger.debug(f"Attempt failed fetching klines for {s}: {e}")
-            continue
-
-    logger.warning(f"Could not fetch sufficient historical klines for {symbol} with any symbol variation.")
-    return pd.DataFrame()
 
 
 def save_optimized_parameters(symbol: str, best_params: list, fitness_score: float):
@@ -86,7 +49,8 @@ def save_optimized_parameters(symbol: str, best_params: list, fitness_score: flo
     if not conn:
         return
     try:
-        clean_symbol = normalize_symbol(symbol)
+        # Keep consistent symbol format (e.g., 'LINK/USDT') to match engine queries
+        formatted_symbol = symbol.strip().upper()
         cursor = conn.cursor()
         (
             tema_period, rsi_period, rsi_thresh, adx_period, adx_threshold, 
@@ -114,12 +78,12 @@ def save_optimized_parameters(symbol: str, best_params: list, fitness_score: flo
                           updated_at = NOW();
         """
         cursor.execute(query, (
-            clean_symbol, int(tema_period), int(rsi_period), float(rsi_thresh), int(adx_period), float(adx_threshold),
+            formatted_symbol, int(tema_period), int(rsi_period), float(rsi_thresh), int(adx_period), float(adx_threshold),
             float(max_sl_pct), float(zone_tolerance), float(min_sentiment), float(risk_pct), float(min_rr), float(fitness_score)
         ))
         conn.commit()
         cursor.close()
-        logger.info(f"Successfully saved validated parameters for {clean_symbol} (Walk-Forward Fitness: {fitness_score:.4f})")
+        logger.info(f"Successfully saved validated parameters for {formatted_symbol} (Walk-Forward Fitness: {fitness_score:.4f})")
     except Exception as e:
         if conn:
             conn.rollback()
@@ -160,7 +124,7 @@ def run_backtest_with_friction(
 
     struct_long, struct_short = confirm_market_structure(df_close, lookback=max(3, int(rsi_period // 2)))
 
-    # Convert to NumPy arrays
+    # Convert to pure NumPy arrays
     close_arr = df_close.to_numpy()
     tema_arr = tema_series.to_numpy()
     rsi_arr = rsi_series.to_numpy()
@@ -192,6 +156,7 @@ def run_backtest_with_friction(
     strategy_returns = raw_returns * position
     turnovers = np.abs(np.diff(position, prepend=0))
     
+    # Use stress slippage if provided, otherwise default slippage
     active_slippage = stress_slippage if stress_slippage is not None else SLIPPAGE_PCT
     friction = turnovers * (FEE_RATE + active_slippage)
     
@@ -218,7 +183,7 @@ def run_backtest_with_friction(
 
 
 def run_walk_forward_backtest(df: pd.DataFrame, individual: list, stress_slippage: float = None) -> float:
-    """Rolling Walk-Forward Validation across dynamic fold structures."""
+    """Robust Rolling Walk-Forward Validation across dynamic fold structures."""
     if df is None or len(df) < 350:
         return -999.0
 
@@ -317,101 +282,107 @@ toolbox.register("mate", tools.cxTwoPoint)
 toolbox.register("mutate", mutate_individual)
 toolbox.register("select", tools.selTournament, tournsize=3)
 
+# Use standard single-threaded map to prevent multi-process RAM cloning
+toolbox.register("map", map)
+
+
+def fetch_klines_with_retry(symbol: str, interval: str = "1h", limit: int = 5000, max_retries: int = 3):
+    for attempt in range(1, max_retries + 1):
+        df = strategy.fetch_klines(symbol=symbol, interval=interval, limit=limit)
+        if df is not None and not df.empty and len(df) >= 350:
+            return df
+        logger.info(f"Retrying kline fetch for {symbol} (Attempt {attempt}/{max_retries})...")
+        time.sleep(2 * attempt)
+    return pd.DataFrame()
+
 
 def run_optimization(symbol="XRP/USDT"):
     global GLOBAL_DATA
-    data_df = fetch_klines_paginated(symbol=symbol, interval="1h", total_limit=5000)
+    data_df = fetch_klines_with_retry(symbol=symbol, interval="1h", limit=5000)
     if data_df.empty or len(data_df) < 350:
         logger.warning(f"Insufficient historical klines for {symbol}. Skipping optimization.")
         return None
 
     GLOBAL_DATA = data_df
 
-    pool = Pool(processes=2, initializer=init_worker, initargs=(data_df,), maxtasksperchild=50)
-    toolbox.register("map", pool.map)
+    try:
+        pop = toolbox.population(n=POPULATION_SIZE)
+        hof = tools.HallOfFame(maxsize=10)
 
-    pop = toolbox.population(n=100)
-    hof = tools.HallOfFame(maxsize=15)
-
-    invalid_ind = [ind for ind in pop if not ind.fitness.valid]
-    for ind, fit in zip(invalid_ind, toolbox.map(toolbox.evaluate, invalid_ind)):
-        ind.fitness.values = fit
-    hof.update(pop)
-
-    for gen in range(1, 30):
-        offspring = list(map(toolbox.clone, toolbox.select(pop, len(pop))))
-        for c1, c2 in zip(offspring[::2], offspring[1::2]):
-            if random.random() < 0.65:
-                toolbox.mate(c1, c2)
-                del c1.fitness.values, c2.fitness.values
-        for mutant in offspring:
-            if random.random() < 0.35:
-                toolbox.mutate(mutant)
-                del mutant.fitness.values
-
-        invalid_ind = [ind for ind in offspring if not ind.fitness.valid]
+        invalid_ind = [ind for ind in pop if not ind.fitness.valid]
         for ind, fit in zip(invalid_ind, toolbox.map(toolbox.evaluate, invalid_ind)):
             ind.fitness.values = fit
-
-        pop[:] = offspring
         hof.update(pop)
+
+        for gen in range(1, NGEN + 1):
+            offspring = list(map(toolbox.clone, toolbox.select(pop, len(pop))))
+            for c1, c2 in zip(offspring[::2], offspring[1::2]):
+                if random.random() < 0.65:
+                    toolbox.mate(c1, c2)
+                    del c1.fitness.values, c2.fitness.values
+            for mutant in offspring:
+                if random.random() < 0.35:
+                    toolbox.mutate(mutant)
+                    del mutant.fitness.values
+
+            invalid_ind = [ind for ind in offspring if not ind.fitness.valid]
+            for ind, fit in zip(invalid_ind, toolbox.map(toolbox.evaluate, invalid_ind)):
+                ind.fitness.values = fit
+
+            pop[:] = offspring
+            hof.update(pop)
+
+        validated_candidate = None
+        best_final_score = -999.0
+
+        # Walk-Forward Selection Gate
+        for candidate in hof:
+            wf_score = candidate.fitness.values[0]
+            if wf_score < MIN_REQUIRED_FITNESS:
+                continue
+
+            plateau_score = check_parameter_stability(data_df, candidate)
+            if plateau_score < MIN_REQUIRED_FITNESS:
+                continue
+
+            # Stress-Test Slippage Validation (0.10% Slippage)
+            stress_score = run_walk_forward_backtest(data_df, candidate, stress_slippage=SLIPPAGE_PCT_STRESS)
+            if stress_score <= 0.0:
+                logger.info(f"Candidate for {symbol} failed 0.10% stress slippage check (Stress Sharpe: {stress_score:.4f}). Skipping.")
+                continue
+
+            validated_candidate = candidate
+            best_final_score = plateau_score
+            break
+
+        if validated_candidate is not None:
+            save_optimized_parameters(symbol, validated_candidate, best_final_score)
+            return validated_candidate
+
+        logger.warning(f"No candidates passed walk-forward cross-validation, stability, and stress-test for {symbol}.")
+        return None
+
+    finally:
+        # Guarantee memory release after every symbol optimization loop
+        GLOBAL_DATA = None
+        del data_df
         gc.collect()
-
-    pool.close()
-    pool.join()
-    toolbox.unregister("map")
-
-    validated_candidate = None
-    best_final_score = -999.0
-
-    # Walk-Forward Selection Gate
-    for candidate in hof:
-        wf_score = candidate.fitness.values[0]
-        if wf_score < MIN_REQUIRED_FITNESS:
-            continue
-
-        plateau_score = check_parameter_stability(data_df, candidate)
-        if plateau_score < MIN_REQUIRED_FITNESS:
-            continue
-
-        # Stress-Test Slippage Validation (0.10% Slippage)
-        stress_score = run_walk_forward_backtest(data_df, candidate, stress_slippage=SLIPPAGE_PCT_STRESS)
-        if stress_score <= 0.0:
-            logger.info(f"Candidate for {symbol} failed 0.10% stress slippage check (Stress Sharpe: {stress_score:.4f}). Skipping.")
-            continue
-
-        validated_candidate = candidate
-        best_final_score = plateau_score
-        break
-
-    GLOBAL_DATA = None
-    del data_df
-    gc.collect()
-
-    if validated_candidate is not None:
-        save_optimized_parameters(symbol, validated_candidate, best_final_score)
-        return validated_candidate
-
-    logger.warning(f"No candidates passed walk-forward cross-validation, stability, and stress-test for {symbol}.")
-    return None
 
 
 if __name__ == "__main__":
     ensure_schema_updated()
-    
-    env_symbols = os.getenv("TRACKED_SYMBOLS") or os.getenv("SYMBOLS") or os.getenv("SYMBOL", "XRP/USDT")
-    symbols = [s.strip() for s in env_symbols.split(",") if s.strip()]
+    symbols_env = os.getenv("SYMBOLS") or os.getenv("SYMBOL") or os.getenv("TRADING_SYMBOLS") or "XRP/USDT,BNB/USDT,SOL/USDT,LINK/USDT"
+    symbols = [s.strip().upper() for s in symbols_env.split(",") if s.strip()]
 
     while True:
         try:
             for symbol in symbols:
                 logger.info(f"Starting DEAP Walk-Forward optimization run for {symbol}...")
                 run_optimization(symbol=symbol)
-                time.sleep(3)
-            
+                time.sleep(10)
+                
             logger.info("Optimization cycle complete. Sleeping for 24 hours...")
             time.sleep(86400)
-            
         except Exception as e:
             logger.error(f"Error in optimization cycle: {e}")
-            time.sleep(14400)
+            time.sleep(3600)

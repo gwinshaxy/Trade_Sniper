@@ -77,7 +77,6 @@ def load_symbol_config(symbol: str):
         "use_candlestick_confirm": True
     }
     
-    # Strip slashes to ensure "SOL/USDT" matches "SOLUSDT" in the database
     clean_symbol = str(symbol).replace("/", "").strip().upper() if symbol else ""
     
     try:
@@ -142,10 +141,12 @@ def fetch_cryptocompare_klines(
                 "%Y-%m-%d %H:%M:%S"
             )
 
+            # Keep only essential columns and downcast float types to save RAM
+            df = df[["time", "open", "high", "low", "close", "volume"]].copy()
             for col in ["open", "high", "low", "close", "volume"]:
-                df[col] = df[col].astype(float)
+                df[col] = df[col].astype(np.float32)
 
-            return df[["time", "open", "high", "low", "close", "volume"]]
+            return df
     except Exception as e:
         logger.debug(f"[CryptoCompare Fallback Error]: {e}")
 
@@ -155,7 +156,7 @@ def fetch_cryptocompare_klines(
 def fetch_klines(
     symbol: str, timeframe: str = "1h", limit: int = 600, interval: str = None
 ) -> pd.DataFrame:
-    """Fetches candlestick data using DB -> MEXC -> Bybit -> CryptoCompare fallback chain."""
+    """Fetches candlestick data using DB -> MEXC -> Bybit -> CryptoCompare fallback chain with low RAM optimization."""
     tf = interval if interval is not None else timeframe
     norm_sym = normalize_symbol(symbol)
 
@@ -186,8 +187,11 @@ def fetch_klines(
                 df["time"] = pd.to_datetime(df["timestamp"]).dt.strftime(
                     "%Y-%m-%d %H:%M:%S"
                 )
+                
+                # Keep essential columns & downcast to float32
+                df = df[["time", "open", "high", "low", "close", "volume"]].copy()
                 for col in ["open", "high", "low", "close", "volume"]:
-                    df[col] = df[col].apply(lambda x: safe_float(x))
+                    df[col] = df[col].astype(np.float32)
                 return df
         except Exception as e:
             logger.warning(
@@ -209,8 +213,9 @@ def fetch_klines(
             df["time"] = pd.to_datetime(df["timestamp"], unit="ms").dt.strftime(
                 "%Y-%m-%d %H:%M:%S"
             )
+            df = df[["time", "open", "high", "low", "close", "volume"]].copy()
             for col in ["open", "high", "low", "close", "volume"]:
-                df[col] = df[col].apply(lambda x: safe_float(x))
+                df[col] = df[col].astype(np.float32)
             return df
     except Exception as e:
         logger.warning(
@@ -230,8 +235,9 @@ def fetch_klines(
             df["time"] = pd.to_datetime(df["timestamp"], unit="ms").dt.strftime(
                 "%Y-%m-%d %H:%M:%S"
             )
+            df = df[["time", "open", "high", "low", "close", "volume"]].copy()
             for col in ["open", "high", "low", "close", "volume"]:
-                df[col] = df[col].apply(lambda x: safe_float(x))
+                df[col] = df[col].astype(np.float32)
             return df
     except Exception as e:
         logger.warning(
@@ -491,7 +497,6 @@ def evaluate_signals(
 ) -> tuple:
     config = load_symbol_config(symbol)
     
-    # Safely convert inputs to DataFrames
     if isinstance(df, dict):
         df = pd.DataFrame(df) if df else pd.DataFrame()
     if isinstance(df_4h, dict):
@@ -528,7 +533,6 @@ def evaluate_signals(
     if use_adx_filter and current_adx < adx_threshold:
         return "HOLD", f"ADX too low ({current_adx:.1f} < {adx_threshold:.1f})"
 
-    # Safely evaluate 4H HTF Bias
     if not is_empty_data(df_4h) and isinstance(df_4h, pd.DataFrame):
         htf_bias = check_htf_bias(df_4h)
     else:

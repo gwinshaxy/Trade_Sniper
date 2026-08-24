@@ -1,7 +1,8 @@
 import os
 import time
 import logging
-from datetime import datetime
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 import pandas as pd
 from dotenv import load_dotenv
 
@@ -17,13 +18,14 @@ from trade_manager import TradeManager
 
 load_dotenv()
 
-# Dynamic Symbol Loading from .env (e.g., TRADING_SYMBOLS="XRP/USDT,BTC/USDT")
+# Dynamic Symbol Loading from .env
 raw_symbols = os.getenv("TRADING_SYMBOLS") or os.getenv("WATCHLIST") or "XRP/USDT"
 WATCHLIST = [s.strip() for s in raw_symbols.split(",") if s.strip()]
 
 TIMEFRAME = os.getenv("TIMEFRAME", "1h")
 POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", "60"))
 ACCOUNT_RISK_PCT = float(os.getenv("ACCOUNT_RISK_PCT", "1.0"))
+PORT = int(os.getenv("PORT", 10000))
 
 logging.basicConfig(
     level=logging.INFO,
@@ -34,6 +36,29 @@ logging.basicConfig(
     ],
 )
 logger = logging.getLogger("main_engine")
+
+
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    """Zero-dependency HTTP Handler for Render port health checks."""
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(b'{"status": "healthy", "service": "Trading Bot Engine"}')
+
+    def log_message(self, format, *args):
+        # Suppress standard HTTP GET logs to keep console output clean
+        return
+
+
+def run_health_server():
+    """Runs a built-in lightweight HTTP health check server on $PORT in a background thread."""
+    try:
+        server = HTTPServer(("0.0.0.0", PORT), HealthCheckHandler)
+        logger.info(f"Starting native background Health Check server on port {PORT}...")
+        server.serve_forever()
+    except Exception as e:
+        logger.error(f"Failed to start native Health Check HTTP server: {e}")
 
 
 def process_symbol(symbol: str, tm: TradeManager):
@@ -182,6 +207,11 @@ def process_symbol(symbol: str, tm: TradeManager):
 
 def main():
     logger.info(f"Starting Paper Trading Bot Engine (Spot Mode) | Active Watchlist: {WATCHLIST}...")
+    
+    # Start native HTTP server in a daemon thread to bind $PORT for Render
+    health_thread = threading.Thread(target=run_health_server, daemon=True)
+    health_thread.start()
+
     ensure_schema_updated()
     tm = TradeManager()
 
