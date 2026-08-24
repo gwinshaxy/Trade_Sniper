@@ -1,22 +1,60 @@
-# 1. Run Optimizer synchronously once (blocks until complete, then frees 100% RAM)
+#!/bin/bash
+set -e
+
+cleanup() {
+    echo "SIGTERM/SIGINT received. Shutting down active background processes gracefully..."
+    kill -TERM $PID_MAIN $PID_WS 2>/dev/null
+    wait
+    echo "All processes terminated cleanly."
+    exit 0
+}
+
+trap cleanup SIGTERM SIGINT
+
+echo "=================================================="
+echo " Starting Decoupled Live Trading Engine System"
+echo "=================================================="
+
+# Run schema update check prior to process startup
+python -c "from common import ensure_schema_updated; ensure_schema_updated()"
+
+# 1. Run Strategy Optimizer synchronously ONCE (blocks until complete, then frees 100% RAM)
 if [ -f "optimizer.py" ]; then
-    echo "Running initial strategy optimization..."
+    echo "Running initial strategy optimization (--once)..."
     python optimizer.py --once || echo "Optimizer warning: proceeding with database defaults."
-    
-    # Short pause to let system memory settle
-    sleep 5
+    echo "Optimizer completed. Memory released."
+    sleep 3
 fi
 
-# 2. Launch Main Engine in background
-echo "Starting Main Engine..."
+# 2. Launch Primary Engine Loop in background
+echo "Launching Main Engine..."
 python main.py &
 PID_MAIN=$!
 
+# Short delay to allow Main Engine to connect to DB/Exchange
 sleep 5
 
-# 3. Launch WS Monitor in background
+# 3. Launch Real-time WebSocket Price Monitor in background
 if [ -f "ws_monitor.py" ]; then
-    echo "Starting WS Monitor..."
+    echo "Launching WS Monitor..."
     python ws_monitor.py &
     PID_WS=$!
 fi
+
+echo "Services running: Main Engine [$PID_MAIN] | WS Monitor [${PID_WS:-N/A}]"
+
+# Monitor core background process health
+while true; do
+    if ! kill -0 $PID_MAIN 2>/dev/null; then
+        echo "⚠️ Main Engine (PID $PID_MAIN) exited unexpectedly!"
+        break
+    fi
+    if [ -n "$PID_WS" ] && ! kill -0 $PID_WS 2>/dev/null; then
+        echo "⚠️ WS Monitor (PID $PID_WS) exited unexpectedly!"
+        break
+    fi
+    sleep 5
+done
+
+echo "Triggering system cleanup..."
+cleanup

@@ -3,6 +3,7 @@ import gc
 import time
 import random
 import logging
+import argparse
 import pandas as pd
 import numpy as np
 from deap import base, creator, tools
@@ -49,7 +50,6 @@ def save_optimized_parameters(symbol: str, best_params: list, fitness_score: flo
     if not conn:
         return
     try:
-        # Keep consistent symbol format (e.g., 'LINK/USDT') to match engine queries
         formatted_symbol = symbol.strip().upper()
         cursor = conn.cursor()
         (
@@ -281,8 +281,6 @@ toolbox.register("evaluate", evaluate_strategy_train)
 toolbox.register("mate", tools.cxTwoPoint)
 toolbox.register("mutate", mutate_individual)
 toolbox.register("select", tools.selTournament, tournsize=3)
-
-# Use standard single-threaded map to prevent multi-process RAM cloning
 toolbox.register("map", map)
 
 
@@ -335,7 +333,6 @@ def run_optimization(symbol="XRP/USDT"):
         validated_candidate = None
         best_final_score = -999.0
 
-        # Walk-Forward Selection Gate
         for candidate in hof:
             wf_score = candidate.fitness.values[0]
             if wf_score < MIN_REQUIRED_FITNESS:
@@ -345,7 +342,6 @@ def run_optimization(symbol="XRP/USDT"):
             if plateau_score < MIN_REQUIRED_FITNESS:
                 continue
 
-            # Stress-Test Slippage Validation (0.10% Slippage)
             stress_score = run_walk_forward_backtest(data_df, candidate, stress_slippage=SLIPPAGE_PCT_STRESS)
             if stress_score <= 0.0:
                 logger.info(f"Candidate for {symbol} failed 0.10% stress slippage check (Stress Sharpe: {stress_score:.4f}). Skipping.")
@@ -363,26 +359,37 @@ def run_optimization(symbol="XRP/USDT"):
         return None
 
     finally:
-        # Guarantee memory release after every symbol optimization loop
         GLOBAL_DATA = None
         del data_df
         gc.collect()
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Strategy Optimizer Engine")
+    parser.add_argument("--once", action="store_true", help="Run optimization cycle once for all symbols and exit")
+    args = parser.parse_args()
+
     ensure_schema_updated()
     symbols_env = os.getenv("SYMBOLS") or os.getenv("SYMBOL") or os.getenv("TRADING_SYMBOLS") or "XRP/USDT,BNB/USDT,SOL/USDT,LINK/USDT"
     symbols = [s.strip().upper() for s in symbols_env.split(",") if s.strip()]
 
-    while True:
-        try:
-            for symbol in symbols:
-                logger.info(f"Starting DEAP Walk-Forward optimization run for {symbol}...")
-                run_optimization(symbol=symbol)
-                time.sleep(10)
-                
-            logger.info("Optimization cycle complete. Sleeping for 24 hours...")
-            time.sleep(86400)
-        except Exception as e:
-            logger.error(f"Error in optimization cycle: {e}")
-            time.sleep(3600)
+    if args.once:
+        logger.info("Executing single optimization pass (--once specified)...")
+        for symbol in symbols:
+            logger.info(f"Starting DEAP Walk-Forward optimization run for {symbol}...")
+            run_optimization(symbol=symbol)
+            time.sleep(2)
+        logger.info("Single-pass optimization complete. Exiting clean.")
+    else:
+        while True:
+            try:
+                for symbol in symbols:
+                    logger.info(f"Starting DEAP Walk-Forward optimization run for {symbol}...")
+                    run_optimization(symbol=symbol)
+                    time.sleep(10)
+                    
+                logger.info("Optimization cycle complete. Sleeping for 24 hours...")
+                time.sleep(86400)
+            except Exception as e:
+                logger.error(f"Error in optimization cycle: {e}")
+                time.sleep(3600)
