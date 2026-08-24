@@ -13,7 +13,8 @@ from common import (
     check_daily_circuit_breaker,
     send_telegram_notification,
 )
-from strategy import fetch_klines, evaluate_signals
+from live_executor import LiveExecutionEngine
+from strategy import fetch_klines, evaluate_signals, safe_float
 from trade_manager import TradeManager
 
 load_dotenv()
@@ -37,6 +38,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger("main_engine")
 
+execution_engine = LiveExecutionEngine()
+
 
 class HealthCheckHandler(BaseHTTPRequestHandler):
     """Zero-dependency HTTP Handler for Render port health checks."""
@@ -47,7 +50,6 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
         self.wfile.write(b'{"status": "healthy", "service": "Trading Bot Engine"}')
 
     def log_message(self, format, *args):
-        # Suppress standard HTTP GET logs to keep console output clean
         return
 
 
@@ -62,8 +64,8 @@ def run_health_server():
 
 
 def process_symbol(symbol: str, tm: TradeManager):
-    """Fetches data, evaluates strategy, checks open trades, and processes new signals for a single symbol."""
-    logger.info(f"--- Processing {symbol} [{TIMEFRAME}] (PAPER SPOT MODE) ---")
+    """Fetches data, evaluates strategy, checks open trades, and executes live spot buy orders."""
+    logger.info(f"--- Processing {symbol} [{TIMEFRAME}] (LIVE SPOT MODE) ---")
 
     # 1. Fetch Latest Kline Data
     df = fetch_klines(symbol=symbol, timeframe=TIMEFRAME, limit=300)
@@ -72,7 +74,7 @@ def process_symbol(symbol: str, tm: TradeManager):
         return
 
     latest_candle = df.iloc[-1]
-    current_price = float(latest_candle["close"])
+    current_price = safe_float(latest_candle["close"])
 
     # 2. Process existing open trades for this pair in the Database
     conn = get_db_connection()
@@ -84,7 +86,7 @@ def process_symbol(symbol: str, tm: TradeManager):
                 SELECT id, pair, direction, entry_price, stop_loss, take_profit, position_size, account_balance, trade_state
                 FROM trade_setups
                 WHERE pair = %s AND trade_state = 'OPEN';
-            """,
+                """,
                 (symbol,),
             )
             open_trades = cursor.fetchall()
@@ -96,22 +98,19 @@ def process_symbol(symbol: str, tm: TradeManager):
                         "id": trade_row[0],
                         "pair": trade_row[1],
                         "direction": trade_row[2],
-                        "entry_price": float(trade_row[3]),
-                        "stop_loss": float(trade_row[4]) if trade_row[4] else None,
-                        "take_profit": (
-                            float(trade_row[5]) if trade_row[5] else None
-                        ),
-                        "position_size": float(trade_row[6]),
-                        "account_balance": float(trade_row[7] or 100.0),
+                        "entry_price": safe_float(trade_row[3]),
+                        "stop_loss": safe_float(trade_row[4]) if trade_row[4] else None,
+                        "take_profit": safe_float(trade_row[5]) if trade_row[5] else None,
+                        "position_size": safe_float(trade_row[6]),
+                        "account_balance": safe_float(trade_row[7], default=100.0),
                         "trade_state": trade_row[8],
                     }
                 )
 
-                # Process stop-loss / take-profit conditions via TradeManager
                 action_result = tm.process_trade(trade_series, latest_candle)
                 if action_result.get("action") in ["CLOSE_SL", "CLOSE_TP"]:
                     logger.info(
-                        f"Trade #{trade_series['id']} closed via {action_result['action']} at ${current_price:.5f}"
+                        f"Trade #{trade_series['id']} condition met via {action_result['action']} at ${current_price:.5f}"
                     )
         except Exception as e:
             logger.error(f"Error querying/updating open trades for {symbol}: {e}")
@@ -131,14 +130,13 @@ def process_symbol(symbol: str, tm: TradeManager):
     )
 
     if signal in ["BUY", "SELL"] and isinstance(details, dict):
-        # In Spot Mode, SELL/SHORT signals are skipped for fresh entries
         if signal == "SELL":
             logger.info(f"⚡ SHORT SIGNAL DETECTED for {symbol}: Bypassed (Spot Mode Active).")
             return
 
-        logger.info(f"⚡ BUY SIGNAL DETECTED: {signal} on {symbol}")
+        logger.info(f"⚡ LIVE BUY SIGNAL DETECTED: {signal} on {symbol}")
 
-        # Ensure no existing open trade for this pair before inserting
+        # Ensure no existing open trade for this pair before placing live buy order
         conn = get_db_connection()
         if conn:
             try:
@@ -150,47 +148,61 @@ def process_symbol(symbol: str, tm: TradeManager):
                 existing = cursor.fetchone()
 
                 if not existing:
-                    entry_price = details["entry_price"]
-                    stop_loss = details["stop_loss"]
-                    take_profit = details["take_profit"]
+                    target_stop_loss = details["stop_loss"]
+                    target_take_profit = details["take_profit"]
                     position_size = details["position_size"]
                     account_balance = details.get("account_balance", 100.0)
 
-                    insert_query = """
-                        INSERT INTO trade_setups (pair, direction, entry_price, stop_loss, take_profit, risk_pct, position_size, account_balance, status, trade_state)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'EXECUTED', 'OPEN')
-                        RETURNING id;
-                    """
-                    cursor.execute(
-                        insert_query,
-                        (
-                            symbol,
-                            "LONG",
-                            entry_price,
-                            stop_loss,
-                            take_profit,
-                            ACCOUNT_RISK_PCT,
-                            position_size,
-                            account_balance,
-                        ),
-                    )
-                    trade_id = cursor.fetchone()[0]
-                    conn.commit()
+                    # Calculate USD execution allocation or unit amount
+                    amount_usd = details.get("position_size_usd") or (position_size * safe_float(details["entry_price"]))
 
-                    logger.info(
-                        f"SUCCESS: Executed and recorded Paper Trade #{trade_id} [BUY {symbol}]"
+                    # Execute Live Spot Buy Order
+                    order_res = execution_engine.buy_spot_mexc(
+                        symbol=symbol,
+                        amount_usd=amount_usd
                     )
 
-                    send_telegram_notification(
-                        f"<b>🚀 NEW PAPER TRADE RECORDED (SPOT)</b>\n\n"
-                        f"<b>Trade ID:</b> <code>#{trade_id}</code>\n"
-                        f"<b>Pair:</b> <code>{symbol}</code>\n"
-                        f"<b>Direction:</b> <code>LONG (BUY)</code>\n"
-                        f"<b>Entry:</b> ${entry_price:.5f}\n"
-                        f"<b>Stop Loss:</b> ${stop_loss:.5f}\n"
-                        f"<b>Take Profit:</b> ${take_profit:.5f}\n"
-                        f"<b>Size:</b> {position_size:.2f} units"
-                    )
+                    if order_res and (order_res.get("status") == "SUCCESS" or order_res.get("id")):
+                        actual_entry = safe_float(order_res.get("fill_price") or order_res.get("price"), default=details["entry_price"])
+                        actual_qty = safe_float(order_res.get("executed_qty") or order_res.get("amount"), default=position_size)
+
+                        insert_query = """
+                            INSERT INTO trade_setups (pair, direction, entry_price, stop_loss, take_profit, risk_pct, position_size, account_balance, status, trade_state)
+                            VALUES (%s, 'LONG', %s, %s, %s, %s, %s, %s, 'EXECUTED', 'OPEN')
+                            RETURNING id;
+                        """
+                        cursor.execute(
+                            insert_query,
+                            (
+                                symbol,
+                                actual_entry,
+                                target_stop_loss,
+                                target_take_profit,
+                                ACCOUNT_RISK_PCT,
+                                actual_qty,
+                                account_balance,
+                            ),
+                        )
+                        trade_id = cursor.fetchone()[0]
+                        conn.commit()
+
+                        logger.info(
+                            f"SUCCESS: Live Spot Buy Order Executed & Trade #{trade_id} Recorded [{symbol}]"
+                        )
+
+                        send_telegram_notification(
+                            f"<b>🚀 NEW LIVE SPOT TRADE EXECUTED</b>\n\n"
+                            f"<b>Trade ID:</b> <code>#{trade_id}</code>\n"
+                            f"<b>Pair:</b> <code>{symbol}</code>\n"
+                            f"<b>Direction:</b> <code>LONG (BUY SPOT)</code>\n"
+                            f"<b>Fill Price:</b> ${actual_entry:.5f}\n"
+                            f"<b>Stop Loss:</b> ${target_stop_loss:.5f}\n"
+                            f"<b>Take Profit:</b> ${target_take_profit:.5f}\n"
+                            f"<b>Quantity:</b> {actual_qty:.4f} units"
+                        )
+                    else:
+                        logger.error(f"Live Spot Order Execution failed for {symbol}: {order_res}")
+
                 else:
                     logger.info(
                         f"Skipping trade execution: Trade #{existing[0]} is already OPEN for {symbol}."
@@ -198,7 +210,7 @@ def process_symbol(symbol: str, tm: TradeManager):
 
                 cursor.close()
             except Exception as e:
-                logger.error(f"Failed to process trade signal in DB: {e}")
+                logger.error(f"Failed to process live trade execution in DB: {e}")
             finally:
                 release_db_connection(conn)
     else:
@@ -206,9 +218,8 @@ def process_symbol(symbol: str, tm: TradeManager):
 
 
 def main():
-    logger.info(f"Starting Paper Trading Bot Engine (Spot Mode) | Active Watchlist: {WATCHLIST}...")
+    logger.info(f"Starting Live Trading Bot Engine (Spot Mode) | Active Watchlist: {WATCHLIST}...")
     
-    # Start native HTTP server in a daemon thread to bind $PORT for Render
     health_thread = threading.Thread(target=run_health_server, daemon=True)
     health_thread.start()
 
@@ -216,7 +227,7 @@ def main():
     tm = TradeManager()
 
     send_telegram_notification(
-        f"<b>🟢 BOT STARTED (PAPER SPOT MODE)</b>\nMonitoring pairs: <code>{', '.join(WATCHLIST)}</code>"
+        f"<b>🟢 BOT STARTED (LIVE SPOT MODE)</b>\nMonitoring pairs: <code>{', '.join(WATCHLIST)}</code>"
     )
 
     while True:

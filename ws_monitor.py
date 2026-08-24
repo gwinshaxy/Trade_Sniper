@@ -25,6 +25,8 @@ ensure_schema_updated()
 execution_engine = LiveExecutionEngine()
 trade_manager = TradeManager()
 
+indicator_cache = {}
+
 def _sync_fetch_active_trades():
     conn = get_db_connection()
     if not conn:
@@ -34,7 +36,7 @@ def _sync_fetch_active_trades():
             cur.execute("""
                 SELECT id, pair, direction, entry_price, stop_loss, take_profit, position_size, account_balance, trade_state
                 FROM trade_setups
-                WHERE status = 'EXECUTED' AND trade_state != 'CLOSED';
+                WHERE trade_state = 'OPEN';
             """)
             return cur.fetchall()
     except Exception as e:
@@ -66,6 +68,7 @@ def _sync_update_db_stop_loss(trade_id: int, new_sl: float, new_state: str):
         release_db_connection(conn)
 
 async def update_db_stop_loss(trade_id: int, new_sl: float, new_state: str):
+    # FIXED: Added new_sl parameter to _sync_update_db_stop_loss call
     await asyncio.to_thread(_sync_update_db_stop_loss, trade_id, new_sl, new_state)
 
 def _sync_execute_auto_settlement(trade, trigger_price, reason):
@@ -74,8 +77,10 @@ def _sync_execute_auto_settlement(trade, trigger_price, reason):
     direction = trade["direction"]
     position_size = safe_float(trade.get("position_size"))
 
-    exit_res = execution_engine.close_live_position_mexc(pair, position_side="BOTH")
-    raw_exit = exit_res.get("exit_price") if isinstance(exit_res, dict) else None
+    # Execute Live Spot Market Sell Order to exit position
+    exit_res = execution_engine.sell_spot_mexc(pair, amount=position_size)
+    
+    raw_exit = exit_res.get("fill_price") or exit_res.get("price") if isinstance(exit_res, dict) else None
     actual_exit_price = safe_float(raw_exit) if raw_exit and safe_float(raw_exit) > 0 else safe_float(trigger_price)
 
     conn = get_db_connection()
@@ -97,7 +102,7 @@ def _sync_execute_auto_settlement(trade, trigger_price, reason):
 
             emoji = "🟢" if outcome == "WIN" else "🔴"
             send_telegram_notification(
-                f"<b>{emoji} MEXC LIVE SETTLEMENT ({reason})</b>\n\n"
+                f"<b>{emoji} MEXC LIVE SPOT SETTLEMENT ({reason})</b>\n\n"
                 f"<b>Trade ID:</b> <code>#{trade_id}</code>\n"
                 f"<b>Pair:</b> <code>{pair}</code>\n"
                 f"<b>Direction:</b> <code>{direction}</code>\n"
@@ -119,7 +124,10 @@ async def send_mexc_ping(websocket):
         try:
             await asyncio.sleep(20)
             await websocket.send(json.dumps({"method": "ping"}))
-        except Exception:
+        except (asyncio.CancelledError, websockets.ConnectionClosed):
+            break
+        except Exception as e:
+            logger.debug(f"Ping encountered an error: {e}")
             break
 
 def _sync_get_technical_indicators(pair: str):
@@ -140,8 +148,45 @@ def _sync_get_technical_indicators(pair: str):
         logger.error(f"Error fetching indicator metrics for {pair}: {e}")
     return None, 0.0
 
-async def get_technical_indicators(pair: str):
-    return await asyncio.to_thread(_sync_get_technical_indicators, pair)
+async def indicator_refresh_loop():
+    """Background task running once for the process lifetime to update indicator values."""
+    global indicator_cache
+    while True:
+        try:
+            trades = await fetch_active_trades()
+            pairs = list(set([t["pair"] for t in trades]))
+            for pair in pairs:
+                tema, atr = await asyncio.to_thread(_sync_get_technical_indicators, pair)
+                indicator_cache[pair] = {"tema": tema, "atr": atr}
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.error(f"Error in indicator refresh background task: {e}")
+        await asyncio.sleep(30)
+
+async def manage_subscriptions(websocket, active_trades_ref, subscribed_symbols):
+    """Background task to poll DB and adjust WS subscriptions without blocking price parsing."""
+    while True:
+        try:
+            await asyncio.sleep(10)
+            trades = await fetch_active_trades()
+            active_trades_ref["trades"] = trades
+            current_symbols = set(to_mexc_ws_symbol(t["pair"]) for t in trades)
+            
+            new_symbols = current_symbols - subscribed_symbols
+            for ws_sym in new_symbols:
+                await websocket.send(json.dumps({"method": "sub.ticker", "param": {"symbol": ws_sym}}))
+                subscribed_symbols.add(ws_sym)
+            
+            removed_symbols = subscribed_symbols - current_symbols
+            for ws_sym in removed_symbols:
+                await websocket.send(json.dumps({"method": "unsub.ticker", "param": {"symbol": ws_sym}}))
+                subscribed_symbols.remove(ws_sym)
+
+        except (asyncio.CancelledError, websockets.ConnectionClosed):
+            break
+        except Exception as e:
+            logger.warning(f"Error managing subscriptions: {e}")
 
 async def monitor_prices():
     MEXC_CONTRACT_WS_URL = "wss://contract.mexc.com/edge"
@@ -152,32 +197,23 @@ async def monitor_prices():
             await asyncio.sleep(3)
             continue
 
-        active_ws_symbols = list(set([to_mexc_ws_symbol(t["pair"]) for t in trades]))
+        subscribed_symbols = set(to_mexc_ws_symbol(t["pair"]) for t in trades)
+        active_trades_ref = {"trades": trades}
+
+        ping_task = None
+        sub_task = None
 
         try:
             async with websockets.connect(MEXC_CONTRACT_WS_URL, ping_interval=None) as websocket:
                 ping_task = asyncio.create_task(send_mexc_ping(websocket))
+                sub_task = asyncio.create_task(manage_subscriptions(websocket, active_trades_ref, subscribed_symbols))
 
-                for ws_sym in active_ws_symbols:
-                    sub_payload = {
-                        "method": "sub.ticker",
-                        "param": {"symbol": ws_sym}
-                    }
-                    await websocket.send(json.dumps(sub_payload))
+                for ws_sym in list(subscribed_symbols):
+                    await websocket.send(json.dumps({"method": "sub.ticker", "param": {"symbol": ws_sym}}))
                 
-                logger.info(f"Subscribed to MEXC Futures WebSocket ticker feeds for: {active_ws_symbols}")
-
-                last_trade_poll = asyncio.get_running_loop().time()
+                logger.info(f"Subscribed to MEXC WebSocket ticker feeds for: {list(subscribed_symbols)}")
 
                 while True:
-                    if asyncio.get_running_loop().time() - last_trade_poll > 10:
-                        trades = await fetch_active_trades()
-                        new_ws_symbols = list(set([to_mexc_ws_symbol(t["pair"]) for t in trades]))
-                        if set(new_ws_symbols) != set(active_ws_symbols):
-                            logger.info("Active trade set changed! Re-subscribing Futures WebSocket feed...")
-                            break
-                        last_trade_poll = asyncio.get_running_loop().time()
-
                     msg = await asyncio.wait_for(websocket.recv(), timeout=30.0)
                     
                     try:
@@ -186,25 +222,23 @@ async def monitor_prices():
                         if data.get("channel") == "pong" or data.get("data") == "pong":
                             continue
 
-                        channel = data.get("channel", "")
-                        if channel == "push.ticker" and "data" in data and data["data"]:
+                        if data.get("channel") == "push.ticker" and "data" in data and data["data"]:
                             ticker_data = data["data"]
-                            
                             raw_price = ticker_data.get("p") or ticker_data.get("lastPrice") or ticker_data.get("close")
                             current_price = safe_float(raw_price)
                             if current_price <= 0:
                                 continue
 
                             raw_ws_symbol = str(ticker_data.get("symbol", "")).upper()
+                            current_trades = list(active_trades_ref["trades"])
 
-                            for trade in trades:
-                                trade_ws_format = to_mexc_ws_symbol(trade["pair"])
-                                if trade_ws_format != raw_ws_symbol:
+                            for trade in current_trades:
+                                if to_mexc_ws_symbol(trade["pair"]) != raw_ws_symbol:
                                     continue
 
-                                tema_val, atr_val = await get_technical_indicators(trade["pair"])
-                                
-                                # Safe fallback if TEMA fails to calculate
+                                cached_ind = indicator_cache.get(trade["pair"], {})
+                                tema_val = cached_ind.get("tema")
+                                atr_val = cached_ind.get("atr", 0.0)
                                 safe_tema = safe_float(tema_val, default=current_price) if tema_val is not None else current_price
 
                                 candle_data = pd.Series({
@@ -216,19 +250,14 @@ async def monitor_prices():
                                 managed_res = trade_manager.process_trade(pd.Series(trade), candle_data)
                                 action = managed_res.get("action")
 
-                                if action == "CLOSE_SL":
-                                    await execute_auto_settlement(trade, managed_res["exit_price"], "STOP_LOSS")
-                                    trades = await fetch_active_trades()
-                                    break
-                                elif action == "CLOSE_TP":
-                                    await execute_auto_settlement(trade, managed_res["exit_price"], "TAKE_PROFIT")
-                                    trades = await fetch_active_trades()
-                                    break
+                                if action in ("CLOSE_SL", "CLOSE_TP"):
+                                    reason = "STOP_LOSS" if action == "CLOSE_SL" else "TAKE_PROFIT"
+                                    await execute_auto_settlement(trade, managed_res["exit_price"], reason)
+                                    active_trades_ref["trades"] = [t for t in active_trades_ref["trades"] if t["id"] != trade["id"]]
                                 elif action == "UPDATE_SL":
                                     await update_db_stop_loss(trade["id"], managed_res["new_sl"], managed_res["new_state"])
-                                    if "msg" in managed_res and managed_res["msg"]:
+                                    if managed_res.get("msg"):
                                         send_telegram_notification(managed_res["msg"])
-                                    trades = await fetch_active_trades()
 
                     except (ValueError, TypeError) as e:
                         logger.warning(f"Ignored invalid ticker frame: {e}")
@@ -236,11 +265,28 @@ async def monitor_prices():
                         continue
 
         except Exception as err:
-            logger.warning(f"MEXC Futures WebSocket Connection Interrupted ({err}). Reconnecting in 3 seconds...")
+            logger.warning(f"MEXC WebSocket Connection Interrupted ({err}). Reconnecting in 3 seconds...")
             await asyncio.sleep(3)
         finally:
-            if 'ping_task' in locals() and not ping_task.done():
-                ping_task.cancel()
+            for task in (ping_task, sub_task):
+                if task and not task.done():
+                    task.cancel()
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        pass
+
+async def main():
+    # Start the single global indicator refresh background task
+    refresh_task = asyncio.create_task(indicator_refresh_loop())
+    try:
+        await monitor_prices()
+    finally:
+        refresh_task.cancel()
+        try:
+            await refresh_task
+        except asyncio.CancelledError:
+            pass
 
 if __name__ == "__main__":
-    asyncio.run(monitor_prices())
+    asyncio.run(main())

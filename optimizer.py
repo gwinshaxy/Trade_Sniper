@@ -172,7 +172,7 @@ def run_backtest_with_friction(
 
     # Turnover penalty
     turnover_rate = np.sum(turnovers) / len(df)
-    regularization_penalty = max(0.0, turnover_rate * 0.5)
+    regularization_penalty = max(0.0, turnover_rate * 0.2)
     adjusted_sharpe = sharpe_ratio - regularization_penalty
 
     # Execution count filter
