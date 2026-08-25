@@ -19,7 +19,6 @@ from trade_manager import TradeManager
 
 load_dotenv()
 
-# Dynamic Symbol Loading from .env
 raw_symbols = os.getenv("TRADING_SYMBOLS") or os.getenv("WATCHLIST") or "XRP/USDT"
 WATCHLIST = [s.strip() for s in raw_symbols.split(",") if s.strip()]
 
@@ -40,7 +39,6 @@ logger = logging.getLogger("main_engine")
 
 execution_engine = LiveExecutionEngine()
 
-
 class HealthCheckHandler(BaseHTTPRequestHandler):
     """Zero-dependency HTTP Handler for Render port health checks."""
     def do_GET(self):
@@ -52,7 +50,6 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         return
 
-
 def run_health_server():
     """Runs a built-in lightweight HTTP health check server on $PORT in a background thread."""
     try:
@@ -61,7 +58,6 @@ def run_health_server():
         server.serve_forever()
     except Exception as e:
         logger.error(f"Failed to start native Health Check HTTP server: {e}")
-
 
 def process_symbol(symbol: str, tm: TradeManager):
     """Fetches data, evaluates strategy, checks open trades, and executes live spot buy orders."""
@@ -77,6 +73,8 @@ def process_symbol(symbol: str, tm: TradeManager):
     current_price = safe_float(latest_candle["close"])
 
     # 2. Process existing open trades for this pair in the Database
+    db_symbol = symbol.replace("/", "").replace("-", "").strip().upper()
+
     conn = get_db_connection()
     if conn:
         try:
@@ -85,9 +83,9 @@ def process_symbol(symbol: str, tm: TradeManager):
                 """
                 SELECT id, pair, direction, entry_price, stop_loss, take_profit, position_size, account_balance, trade_state
                 FROM trade_setups
-                WHERE pair = %s AND trade_state = 'OPEN';
+                WHERE (pair = %s OR pair = %s) AND trade_state = 'OPEN';
                 """,
-                (symbol,),
+                (symbol, db_symbol),
             )
             open_trades = cursor.fetchall()
             cursor.close()
@@ -142,8 +140,8 @@ def process_symbol(symbol: str, tm: TradeManager):
             try:
                 cursor = conn.cursor()
                 cursor.execute(
-                    "SELECT id FROM trade_setups WHERE pair = %s AND trade_state = 'OPEN';",
-                    (symbol,),
+                    "SELECT id FROM trade_setups WHERE (pair = %s OR pair = %s) AND trade_state = 'OPEN';",
+                    (symbol, db_symbol),
                 )
                 existing = cursor.fetchone()
 
@@ -153,7 +151,6 @@ def process_symbol(symbol: str, tm: TradeManager):
                     position_size = details["position_size"]
                     account_balance = details.get("account_balance", 100.0)
 
-                    # Calculate USD execution allocation or unit amount
                     amount_usd = details.get("position_size_usd") or (position_size * safe_float(details["entry_price"]))
 
                     # Execute Live Spot Buy Order
@@ -216,7 +213,6 @@ def process_symbol(symbol: str, tm: TradeManager):
     else:
         logger.info(f"No entry signal for {symbol} ({details})")
 
-
 def main():
     logger.info(f"Starting Live Trading Bot Engine (Spot Mode) | Active Watchlist: {WATCHLIST}...")
     
@@ -247,7 +243,6 @@ def main():
         except Exception as e:
             logger.error(f"Unexpected error in main loop: {e}", exc_info=True)
             time.sleep(15)
-
 
 if __name__ == "__main__":
     main()

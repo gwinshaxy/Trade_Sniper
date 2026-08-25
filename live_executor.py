@@ -10,6 +10,15 @@ DEFAULT_LEVERAGE = 10
 MIN_NOTIONAL = 5.0
 RISK_PER_TRADE_PCT = 0.01
 
+def safe_float(val, default: float = 0.0) -> float:
+    """Safe conversion helper to prevent float(None) errors."""
+    if val is None:
+        return default
+    try:
+        return float(val)
+    except (ValueError, TypeError):
+        return default
+
 def get_account_balance() -> float:
     """Fetches account balance (can be updated to pull live MEXC USDT balance)."""
     return 100.0  
@@ -51,7 +60,6 @@ def execute_signal(symbol: str, direction: str, entry_price: float, atr_val: flo
 
     conn = get_db_connection()
     try:
-        # Changed 'quantity' to 'amount' to match database schema
         query = """
             INSERT INTO trade_setups (pair, direction, entry_price, amount, stop_loss, take_profit, status, trade_state, created_at)
             VALUES (%s, %s, %s, %s, %s, %s, 'EXECUTED', 'OPEN', NOW());
@@ -77,17 +85,62 @@ class LiveExecutionEngine:
         })
         logger.info("LiveExecutionEngine initialized with CCXT MEXC integration.")
 
+    def buy_spot_mexc(self, symbol: str, amount_usd: float) -> dict:
+        """Executes a live spot market buy order on MEXC via CCXT using quote currency amount."""
+        clean_symbol = symbol.replace("-", "/").replace("_", "")
+        if "/" not in clean_symbol and clean_symbol.endswith("USDT"):
+            clean_symbol = f"{clean_symbol[:-4]}/USDT"
+
+        logger.info(f"[{clean_symbol}] Executing Spot Market Buy for ${amount_usd:.2f} USD")
+        
+        try:
+            if not self.api_key or not self.api_secret:
+                logger.warning(f"[{clean_symbol}] MEXC API credentials missing. Running in Simulation/DB-only mode.")
+                ticker = self.exchange.fetch_ticker(clean_symbol) if self.exchange else {"last": 1.0}
+                fill_price = safe_float(ticker.get("last", 1.0))
+                executed_qty = amount_usd / fill_price if fill_price > 0 else 0.0
+                return {
+                    "status": "SUCCESS",
+                    "id": "SIMULATED_SPOT_ORDER",
+                    "fill_price": fill_price,
+                    "executed_qty": executed_qty
+                }
+                
+            # Fetch current ticker to estimate base quantity if required
+            ticker = self.exchange.fetch_ticker(clean_symbol)
+            fill_price = safe_float(ticker.get("last") or ticker.get("close"), 1.0)
+            estimated_qty = amount_usd / fill_price if fill_price > 0 else 0.0
+
+            # Execute unified CCXT market buy order
+            try:
+                # Primary method: Buy using cost/quote currency amount
+                order = self.exchange.create_market_buy_order(clean_symbol, estimated_qty, {'cost': amount_usd})
+            except Exception as inner_e:
+                logger.debug(f"[{clean_symbol}] Primary market buy failed ({inner_e}), trying fallback order placement...")
+                order = self.exchange.create_order(clean_symbol, 'market', 'buy', estimated_qty)
+
+            order_price = safe_float(order.get("price") or order.get("average"), default=fill_price)
+            executed_qty = safe_float(order.get("filled") or order.get("amount"), default=estimated_qty)
+            
+            return {
+                "status": "SUCCESS",
+                "id": str(order.get("id", "EXECUTED")),
+                "fill_price": order_price,
+                "executed_qty": executed_qty
+            }
+        except Exception as e:
+            logger.error(f"[{clean_symbol}] MEXC Spot Buy Execution Failed: {e}")
+            return {"status": "FAILED", "reason": str(e)}
+
     def execute_trade(self, symbol: str, direction: str, entry_price: float, atr_val: float):
         """Standard signal execution route using ATR dynamic risk."""
         execute_signal(symbol, direction, entry_price, atr_val)
 
-    # Inside LiveExecutionEngine class:
     def execute_live_order(self, symbol: str, side: str, amount: float, stop_loss: float = None, take_profit: float = None, entry_price: float = 0.0, risk_pct: float = 1.0):
         """Wrapper method invoked directly by main_trading_engine.py."""
         db_symbol = symbol.replace("/", "").upper()
         logger.info(f"Executing Live Order for {db_symbol}: Side={side}, Amount={amount}, Entry={entry_price}, SL={stop_loss}, TP={take_profit}, Risk%={risk_pct}")
         
-        # Dynamic R:R Calculation
         risk_reward_ratio = 2.0
         if entry_price > 0 and stop_loss and take_profit:
             risk = abs(entry_price - stop_loss)
@@ -95,12 +148,10 @@ class LiveExecutionEngine:
             if risk > 0:
                 risk_reward_ratio = round(reward / risk, 2)
 
-        # Fetch Account Balance
         balance = get_account_balance()
 
         conn = get_db_connection()
         try:
-            # Included both 'amount' and 'position_size' to satisfy schema requirements
             query = """
                 INSERT INTO trade_setups (pair, direction, entry_price, amount, position_size, stop_loss, take_profit, risk_reward_ratio, account_balance, risk_pct, status, trade_state, created_at)
                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'EXECUTED', 'OPEN', NOW());
@@ -113,6 +164,7 @@ class LiveExecutionEngine:
             return {"status": "FAILED", "reason": str(e)}
         finally:
             release_db_connection(conn)
+
     def close_live_position_mexc(self, symbol: str, position_side: str = "BOTH"):
         """Wrapper method invoked directly by main_trading_engine.py for position closes."""
         raw_symbol = symbol.upper()
@@ -121,8 +173,6 @@ class LiveExecutionEngine:
         
         conn = get_db_connection()
         try:
-            # Updates trade_state, status, and records the exact closing timestamp
-            # Handles both slash and non-slash pair variations stored in trade_setups
             query = """
                 UPDATE trade_setups
                 SET trade_state = 'CLOSED', status = 'CLOSED', closed_at = NOW()
