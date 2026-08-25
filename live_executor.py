@@ -3,7 +3,6 @@ import logging
 import ccxt
 from common import get_db_connection, execute_query, release_db_connection
 
-# Initialize Module Logger
 logger = logging.getLogger("live_executor")
 
 DEFAULT_LEVERAGE = 10
@@ -11,7 +10,6 @@ MIN_NOTIONAL = 5.0
 RISK_PER_TRADE_PCT = 0.01
 
 def safe_float(val, default: float = 0.0) -> float:
-    """Safe conversion helper to prevent float(None) errors."""
     if val is None:
         return default
     try:
@@ -20,12 +18,13 @@ def safe_float(val, default: float = 0.0) -> float:
         return default
 
 def get_account_balance() -> float:
-    """Fetches account balance (can be updated to pull live MEXC USDT balance)."""
-    return 100.0  
+    return float(os.getenv("ACCOUNT_BALANCE", 100.0))  
 
-def calculate_position_size(entry_price: float, atr_val: float, leverage: int = DEFAULT_LEVERAGE) -> float:
+def calculate_position_size(entry_price: float, atr_val: float, leverage: int = DEFAULT_LEVERAGE, max_trade_pct: float = 0.25) -> float:
     account_balance = get_account_balance()
-    risk_usd = account_balance * RISK_PER_TRADE_PCT
+    # Limit maximum notional per asset to its assigned percentage of total wallet
+    effective_slot_balance = account_balance * max_trade_pct
+    risk_usd = effective_slot_balance * RISK_PER_TRADE_PCT
     
     stop_distance = atr_val * 1.5 if atr_val > 0 else entry_price * 0.02
     if stop_distance == 0:
@@ -34,7 +33,7 @@ def calculate_position_size(entry_price: float, atr_val: float, leverage: int = 
     raw_qty = risk_usd / stop_distance
     notional_usd = raw_qty * entry_price
     
-    max_notional_allowed = account_balance * leverage * 0.95
+    max_notional_allowed = effective_slot_balance * leverage * 0.95
     if notional_usd > max_notional_allowed:
         notional_usd = max_notional_allowed
         raw_qty = notional_usd / entry_price
@@ -72,7 +71,7 @@ def execute_signal(symbol: str, direction: str, entry_price: float, atr_val: flo
         release_db_connection(conn)
 
 class LiveExecutionEngine:
-    """Execution engine class expected by main_trading_engine.py and ws_monitor.py"""
+    """Execution engine with robust multi-symbol format database settlement."""
     def __init__(self):
         self.api_key = os.getenv("MEXC_API_KEY", "")
         self.api_secret = os.getenv("MEXC_SECRET_KEY", "")
@@ -85,8 +84,16 @@ class LiveExecutionEngine:
         })
         logger.info("LiveExecutionEngine initialized with CCXT MEXC integration.")
 
+    def format_precision_amount(self, symbol: str, amount: float) -> float:
+        """Safely rounds order quantity using exchange market precision or standard rounding."""
+        try:
+            if self.exchange.markets and symbol in self.exchange.markets:
+                return float(self.exchange.amount_to_precision(symbol, amount))
+        except Exception as e:
+            logger.debug(f"[{symbol}] Precision formatting fallback triggered: {e}")
+        return round(amount, 4)
+
     def buy_spot_mexc(self, symbol: str, amount_usd: float) -> dict:
-        """Executes a live spot market buy order on MEXC via CCXT using quote currency amount."""
         clean_symbol = symbol.replace("-", "/").replace("_", "")
         if "/" not in clean_symbol and clean_symbol.endswith("USDT"):
             clean_symbol = f"{clean_symbol[:-4]}/USDT"
@@ -95,10 +102,10 @@ class LiveExecutionEngine:
         
         try:
             if not self.api_key or not self.api_secret:
-                logger.warning(f"[{clean_symbol}] MEXC API credentials missing. Running in Simulation/DB-only mode.")
+                logger.warning(f"[{clean_symbol}] MEXC API credentials missing. Running in Simulation mode.")
                 ticker = self.exchange.fetch_ticker(clean_symbol) if self.exchange else {"last": 1.0}
                 fill_price = safe_float(ticker.get("last", 1.0))
-                executed_qty = amount_usd / fill_price if fill_price > 0 else 0.0
+                executed_qty = self.format_precision_amount(clean_symbol, amount_usd / fill_price) if fill_price > 0 else 0.0
                 return {
                     "status": "SUCCESS",
                     "id": "SIMULATED_SPOT_ORDER",
@@ -106,14 +113,11 @@ class LiveExecutionEngine:
                     "executed_qty": executed_qty
                 }
                 
-            # Fetch current ticker to estimate base quantity if required
             ticker = self.exchange.fetch_ticker(clean_symbol)
             fill_price = safe_float(ticker.get("last") or ticker.get("close"), 1.0)
-            estimated_qty = amount_usd / fill_price if fill_price > 0 else 0.0
+            estimated_qty = self.format_precision_amount(clean_symbol, amount_usd / fill_price) if fill_price > 0 else 0.0
 
-            # Execute unified CCXT market buy order
             try:
-                # Primary method: Buy using cost/quote currency amount
                 order = self.exchange.create_market_buy_order(clean_symbol, estimated_qty, {'cost': amount_usd})
             except Exception as inner_e:
                 logger.debug(f"[{clean_symbol}] Primary market buy failed ({inner_e}), trying fallback order placement...")
@@ -132,57 +136,110 @@ class LiveExecutionEngine:
             logger.error(f"[{clean_symbol}] MEXC Spot Buy Execution Failed: {e}")
             return {"status": "FAILED", "reason": str(e)}
 
-    def execute_trade(self, symbol: str, direction: str, entry_price: float, atr_val: float):
-        """Standard signal execution route using ATR dynamic risk."""
-        execute_signal(symbol, direction, entry_price, atr_val)
+    def sell_spot_mexc(self, symbol: str, amount: float) -> dict:
+        clean_symbol = symbol.replace("-", "/").replace("_", "")
+        if "/" not in clean_symbol and clean_symbol.endswith("USDT"):
+            clean_symbol = f"{clean_symbol[:-4]}/USDT"
 
-    def execute_live_order(self, symbol: str, side: str, amount: float, stop_loss: float = None, take_profit: float = None, entry_price: float = 0.0, risk_pct: float = 1.0):
-        """Wrapper method invoked directly by main_trading_engine.py."""
-        db_symbol = symbol.replace("/", "").upper()
-        logger.info(f"Executing Live Order for {db_symbol}: Side={side}, Amount={amount}, Entry={entry_price}, SL={stop_loss}, TP={take_profit}, Risk%={risk_pct}")
+        formatted_amount = self.format_precision_amount(clean_symbol, amount)
+        logger.info(f"[{clean_symbol}] Executing Spot Market Sell for {formatted_amount} units")
         
-        risk_reward_ratio = 2.0
-        if entry_price > 0 and stop_loss and take_profit:
-            risk = abs(entry_price - stop_loss)
-            reward = abs(take_profit - entry_price)
-            if risk > 0:
-                risk_reward_ratio = round(reward / risk, 2)
+        try:
+            if not self.api_key or not self.api_secret:
+                logger.warning(f"[{clean_symbol}] MEXC API credentials missing. Running in Simulation Exit mode.")
+                ticker = self.exchange.fetch_ticker(clean_symbol) if self.exchange else {"last": 1.0}
+                fill_price = safe_float(ticker.get("last", 1.0))
+                return {
+                    "status": "SUCCESS",
+                    "id": "SIMULATED_SPOT_SELL_ORDER",
+                    "fill_price": fill_price,
+                    "executed_qty": formatted_amount
+                }
+                
+            order = self.exchange.create_market_sell_order(clean_symbol, formatted_amount)
+            order_price = safe_float(order.get("price") or order.get("average"), default=0.0)
+            executed_qty = safe_float(order.get("filled") or order.get("amount"), default=formatted_amount)
+            
+            return {
+                "status": "SUCCESS",
+                "id": str(order.get("id", "CLOSED")),
+                "fill_price": order_price,
+                "executed_qty": executed_qty
+            }
+        except Exception as e:
+            logger.error(f"[{clean_symbol}] MEXC Spot Sell Execution Failed: {e}")
+            return {"status": "FAILED", "reason": str(e)}
 
-        balance = get_account_balance()
+    def close_live_position_mexc(self, symbol: str, position_size: float = None, current_price: float = None, outcome: str = None):
+        """Executes exchange market sell order and updates DB state, exit price, and PnL metrics to CLOSED."""
+        raw_symbol = symbol.upper().strip()
+        entry_price = 0.0
+        
+        # 1. Fetch open position details from DB if missing
+        conn = get_db_connection()
+        if conn:
+            try:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "SELECT position_size, entry_price FROM trade_setups WHERE pair IN (%s, %s) AND trade_state = 'OPEN';",
+                    (raw_symbol, raw_symbol.replace("/", ""))
+                )
+                res = cursor.fetchone()
+                if res:
+                    if position_size is None or position_size <= 0:
+                        position_size = safe_float(res[0])
+                    entry_price = safe_float(res[1])
+                cursor.close()
+            finally:
+                release_db_connection(conn)
+
+        # 2. Place spot market sell order on MEXC
+        exit_price = current_price or 0.0
+        if position_size and position_size > 0:
+            logger.info(f"[{raw_symbol}] Initiating exchange spot sell for {position_size} units...")
+            sell_res = self.sell_spot_mexc(symbol=raw_symbol, amount=position_size)
+            if sell_res.get("status") != "SUCCESS":
+                logger.error(f"[{raw_symbol}] Market sell failed on exchange: {sell_res.get('reason')}")
+                return {"status": "FAILED", "reason": sell_res.get("reason")}
+            
+            if sell_res.get("fill_price") and sell_res["fill_price"] > 0:
+                exit_price = sell_res["fill_price"]
+
+        # 3. Calculate PnL Metrics
+        pnl_usd = 0.0
+        pnl_pct = 0.0
+        if entry_price > 0 and exit_price > 0 and position_size > 0:
+            pnl_usd = (exit_price - entry_price) * position_size
+            pnl_pct = ((exit_price - entry_price) / entry_price) * 100
+
+        # 4. Update DB record state with exit logging
+        clean_symbol = raw_symbol.replace("/", "").replace("-", "")
+        formatted_slash = f"{clean_symbol[:-4]}/{clean_symbol[-4:]}" if clean_symbol.endswith("USDT") else raw_symbol
 
         conn = get_db_connection()
-        try:
-            query = """
-                INSERT INTO trade_setups (pair, direction, entry_price, amount, position_size, stop_loss, take_profit, risk_reward_ratio, account_balance, risk_pct, status, trade_state, created_at)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'EXECUTED', 'OPEN', NOW());
-            """
-            execute_query(conn, query, (db_symbol, side.upper(), entry_price, amount, amount, stop_loss, take_profit, risk_reward_ratio, balance, risk_pct))
-            logger.info(f"[{db_symbol}] Live order successfully logged with amount/position_size={amount}.")
-            return {"status": "SUCCESS", "pair": db_symbol}
-        except Exception as e:
-            logger.error(f"[{db_symbol}] Failed to execute live order: {e}")
-            return {"status": "FAILED", "reason": str(e)}
-        finally:
-            release_db_connection(conn)
-
-    def close_live_position_mexc(self, symbol: str, position_side: str = "BOTH"):
-        """Wrapper method invoked directly by main_trading_engine.py for position closes."""
-        raw_symbol = symbol.upper()
-        clean_symbol = raw_symbol.replace("/", "")
-        logger.info(f"Closing Live Position for {raw_symbol} / {clean_symbol} (Side: {position_side})")
-        
-        conn = get_db_connection()
-        try:
-            query = """
-                UPDATE trade_setups
-                SET trade_state = 'CLOSED', status = 'CLOSED', closed_at = NOW()
-                WHERE (pair = %s OR pair = %s) AND trade_state = 'OPEN';
-            """
-            execute_query(conn, query, (raw_symbol, clean_symbol))
-            logger.info(f"[{clean_symbol}] Position successfully closed in trade_setups.")
-            return {"status": "SUCCESS"}
-        except Exception as e:
-            logger.error(f"[{clean_symbol}] Failed to close position: {e}")
-            return {"status": "FAILED", "reason": str(e)}
-        finally:
-            release_db_connection(conn)
+        if conn:
+            try:
+                cursor = conn.cursor()
+                query = """
+                    UPDATE trade_setups
+                    SET trade_state = 'CLOSED', 
+                        status = 'CLOSED', 
+                        closed_at = NOW(),
+                        exit_price = %s,
+                        pnl_usd = %s,
+                        pnl_pct = %s,
+                        outcome = %s
+                    WHERE (pair = %s OR pair = %s OR pair = %s) AND trade_state = 'OPEN';
+                """
+                cursor.execute(query, (exit_price, pnl_usd, pnl_pct, outcome or "CLOSED", raw_symbol, clean_symbol, formatted_slash))
+                conn.commit()
+                cursor.close()
+                logger.info(f"[{raw_symbol}] Position successfully updated to CLOSED in DB. PnL: ${pnl_usd:.2f} ({pnl_pct:.2f}%)")
+                return {"status": "SUCCESS", "exit_price": exit_price, "pnl_usd": pnl_usd, "pnl_pct": pnl_pct}
+            except Exception as e:
+                conn.rollback()
+                logger.error(f"[{raw_symbol}] Failed to close position in DB: {e}")
+                return {"status": "FAILED", "reason": str(e)}
+            finally:
+                release_db_connection(conn)
+        return {"status": "FAILED", "reason": "No DB connection"}

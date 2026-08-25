@@ -318,17 +318,22 @@ def evaluate_signals(
     if long_cond:
         stop_loss = c_price - (1.5 * atr_val)
         take_profit = c_price + (3.0 * atr_val)
-        risk_usd = account_balance * (risk_pct / 100.0)
+
+        # Compute position sizing based on dedicated slot budget rather than full account balance
+        slot_balance = kwargs.get("allocated_slot_usd", account_balance * 0.25)
+        risk_usd = slot_balance * (risk_pct / 100.0)
+
         stop_dist = abs(c_price - stop_loss)
         pos_size = (risk_usd / stop_dist) if stop_dist > 0 else 0.0
+        position_size_usd = min(pos_size * c_price, slot_balance)  # Hard cap at dedicated slot size
 
         return "BUY", {
             "entry_price": c_price,
             "stop_loss": stop_loss,
             "take_profit": take_profit,
-            "position_size": pos_size,
-            "position_size_usd": pos_size * c_price,
-            "account_balance": account_balance
+            "position_size": position_size_usd / c_price if c_price > 0 else 0.0,
+            "position_size_usd": position_size_usd,
+            "account_balance": slot_balance
         }
 
     return "HOLD", "No signal threshold triggered"

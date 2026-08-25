@@ -27,6 +27,11 @@ POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", "60"))
 ACCOUNT_RISK_PCT = float(os.getenv("ACCOUNT_RISK_PCT", "1.0"))
 PORT = int(os.getenv("PORT", 10000))
 
+# Maximum concurrent open trades across all watchlist pairs
+MAX_CONCURRENT_TRADES = 4  
+# Max fraction of total balance per trade slot (25%)
+MAX_ALLOCATION_PER_TRADE = 0.25 
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -106,25 +111,70 @@ def process_symbol(symbol: str, tm: TradeManager):
                 )
 
                 action_result = tm.process_trade(trade_series, latest_candle)
-                if action_result.get("action") in ["CLOSE_SL", "CLOSE_TP"]:
+                action = action_result.get("action")
+                
+                if action in ["CLOSE_SL", "CLOSE_TP"]:
                     logger.info(
-                        f"Trade #{trade_series['id']} condition met via {action_result['action']} at ${current_price:.5f}"
+                        f"Trade #{trade_series['id']} condition met via {action} at ${current_price:.5f}. Triggering Exchange & DB update..."
                     )
+                    close_res = execution_engine.close_live_position_mexc(
+                        symbol=symbol, 
+                        position_size=trade_series['position_size'],
+                        current_price=current_price,
+                        outcome=action
+                    )
+                    
+                    if close_res.get("status") == "SUCCESS":
+                        pnl_usd = close_res.get("pnl_usd", 0.0)
+                        pnl_pct = close_res.get("pnl_pct", 0.0)
+                        send_telegram_notification(
+                            f"<b>🔴 LIVE SPOT POSITION CLOSED ({action})</b>\n\n"
+                            f"<b>Trade ID:</b> <code>#{trade_series['id']}</code>\n"
+                            f"<b>Pair:</b> <code>{symbol}</code>\n"
+                            f"<b>Exit Price:</b> ${close_res.get('exit_price', current_price):.5f}\n"
+                            f"<b>PnL USD:</b> ${pnl_usd:.2f}\n"
+                            f"<b>PnL Return:</b> {pnl_pct:.2f}%"
+                        )
+
         except Exception as e:
             logger.error(f"Error querying/updating open trades for {symbol}: {e}")
         finally:
             release_db_connection(conn)
 
-    # 3. Check Daily Circuit Breaker before opening new trades
-    if check_daily_circuit_breaker(max_loss_pct=3.0, account_balance=100.0):
+    # 3. Check Global Active Portfolio Allocation & Concurrency Limits
+    total_balance = float(os.getenv("ACCOUNT_BALANCE", 100.0))
+    allocated_slot_usd = total_balance * MAX_ALLOCATION_PER_TRADE
+
+    conn = get_db_connection()
+    if conn:
+        try:
+            cursor = conn.cursor()
+            cursor.execute("SELECT COUNT(*), COALESCE(SUM(account_balance), 0) FROM trade_setups WHERE trade_state = 'OPEN';")
+            open_count, total_allocated = cursor.fetchone()
+            cursor.close()
+
+            if open_count >= MAX_CONCURRENT_TRADES:
+                logger.info(f"Skipping {symbol}: Maximum concurrent open trade limit ({MAX_CONCURRENT_TRADES}) reached.")
+                return
+        except Exception as e:
+            logger.error(f"Error checking portfolio allocation limit: {e}")
+        finally:
+            release_db_connection(conn)
+
+    # 4. Check Daily Circuit Breaker before opening new trades
+    if check_daily_circuit_breaker(max_loss_pct=3.0, account_balance=total_balance):
         logger.warning(
             f"Daily Circuit Breaker triggered (Max daily loss limit hit). Skipping new signal checks for {symbol}."
         )
         return
 
-    # 4. Evaluate Strategy Signals for New Trade Entries
+    # 5. Evaluate Strategy Signals for New Trade Entries
     signal, details = evaluate_signals(
-        df, symbol=symbol, risk_pct=ACCOUNT_RISK_PCT
+        df, 
+        symbol=symbol, 
+        risk_pct=ACCOUNT_RISK_PCT,
+        account_balance=total_balance,
+        allocated_slot_usd=allocated_slot_usd
     )
 
     if signal in ["BUY", "SELL"] and isinstance(details, dict):
@@ -149,7 +199,7 @@ def process_symbol(symbol: str, tm: TradeManager):
                     target_stop_loss = details["stop_loss"]
                     target_take_profit = details["take_profit"]
                     position_size = details["position_size"]
-                    account_balance = details.get("account_balance", 100.0)
+                    account_balance = details.get("account_balance", allocated_slot_usd)
 
                     amount_usd = details.get("position_size_usd") or (position_size * safe_float(details["entry_price"]))
 
@@ -195,7 +245,8 @@ def process_symbol(symbol: str, tm: TradeManager):
                             f"<b>Fill Price:</b> ${actual_entry:.5f}\n"
                             f"<b>Stop Loss:</b> ${target_stop_loss:.5f}\n"
                             f"<b>Take Profit:</b> ${target_take_profit:.5f}\n"
-                            f"<b>Quantity:</b> {actual_qty:.4f} units"
+                            f"<b>Quantity:</b> {actual_qty:.4f} units\n"
+                            f"<b>Slot Margin:</b> ${account_balance:.2f} USD"
                         )
                     else:
                         logger.error(f"Live Spot Order Execution failed for {symbol}: {order_res}")
