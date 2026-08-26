@@ -14,6 +14,16 @@ from dotenv import load_dotenv
 
 load_dotenv(override=True)
 
+# --- Asset Links Intercept for TWA Verification ---
+query_params = st.query_params
+if "assetlinks" in query_params or st.context.headers.get("Path") == "/.well-known/assetlinks.json":
+    try:
+        with open(".well-known/assetlinks.json") as f:
+            st.json(json.load(f))
+    except Exception as e:
+        st.error(f"Error reading assetlinks.json: {e}")
+    st.stop()
+
 from lightweight_charts.widgets import StreamlitChart
 
 # Page configuration MUST be the first Streamlit command executed
