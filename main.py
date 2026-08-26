@@ -1,8 +1,6 @@
 import os
 import time
 import logging
-import threading
-from http.server import HTTPServer, BaseHTTPRequestHandler
 import pandas as pd
 from dotenv import load_dotenv
 
@@ -13,7 +11,7 @@ from common import (
     check_daily_circuit_breaker,
     send_telegram_notification,
 )
-from live_executor import LiveExecutionEngine
+from live_executor import LiveExecutionEngine, MEXCLiveExecutor
 from strategy import fetch_klines, evaluate_signals, safe_float
 from trade_manager import TradeManager
 
@@ -25,7 +23,9 @@ WATCHLIST = [s.strip() for s in raw_symbols.split(",") if s.strip()]
 TIMEFRAME = os.getenv("TIMEFRAME", "1h")
 POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", "60"))
 ACCOUNT_RISK_PCT = float(os.getenv("ACCOUNT_RISK_PCT", "1.0"))
-PORT = int(os.getenv("PORT", 10000))
+
+MEXC_API_KEY = os.getenv("MEXC_API_KEY", "")
+MEXC_SECRET_KEY = os.getenv("MEXC_SECRET_KEY", "")
 
 # Maximum concurrent open trades across all watchlist pairs
 MAX_CONCURRENT_TRADES = 4  
@@ -42,27 +42,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger("main_engine")
 
-execution_engine = LiveExecutionEngine()
-
-class HealthCheckHandler(BaseHTTPRequestHandler):
-    """Zero-dependency HTTP Handler for Render port health checks."""
-    def do_GET(self):
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.end_headers()
-        self.wfile.write(b'{"status": "healthy", "service": "Trading Bot Engine"}')
-
-    def log_message(self, format, *args):
-        return
-
-def run_health_server():
-    """Runs a built-in lightweight HTTP health check server on $PORT in a background thread."""
-    try:
-        server = HTTPServer(("0.0.0.0", PORT), HealthCheckHandler)
-        logger.info(f"Starting native background Health Check server on port {PORT}...")
-        server.serve_forever()
-    except Exception as e:
-        logger.error(f"Failed to start native Health Check HTTP server: {e}")
+# Safely initialize the engine with API keys from environment
+execution_engine = LiveExecutionEngine(api_key=MEXC_API_KEY, secret_key=MEXC_SECRET_KEY)
 
 def process_symbol(symbol: str, tm: TradeManager):
     """Fetches data, evaluates strategy, checks open trades, and executes live spot buy orders."""
@@ -272,9 +253,6 @@ def process_symbol(symbol: str, tm: TradeManager):
 
 def main():
     logger.info(f"Starting Live Trading Bot Engine (Spot Mode) | Active Watchlist: {WATCHLIST}...")
-    
-    health_thread = threading.Thread(target=run_health_server, daemon=True)
-    health_thread.start()
 
     ensure_schema_updated()
     tm = TradeManager()

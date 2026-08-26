@@ -15,7 +15,7 @@ def safe_float(val, default=0.0):
 
 
 class MEXCLiveExecutor:
-    def __init__(self, api_key: str, secret_key: str, testnet: bool = False):
+    def __init__(self, api_key: str = "", secret_key: str = "", testnet: bool = False):
         self.exchange = ccxt.mexc({
             'apiKey': api_key,
             'secret': secret_key,
@@ -49,23 +49,17 @@ class MEXCLiveExecutor:
         to capture the true average fill price and executed quantity.
         """
         clean_symbol = symbol.replace("/", "").upper()
-        if "/" not in symbol:
-            # Reconstruct standard CCXT symbol format if passed without slash (e.g. BTCUSDT -> BTC/USDT)
-            if clean_symbol.endswith("USDT"):
-                symbol = f"{clean_symbol[:-4]}/USDT"
+        if "/" not in symbol and clean_symbol.endswith("USDT"):
+            symbol = f"{clean_symbol[:-4]}/USDT"
 
-        # Step 1: Pre-execution ticker snapshot
         current_ticker_price = self.fetch_ticker_price(symbol)
         if current_ticker_price <= 0:
-            return {"success": False, "error": "Invalid ticker price before execution"}
+            return {"status": "FAILED", "error": "Invalid ticker price before execution"}
 
         estimated_qty = amount_usd / current_ticker_price
-
         logger.info(f"[{symbol}] Initiating Market Buy: ${amount_usd:.2f} (~{estimated_qty:.4f} units @ ~{current_ticker_price})")
 
         try:
-            # Step 2: Place Spot Market Order
-            # For MEXC Spot market buy, CCXT uses cost (quote currency) or amount (base currency)
             order = self.exchange.create_market_buy_order(
                 symbol=symbol,
                 amount=estimated_qty,
@@ -73,14 +67,11 @@ class MEXCLiveExecutor:
             )
 
             order_id = order.get("id")
-            
-            # Step 3: Handle execution price resolution
             fill_price = safe_float(order.get("average") or order.get("price"))
             executed_qty = safe_float(order.get("filled") or order.get("amount"))
 
-            # If the immediate order response lacks execution details (common in CCXT market orders)
             if (fill_price <= 0 or executed_qty <= 0) and order_id:
-                time.sleep(0.4)  # Short pause for order book match settlement
+                time.sleep(0.4)
                 try:
                     fetched_order = self.exchange.fetch_order(order_id, symbol)
                     fill_price = safe_float(fetched_order.get("average") or fetched_order.get("price"))
@@ -88,9 +79,8 @@ class MEXCLiveExecutor:
                 except Exception as fetch_err:
                     logger.warning(f"[{symbol}] Failed post-execution order lookup: {fetch_err}")
 
-            # Step 4: Fallback to ticker if fill_price still unpopulated
             if fill_price <= 0:
-                logger.warning(f"[{symbol}] Order response missing fill price. Falling back to immediate post-trade ticker.")
+                logger.warning(f"[{symbol}] Order response missing fill price. Falling back to ticker.")
                 fill_price = self.fetch_ticker_price(symbol) or current_ticker_price
 
             if executed_qty <= 0:
@@ -99,7 +89,7 @@ class MEXCLiveExecutor:
             logger.info(f"[{symbol}] Market Buy Executed successfully. Fill Price: {fill_price:.6f}, Qty: {executed_qty:.4f}")
 
             return {
-                "success": True,
+                "status": "SUCCESS",
                 "order_id": order_id,
                 "fill_price": fill_price,
                 "executed_qty": executed_qty,
@@ -109,7 +99,35 @@ class MEXCLiveExecutor:
 
         except Exception as e:
             logger.error(f"[{symbol}] MEXC Market Buy Failed: {e}")
-            return {"success": False, "error": str(e)}
+            return {"status": "FAILED", "error": str(e)}
+
+    def close_live_position_mexc(self, symbol: str, position_size: float, current_price: float, outcome: str = "CLOSE") -> dict:
+        """Executes a Spot Market Sell order to close an active long position."""
+        clean_symbol = symbol.replace("/", "").upper()
+        if "/" not in symbol and clean_symbol.endswith("USDT"):
+            symbol = f"{clean_symbol[:-4]}/USDT"
+
+        logger.info(f"[{symbol}] Closing Spot Position ({outcome}): Selling {position_size:.4f} units...")
+
+        try:
+            order = self.exchange.create_market_sell_order(
+                symbol=symbol,
+                amount=position_size
+            )
+            order_id = order.get("id")
+            exit_price = safe_float(order.get("average") or order.get("price")) or current_price
+
+            return {
+                "status": "SUCCESS",
+                "order_id": order_id,
+                "exit_price": exit_price,
+                "pnl_usd": 0.0,
+                "pnl_pct": 0.0,
+                "raw_order": order
+            }
+        except Exception as e:
+            logger.error(f"[{symbol}] Failed to execute Spot Market Sell: {e}")
+            return {"status": "FAILED", "error": str(e)}
 
     def calculate_dynamic_stop_loss(
         self, 
@@ -119,16 +137,11 @@ class MEXCLiveExecutor:
         risk_reward_ratio: float = 2.0,
         min_sl_pct: float = 0.008
     ) -> tuple[float, float]:
-        """
-        Calculates Stop Loss and Take Profit levels dynamically anchored to 
-        the ACTUAL filled market price to prevent immediate stop-outs.
-        """
         if entry_price <= 0:
             raise ValueError("Entry price must be greater than 0")
 
-        # Fallback to percentage-based distance if ATR is invalid or missing
         if atr_val <= 0:
-            sl_distance = entry_price * max(0.015, min_sl_pct)  # Default 1.5% minimum
+            sl_distance = entry_price * max(0.015, min_sl_pct)
         else:
             sl_distance = max(atr_val * 1.5, entry_price * min_sl_pct)
 
@@ -142,3 +155,6 @@ class MEXCLiveExecutor:
             take_profit = entry_price - tp_distance
 
         return round(stop_loss, 6), round(take_profit, 6)
+
+# Backwards-compatibility Alias
+LiveExecutionEngine = MEXCLiveExecutor
