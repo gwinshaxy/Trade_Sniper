@@ -1,7 +1,6 @@
 import os
 import sys
 import json
-import urllib.parse
 import logging
 import subprocess
 import psutil
@@ -15,74 +14,7 @@ load_dotenv(override=True)
 
 from lightweight_charts.widgets import StreamlitChart
 
-# Page configuration MUST be the first Streamlit command executed
 st.set_page_config(page_title="MEXC Trading Terminal", layout="wide")
-
-# Encode and Inject Dynamic Data URI PWA Manifest & Metadata
-manifest_data = {
-    "name": "TradeSniper Terminal",
-    "short_name": "TradeSniper",
-    "description": "MEXC Algorithmic Trading Terminal",
-    "start_url": "/",
-    "display": "standalone",
-    "background_color": "#0e1117",
-    "theme_color": "#0e1117",
-    "icons": [
-        {
-            "src": "https://raw.githubusercontent.com/gwinshaxy/Trade_Sniper/main/icon-192.png",
-            "sizes": "192x192",
-            "type": "image/png"
-        },
-        {
-            "src": "https://raw.githubusercontent.com/gwinshaxy/Trade_Sniper/main/icon-512.png",
-            "sizes": "512x512",
-            "type": "image/png"
-        }
-    ]
-}
-
-manifest_json = json.dumps(manifest_data)
-encoded_manifest = urllib.parse.quote(manifest_json)
-manifest_uri = f"data:application/manifest+json;charset=utf-8,{encoded_manifest}"
-
-st.markdown(
-    f"""
-    <link rel="manifest" href="{manifest_uri}">
-    <meta name="theme-color" content="#0e1117">
-    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
-    <meta name="mobile-web-app-capable" content="yes">
-    <meta name="apple-mobile-web-app-capable" content="yes">
-    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-    <meta name="apple-mobile-web-app-title" content="TradeSniper">
-    """,
-    unsafe_allow_html=True
-)
-
-# Inject Blob-Based Service Worker Registration
-st.markdown(
-    """
-    <script>
-    if ('serviceWorker' in navigator) {
-      window.addEventListener('load', function() {
-        const swCode = `
-          self.addEventListener('install', e => self.skipWaiting());
-          self.addEventListener('activate', e => e.waitUntil(clients.claim()));
-          self.addEventListener('fetch', e => {
-            e.respondWith(fetch(e.request).catch(() => new Response('Offline')));
-          });
-        `;
-        const blob = new Blob([swCode], { type: 'application/javascript' });
-        const blobURL = URL.createObjectURL(blob);
-        
-        navigator.serviceWorker.register(blobURL)
-          .then(reg => console.log('PWA ServiceWorker registered successfully via Blob'))
-          .catch(err => console.error('ServiceWorker registration failed:', err));
-      });
-    }
-    </script>
-    """,
-    unsafe_allow_html=True
-)
 
 HTTP_PROXY = os.getenv("HTTP_PROXY") or os.getenv("PROXY_URL")
 HTTPS_PROXY = os.getenv("HTTPS_PROXY") or os.getenv("PROXY_URL")
@@ -192,11 +124,14 @@ for default_pair in ["XRP/USDT"]:
 
 st.sidebar.subheader("🎛️ Terminal Controls & Tuning")
 
+# 1. Active Execution / Config Pair
 config_target_pair = st.sidebar.selectbox("Active Execution / Config Pair", available_pairs, index=0)
 
+# Normalize key string for consistent strategy dict loading & widget session keys
 pair_key = config_target_pair.replace("/", "")
 dyn_cfg = strategy.load_symbol_config(config_target_pair)
 
+# 2. Attach pair-specific keys to widgets so values re-initialize dynamically on pair switch
 lookback_bars = st.sidebar.number_input("Lookback Bars (Range)", value=600, min_value=100, max_value=1000, step=50, key=f"lookback_{pair_key}")
 
 tema_period = st.sidebar.number_input(
@@ -363,37 +298,34 @@ if df_ohlc is not None and not df_ohlc.empty:
     try:
         df_ohlc = df_ohlc.copy()
 
+        # Re-index datetime index or normalize timestamp column name
         if isinstance(df_ohlc.index, pd.DatetimeIndex):
             df_ohlc = df_ohlc.reset_index()
             df_ohlc.rename(columns={df_ohlc.columns[0]: 'time'}, inplace=True)
         elif 'timestamp' in df_ohlc.columns and 'time' not in df_ohlc.columns:
             df_ohlc.rename(columns={'timestamp': 'time'}, inplace=True)
 
+        # Deduplicate column names
         df_ohlc = df_ohlc.loc[:, ~df_ohlc.columns.duplicated()].copy()
+
+        # Parse time column as datetime pandas series safely
         df_ohlc['time'] = pd.to_datetime(df_ohlc['time'], errors='coerce')
         df_ohlc = df_ohlc.dropna(subset=['time'])
 
+        # Ensure numeric OHLCV types
         for col in ['open', 'high', 'low', 'close', 'volume']:
             if col in df_ohlc.columns:
                 df_ohlc[col] = pd.to_numeric(df_ohlc[col], errors='coerce')
 
         df_ohlc['tema_custom'] = strategy.calc_tema(df_ohlc['close'], period=min(tema_period, len(df_ohlc)))
         
-        # Defensive calls to compute volume profile
-        if hasattr(strategy, 'compute_volume_profile'):
-            poc, vah, val = strategy.compute_volume_profile(df_ohlc, num_bins=100, lookback_bars=lookback_bars, va_pct=0.70)
-        else:
-            poc, vah, val = None, None, None
+        poc, vah, val = strategy.compute_volume_profile(df_ohlc, num_bins=100, lookback_bars=lookback_bars, va_pct=0.70)
+        detected_gaps = strategy.calculate_volume_profile_gaps(df_ohlc, num_bins=100, lookback_bars=lookback_bars, detection_pct=node_detection_pct)
 
-        if hasattr(strategy, 'calculate_volume_profile_gaps'):
-            detected_gaps = strategy.calculate_volume_profile_gaps(df_ohlc, num_bins=100, lookback_bars=lookback_bars, detection_pct=node_detection_pct)
-        else:
-            detected_gaps = []
-
-        # Extract min/max bounds with a minor safety buffer
         min_chart_p = float(df_ohlc['low'].min())
         max_chart_p = float(df_ohlc['high'].max())
 
+        # Format string time depending on daily vs intraday resolution
         df_chart = df_ohlc.copy()
         if selected_timeframe in ['1d']:
             df_chart['time'] = df_chart['time'].dt.strftime('%Y-%m-%d')
@@ -406,6 +338,7 @@ if df_ohlc is not None and not df_ohlc.empty:
         chart.layout(background_color='#131722', text_color='#d1d4dc')
         chart.volume_config(scale_margin_top=0.85, scale_margin_bottom=0.0, up_color='#26a69a', down_color='#ef5350')
         
+        # Pass standardized dataframe into chart
         ohlcv_data = df_chart[['time', 'open', 'high', 'low', 'close', 'volume']].dropna()
         chart.set(ohlcv_data)
 
@@ -415,20 +348,16 @@ if df_ohlc is not None and not df_ohlc.empty:
             tema_line = chart.create_line(name=line_name, color="orange", width=2)
             tema_line.set(tema_df)
 
-        # --- Volume Profile Levels (VAH, VAL, POC) ---
-        if pd.notnull(vah) and not np.isnan(vah):
+        if pd.notnull(vah) and min_chart_p <= float(vah) <= max_chart_p:
             chart.horizontal_line(float(vah), color="#2962ff", style="solid", width=2, text=f"VAH: {vah:.2f}")
-
-        if pd.notnull(val) and not np.isnan(val):
+        if pd.notnull(val) and min_chart_p <= float(val) <= max_chart_p:
             chart.horizontal_line(float(val), color="#2962ff", style="solid", width=2, text=f"VAL: {val:.2f}")
-
-        if pd.notnull(poc) and not np.isnan(poc):
+        if pd.notnull(poc) and min_chart_p <= float(poc) <= max_chart_p:
             chart.horizontal_line(float(poc), color="#f44336", style="solid", width=2, text=f"POC: {poc:.2f}")
 
-        # --- Volume Profile Gaps Overlay ---
         if overlay_gaps and detected_gaps:
             for gap_price in detected_gaps:
-                if pd.notnull(gap_price) and not np.isnan(gap_price):
+                if pd.notnull(gap_price) and min_chart_p <= float(gap_price) <= max_chart_p:
                     chart.horizontal_line(float(gap_price), color="#ff9800", style="dashed", width=1, text=f"GAP: {gap_price:.2f}")
 
         if overlay_chart and not df_all_trades.empty and 'pair' in df_all_trades.columns and 'status' in df_all_trades.columns:
