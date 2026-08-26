@@ -196,8 +196,6 @@ def process_symbol(symbol: str, tm: TradeManager):
                 existing = cursor.fetchone()
 
                 if not existing:
-                    target_stop_loss = details["stop_loss"]
-                    target_take_profit = details["take_profit"]
                     position_size = details["position_size"]
                     account_balance = details.get("account_balance", allocated_slot_usd)
 
@@ -209,9 +207,17 @@ def process_symbol(symbol: str, tm: TradeManager):
                         amount_usd=amount_usd
                     )
 
-                    if order_res and (order_res.get("status") == "SUCCESS" or order_res.get("id")):
+                    if order_res and (order_res.get("status") == "SUCCESS" or order_res.get("id") or order_res.get("success")):
                         actual_entry = safe_float(order_res.get("fill_price") or order_res.get("price"), default=details["entry_price"])
                         actual_qty = safe_float(order_res.get("executed_qty") or order_res.get("amount"), default=position_size)
+
+                        # Calculate percentage or ATR distance from original signal
+                        sl_distance = abs(safe_float(details["entry_price"]) - safe_float(details["stop_loss"]))
+                        tp_distance = abs(safe_float(details["take_profit"]) - safe_float(details["entry_price"]))
+
+                        # Dynamic re-anchoring to actual fill price
+                        dynamic_stop_loss = actual_entry - sl_distance if signal == "BUY" else actual_entry + sl_distance
+                        dynamic_take_profit = actual_entry + tp_distance if signal == "BUY" else actual_entry - tp_distance
 
                         insert_query = """
                             INSERT INTO trade_setups (pair, direction, entry_price, stop_loss, take_profit, risk_pct, position_size, account_balance, status, trade_state)
@@ -223,8 +229,8 @@ def process_symbol(symbol: str, tm: TradeManager):
                             (
                                 symbol,
                                 actual_entry,
-                                target_stop_loss,
-                                target_take_profit,
+                                dynamic_stop_loss,
+                                dynamic_take_profit,
                                 ACCOUNT_RISK_PCT,
                                 actual_qty,
                                 account_balance,
@@ -243,8 +249,8 @@ def process_symbol(symbol: str, tm: TradeManager):
                             f"<b>Pair:</b> <code>{symbol}</code>\n"
                             f"<b>Direction:</b> <code>LONG (BUY SPOT)</code>\n"
                             f"<b>Fill Price:</b> ${actual_entry:.5f}\n"
-                            f"<b>Stop Loss:</b> ${target_stop_loss:.5f}\n"
-                            f"<b>Take Profit:</b> ${target_take_profit:.5f}\n"
+                            f"<b>Stop Loss:</b> ${dynamic_stop_loss:.5f}\n"
+                            f"<b>Take Profit:</b> ${dynamic_take_profit:.5f}\n"
                             f"<b>Quantity:</b> {actual_qty:.4f} units\n"
                             f"<b>Slot Margin:</b> ${account_balance:.2f} USD"
                         )
