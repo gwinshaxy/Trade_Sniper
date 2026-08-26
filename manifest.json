@@ -1,10 +1,12 @@
 {
-  "name": "TradeSniper Dashboard",
+  "name": "MEXC Trading Terminal",
   "short_name": "TradeSniper",
+  "description": "Real-Time Interactive Trading Terminal & Execution Engine",
   "start_url": "/",
   "display": "standalone",
   "background_color": "#0e1117",
   "theme_color": "#0e1117",
+  "orientation": "any",
   "icons": [
     {
       "src": "https://raw.githubusercontent.com/gwinshaxy/Trade_Sniper/main/icon-192.png",
@@ -17,6 +19,14 @@
       "sizes": "512x512",
       "type": "image/png",
       "purpose": "any maskable"
+    }
+  ],
+  "screenshots": [
+    {
+      "src": "https://raw.githubusercontent.com/gwinshaxy/Trade_Sniper/main/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "form_factor": "wide"
     }
   ]
 }

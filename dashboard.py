@@ -17,27 +17,39 @@ from lightweight_charts.widgets import StreamlitChart
 # Page configuration MUST be the first Streamlit command executed
 st.set_page_config(page_title="MEXC Trading Terminal", layout="wide")
 
-# Inject PWA Manifest & Mobile Metadata
+# Inject Complete PWA Manifest & PWA Metadata
 st.markdown(
     """
     <link rel="manifest" href="https://raw.githubusercontent.com/gwinshaxy/Trade_Sniper/main/manifest.json">
     <meta name="theme-color" content="#0e1117">
+    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
     <meta name="mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <meta name="apple-mobile-web-app-title" content="TradeSniper">
     """,
     unsafe_allow_html=True
 )
 
-# Inject Service Worker Registration
+# Inject Blob-Based Service Worker Registration
 st.markdown(
     """
     <script>
     if ('serviceWorker' in navigator) {
       window.addEventListener('load', function() {
-        navigator.serviceWorker.register('/sw.js').then(function(registration) {
-          console.log('ServiceWorker registration successful');
-        }, function(err) {
-          console.log('ServiceWorker registration failed: ', err);
-        });
+        const swCode = `
+          self.addEventListener('install', e => self.skipWaiting());
+          self.addEventListener('activate', e => e.waitUntil(clients.claim()));
+          self.addEventListener('fetch', e => {
+            e.respondWith(fetch(e.request).catch(() => new Response('Offline')));
+          });
+        `;
+        const blob = new Blob([swCode], { type: 'application/javascript' });
+        const blobURL = URL.createObjectURL(blob);
+        
+        navigator.serviceWorker.register(blobURL)
+          .then(reg => console.log('PWA ServiceWorker registered successfully via Blob'))
+          .catch(err => console.error('ServiceWorker registration failed:', err));
       });
     }
     </script>
@@ -450,7 +462,7 @@ with tab_active:
                 if conn_mod:
                     try:
                         cur = conn_mod.cursor()
-                        cur.execute("UPDATE trade_setups SET take_profit = %s WHERE id = %s;", (new_tp, selected_trade_id))
+                        cur.execute("UPDATE take_profit SET take_profit = %s WHERE id = %s;", (new_tp, selected_trade_id))
                         conn_mod.commit()
                         cur.close()
                     except Exception as tp_err:
