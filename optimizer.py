@@ -370,7 +370,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     ensure_schema_updated()
-    symbols_env = os.getenv("SYMBOLS") or os.getenv("SYMBOL") or os.getenv("TRADING_SYMBOLS") or "XRP/USDT,BNB/USDT,SOL/USDT,LINK/USDT"
+    symbols_env = os.getenv("SYMBOLS") or os.getenv("SYMBOL") or os.getenv("TRADING_SYMBOLS") or "XRP/USDT,SOL/USDT,LINK/USDT"
     symbols = [s.strip().upper() for s in symbols_env.split(",") if s.strip()]
 
     if args.once:
