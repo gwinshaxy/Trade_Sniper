@@ -1,0 +1,12 @@
+[
+  {
+    "relation": ["delegate_permission/common.handle_all_urls"],
+    "target": {
+      "namespace": "android_app",
+      "package_name": "com.tradesniper.app",
+      "sha256_cert_fingerprints": [
+        " 0D:4D:A0:D1:3C:5E:34:6B:4A:47:AB:8A:80:D2:15:4B:69:AC:94:6B:5F:D6:D4:4E:C9:5B:F2:2F:1B:C8:F6:48"
+      ]
+    }
+  }
+]
