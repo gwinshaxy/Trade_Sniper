@@ -27,6 +27,24 @@ st.markdown(
     unsafe_allow_html=True
 )
 
+# Inject Service Worker Registration
+st.markdown(
+    """
+    <script>
+    if ('serviceWorker' in navigator) {
+      window.addEventListener('load', function() {
+        navigator.serviceWorker.register('/sw.js').then(function(registration) {
+          console.log('ServiceWorker registration successful');
+        }, function(err) {
+          console.log('ServiceWorker registration failed: ', err);
+        });
+      });
+    }
+    </script>
+    """,
+    unsafe_allow_html=True
+)
+
 HTTP_PROXY = os.getenv("HTTP_PROXY") or os.getenv("PROXY_URL")
 HTTPS_PROXY = os.getenv("HTTPS_PROXY") or os.getenv("PROXY_URL")
 
