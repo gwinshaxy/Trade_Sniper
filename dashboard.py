@@ -14,7 +14,18 @@ load_dotenv(override=True)
 
 from lightweight_charts.widgets import StreamlitChart
 
+# Page configuration MUST be the first Streamlit command executed
 st.set_page_config(page_title="MEXC Trading Terminal", layout="wide")
+
+# Inject PWA Manifest & Mobile Metadata
+st.markdown(
+    """
+    <link rel="manifest" href="https://raw.githubusercontent.com/gwinshaxy/Trade_Sniper/main/manifest.json">
+    <meta name="theme-color" content="#0e1117">
+    <meta name="mobile-web-app-capable" content="yes">
+    """,
+    unsafe_allow_html=True
+)
 
 HTTP_PROXY = os.getenv("HTTP_PROXY") or os.getenv("PROXY_URL")
 HTTPS_PROXY = os.getenv("HTTPS_PROXY") or os.getenv("PROXY_URL")
