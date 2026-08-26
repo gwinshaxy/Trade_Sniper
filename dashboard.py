@@ -390,6 +390,7 @@ if df_ohlc is not None and not df_ohlc.empty:
         else:
             detected_gaps = []
 
+        # Extract min/max bounds with a minor safety buffer
         min_chart_p = float(df_ohlc['low'].min())
         max_chart_p = float(df_ohlc['high'].max())
 
@@ -414,16 +415,20 @@ if df_ohlc is not None and not df_ohlc.empty:
             tema_line = chart.create_line(name=line_name, color="orange", width=2)
             tema_line.set(tema_df)
 
-        if pd.notnull(vah) and min_chart_p <= float(vah) <= max_chart_p:
+        # --- Volume Profile Levels (VAH, VAL, POC) ---
+        if pd.notnull(vah) and not np.isnan(vah):
             chart.horizontal_line(float(vah), color="#2962ff", style="solid", width=2, text=f"VAH: {vah:.2f}")
-        if pd.notnull(val) and min_chart_p <= float(val) <= max_chart_p:
+
+        if pd.notnull(val) and not np.isnan(val):
             chart.horizontal_line(float(val), color="#2962ff", style="solid", width=2, text=f"VAL: {val:.2f}")
-        if pd.notnull(poc) and min_chart_p <= float(poc) <= max_chart_p:
+
+        if pd.notnull(poc) and not np.isnan(poc):
             chart.horizontal_line(float(poc), color="#f44336", style="solid", width=2, text=f"POC: {poc:.2f}")
 
+        # --- Volume Profile Gaps Overlay ---
         if overlay_gaps and detected_gaps:
             for gap_price in detected_gaps:
-                if pd.notnull(gap_price) and min_chart_p <= float(gap_price) <= max_chart_p:
+                if pd.notnull(gap_price) and not np.isnan(gap_price):
                     chart.horizontal_line(float(gap_price), color="#ff9800", style="dashed", width=1, text=f"GAP: {gap_price:.2f}")
 
         if overlay_chart and not df_all_trades.empty and 'pair' in df_all_trades.columns and 'status' in df_all_trades.columns:
