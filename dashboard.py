@@ -1,6 +1,7 @@
 import os
 import sys
 import json
+import urllib.parse
 import logging
 import subprocess
 import psutil
@@ -17,10 +18,36 @@ from lightweight_charts.widgets import StreamlitChart
 # Page configuration MUST be the first Streamlit command executed
 st.set_page_config(page_title="MEXC Trading Terminal", layout="wide")
 
-# Inject Complete PWA Manifest & PWA Metadata
+# Encode and Inject Dynamic Data URI PWA Manifest & Metadata
+manifest_data = {
+    "name": "TradeSniper Terminal",
+    "short_name": "TradeSniper",
+    "description": "MEXC Algorithmic Trading Terminal",
+    "start_url": "/",
+    "display": "standalone",
+    "background_color": "#0e1117",
+    "theme_color": "#0e1117",
+    "icons": [
+        {
+            "src": "https://raw.githubusercontent.com/gwinshaxy/Trade_Sniper/main/icon-192.png",
+            "sizes": "192x192",
+            "type": "image/png"
+        },
+        {
+            "src": "https://raw.githubusercontent.com/gwinshaxy/Trade_Sniper/main/icon-512.png",
+            "sizes": "512x512",
+            "type": "image/png"
+        }
+    ]
+}
+
+manifest_json = json.dumps(manifest_data)
+encoded_manifest = urllib.parse.quote(manifest_json)
+manifest_uri = f"data:application/manifest+json;charset=utf-8,{encoded_manifest}"
+
 st.markdown(
-    """
-    <link rel="manifest" href="https://raw.githubusercontent.com/gwinshaxy/Trade_Sniper/main/manifest.json">
+    f"""
+    <link rel="manifest" href="{manifest_uri}">
     <meta name="theme-color" content="#0e1117">
     <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
     <meta name="mobile-web-app-capable" content="yes">
