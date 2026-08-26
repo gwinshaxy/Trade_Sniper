@@ -192,14 +192,11 @@ for default_pair in ["XRP/USDT"]:
 
 st.sidebar.subheader("🎛️ Terminal Controls & Tuning")
 
-# 1. Active Execution / Config Pair
 config_target_pair = st.sidebar.selectbox("Active Execution / Config Pair", available_pairs, index=0)
 
-# Normalize key string for consistent strategy dict loading & widget session keys
 pair_key = config_target_pair.replace("/", "")
 dyn_cfg = strategy.load_symbol_config(config_target_pair)
 
-# 2. Attach pair-specific keys to widgets so values re-initialize dynamically on pair switch
 lookback_bars = st.sidebar.number_input("Lookback Bars (Range)", value=600, min_value=100, max_value=1000, step=50, key=f"lookback_{pair_key}")
 
 tema_period = st.sidebar.number_input(
@@ -366,34 +363,36 @@ if df_ohlc is not None and not df_ohlc.empty:
     try:
         df_ohlc = df_ohlc.copy()
 
-        # Re-index datetime index or normalize timestamp column name
         if isinstance(df_ohlc.index, pd.DatetimeIndex):
             df_ohlc = df_ohlc.reset_index()
             df_ohlc.rename(columns={df_ohlc.columns[0]: 'time'}, inplace=True)
         elif 'timestamp' in df_ohlc.columns and 'time' not in df_ohlc.columns:
             df_ohlc.rename(columns={'timestamp': 'time'}, inplace=True)
 
-        # Deduplicate column names
         df_ohlc = df_ohlc.loc[:, ~df_ohlc.columns.duplicated()].copy()
-
-        # Parse time column as datetime pandas series safely
         df_ohlc['time'] = pd.to_datetime(df_ohlc['time'], errors='coerce')
         df_ohlc = df_ohlc.dropna(subset=['time'])
 
-        # Ensure numeric OHLCV types
         for col in ['open', 'high', 'low', 'close', 'volume']:
             if col in df_ohlc.columns:
                 df_ohlc[col] = pd.to_numeric(df_ohlc[col], errors='coerce')
 
         df_ohlc['tema_custom'] = strategy.calc_tema(df_ohlc['close'], period=min(tema_period, len(df_ohlc)))
         
-        poc, vah, val = strategy.compute_volume_profile(df_ohlc, num_bins=100, lookback_bars=lookback_bars, va_pct=0.70)
-        detected_gaps = strategy.calculate_volume_profile_gaps(df_ohlc, num_bins=100, lookback_bars=lookback_bars, detection_pct=node_detection_pct)
+        # Defensive calls to compute volume profile
+        if hasattr(strategy, 'compute_volume_profile'):
+            poc, vah, val = strategy.compute_volume_profile(df_ohlc, num_bins=100, lookback_bars=lookback_bars, va_pct=0.70)
+        else:
+            poc, vah, val = None, None, None
+
+        if hasattr(strategy, 'calculate_volume_profile_gaps'):
+            detected_gaps = strategy.calculate_volume_profile_gaps(df_ohlc, num_bins=100, lookback_bars=lookback_bars, detection_pct=node_detection_pct)
+        else:
+            detected_gaps = []
 
         min_chart_p = float(df_ohlc['low'].min())
         max_chart_p = float(df_ohlc['high'].max())
 
-        # Format string time depending on daily vs intraday resolution
         df_chart = df_ohlc.copy()
         if selected_timeframe in ['1d']:
             df_chart['time'] = df_chart['time'].dt.strftime('%Y-%m-%d')
@@ -406,7 +405,6 @@ if df_ohlc is not None and not df_ohlc.empty:
         chart.layout(background_color='#131722', text_color='#d1d4dc')
         chart.volume_config(scale_margin_top=0.85, scale_margin_bottom=0.0, up_color='#26a69a', down_color='#ef5350')
         
-        # Pass standardized dataframe into chart
         ohlcv_data = df_chart[['time', 'open', 'high', 'low', 'close', 'volume']].dropna()
         chart.set(ohlcv_data)
 
@@ -489,7 +487,7 @@ with tab_active:
                 if conn_mod:
                     try:
                         cur = conn_mod.cursor()
-                        cur.execute("UPDATE take_profit SET take_profit = %s WHERE id = %s;", (new_tp, selected_trade_id))
+                        cur.execute("UPDATE trade_setups SET take_profit = %s WHERE id = %s;", (new_tp, selected_trade_id))
                         conn_mod.commit()
                         cur.close()
                     except Exception as tp_err:
