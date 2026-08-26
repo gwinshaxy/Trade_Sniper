@@ -69,7 +69,7 @@ def process_symbol(symbol: str, tm: TradeManager):
     logger.info(f"--- Processing {symbol} [{TIMEFRAME}] (LIVE SPOT MODE) ---")
 
     # 1. Fetch Latest Kline Data
-    df = fetch_klines(symbol=symbol, timeframe=TIMEFRAME, limit=300)
+    df = fetch_klines(symbol=symbol, timeframe=TIMEFRAME, limit=500)
     if df is None or df.empty:
         logger.warning(f"Could not retrieve kline data for {symbol}. Skipping cycle.")
         return
