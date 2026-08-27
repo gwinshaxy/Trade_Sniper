@@ -1,5 +1,5 @@
 import pandas as pd
-from common import logger
+from common import logger, get_db_connection, release_db_connection
 
 
 class TradeManager:
@@ -12,6 +12,68 @@ class TradeManager:
         self.spread_buffer_pct = spread_buffer_pct
         self.tema_offset_pct = tema_offset_pct
         self.atr_trail_mult = atr_trail_mult
+
+    def has_open_trade(self, symbol: str) -> bool:
+        """Checks if there is an active OPEN or BE_LOCKED trade in the database for the given symbol."""
+        conn = get_db_connection()
+        if not conn:
+            logger.error(f"[{symbol}] Database connection failed during open trade check.")
+            return False
+
+        try:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT COUNT(*) 
+                FROM trade_setups 
+                WHERE pair = %s AND trade_state IN ('OPEN', 'BE_LOCKED', 'TRAILING');
+                """,
+                (symbol,)
+            )
+            count = cursor.fetchone()[0]
+            return count > 0
+        except Exception as e:
+            logger.error(f"[{symbol}] Failed to check open trade status: {e}")
+            return False
+        finally:
+            release_db_connection(conn)
+
+    def record_executed_trade(
+        self, 
+        pair: str, 
+        direction: str, 
+        entry_price: float, 
+        stop_loss: float, 
+        take_profit: float, 
+        position_size: float, 
+        account_balance: float
+    ) -> bool:
+        """Records a successfully executed live trade into the database."""
+        conn = get_db_connection()
+        if not conn:
+            logger.error(f"[{pair}] Database connection failed when recording trade.")
+            return False
+
+        try:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                INSERT INTO trade_setups 
+                (pair, direction, entry_price, stop_loss, take_profit, position_size, account_balance, trade_state, status) 
+                VALUES (%s, %s, %s, %s, %s, %s, %s, 'OPEN', 'EXECUTED');
+                """,
+                (pair, direction, entry_price, stop_loss, take_profit, position_size, account_balance)
+            )
+            conn.commit()
+            logger.info(f"[{pair}] Open trade recorded successfully in database.")
+            return True
+        except Exception as e:
+            logger.error(f"[{pair}] Failed to record executed trade: {e}")
+            if conn:
+                conn.rollback()
+            return False
+        finally:
+            release_db_connection(conn)
 
     def process_trade(self, trade_row: pd.Series, latest_candle: pd.Series) -> dict:
         trade_id = trade_row.get('id')
@@ -40,7 +102,7 @@ class TradeManager:
                 "trade_id": trade_id,
                 "exit_price": curr_sl,
                 "msg": (
-                    f"🚨 <b>STOP LOSS HIT</b>\n\n"
+                    f"🛑 <b>STOP LOSS HIT</b>\n\n"
                     f"<b>Trade ID:</b> <code>#{trade_id}</code>\n"
                     f"<b>Pair:</b> <code>{pair}</code>\n"
                     f"<b>Direction:</b> <code>{direction}</code>\n"

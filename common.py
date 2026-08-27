@@ -5,12 +5,10 @@ from psycopg2 import pool
 import requests
 from dotenv import load_dotenv
 
-# Automatically load environment variables from .env
 base_dir = os.path.dirname(os.path.abspath(__file__))
 env_path = os.path.join(base_dir, ".env")
 load_dotenv(dotenv_path=env_path)
 
-# Configure standardized logger instance
 logger = logging.getLogger("trading_agent")
 if not logger.handlers:
     handler = logging.StreamHandler()
@@ -19,7 +17,6 @@ if not logger.handlers:
     logger.addHandler(handler)
     logger.setLevel(logging.INFO)
 
-# Database Connection Settings with Dual Setup Support (DATABASE_URL vs Explicit Params)
 DB_URL = os.getenv("DATABASE_URL") or os.getenv("DB_URL")
 if DB_URL:
     DB_URL = DB_URL.strip('"').strip("'")
@@ -34,12 +31,10 @@ DB_SSLMODE = os.getenv("DB_SSLMODE", "require")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-# Global Connection Pool
 _db_pool = None
 
 
 def init_db_pool():
-    """Initializes the psycopg2 ThreadedConnectionPool using connection string or Supabase parameters."""
     global _db_pool
     if _db_pool is None:
         try:
@@ -77,13 +72,11 @@ def get_db_pool():
 
 
 class PooledConnectionWrapper:
-    """Wrapper around psycopg2 connection to handle pool release cleanly via context management."""
     def __init__(self, conn, db_pool):
         self._conn = conn
         self._pool = db_pool
 
     def close(self):
-        """Returns connection back to the pool instead of destroying it."""
         if self._conn and self._pool:
             try:
                 self._pool.putconn(self._conn)
@@ -106,19 +99,16 @@ class PooledConnectionWrapper:
         self.close()
 
     def __getattr__(self, name):
-        """Delegates all unhandled attributes/methods directly to the underlying psycopg2 connection."""
         return getattr(self._conn, name)
 
 
 def get_db_connection():
-    """Retrieves a connection from the pool wrapped in PooledConnectionWrapper."""
     p = get_db_pool()
     conn = p.getconn()
     return PooledConnectionWrapper(conn, p)
 
 
 def release_db_connection(conn):
-    """Safely returns a connection to the pool (handles raw connections or PooledConnectionWrapper)."""
     global _db_pool
     if conn:
         if isinstance(conn, PooledConnectionWrapper):
@@ -131,7 +121,6 @@ def release_db_connection(conn):
 
 
 def execute_query(conn, query, params=None, fetch=False):
-    """Generic query executor compatible across worker scripts."""
     cursor = conn.cursor()
     try:
         cursor.execute(query, params or ())
@@ -149,7 +138,7 @@ def execute_query(conn, query, params=None, fetch=False):
 
 
 def ensure_schema_updated():
-    """Ensures trade_setups and strategy_parameters tables exist with fully synchronized schemas."""
+    """Ensures trade_setups and strategy_parameters tables exist with fully synchronized schemas including ATR parameters."""
     conn = get_db_connection()
     if not conn:
         logger.error("Database connection unavailable for schema check.")
@@ -158,7 +147,6 @@ def ensure_schema_updated():
     try:
         cursor = conn.cursor()
         
-        # 1. Create trade_setups table
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS trade_setups (
                 id SERIAL PRIMARY KEY,
@@ -197,7 +185,6 @@ def ensure_schema_updated():
         for col in trade_columns:
             cursor.execute(f"ALTER TABLE trade_setups ADD COLUMN IF NOT EXISTS {col};")
 
-        # 2. Create strategy_parameters table
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS strategy_parameters (
                 id SERIAL PRIMARY KEY,
@@ -216,6 +203,10 @@ def ensure_schema_updated():
                 vp_detection_pct NUMERIC NOT NULL DEFAULT 0.07,
                 use_rsi_filter BOOLEAN DEFAULT TRUE,
                 use_candlestick_confirm BOOLEAN DEFAULT TRUE,
+                atr_period INT DEFAULT 14,
+                atr_mult FLOAT DEFAULT 2.0,
+                use_atr_sl BOOLEAN DEFAULT TRUE,
+                disable_htf BOOLEAN DEFAULT FALSE,
                 fitness_score NUMERIC DEFAULT 0.0,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
@@ -232,6 +223,10 @@ def ensure_schema_updated():
             "vp_detection_pct NUMERIC DEFAULT 0.07",
             "use_rsi_filter BOOLEAN DEFAULT TRUE",
             "use_candlestick_confirm BOOLEAN DEFAULT TRUE",
+            "atr_period INT DEFAULT 14",
+            "atr_mult FLOAT DEFAULT 2.0",
+            "use_atr_sl BOOLEAN DEFAULT TRUE",
+            "disable_htf BOOLEAN DEFAULT FALSE",
             "fitness_score NUMERIC DEFAULT 0.0"
         ]
         for col in param_columns:
@@ -247,7 +242,6 @@ def ensure_schema_updated():
 
 
 def calculate_pnl(direction: str, entry_price: float, current_price: float, quantity: float, account_balance: float = 100.0) -> tuple:
-    """Calculates realized/unrealized profit and loss in USD and percentage along with trade outcome status."""
     dir_clean = str(direction).strip().upper()
     
     if dir_clean in ["BUY", "LONG"]:
@@ -263,7 +257,6 @@ def calculate_pnl(direction: str, entry_price: float, current_price: float, quan
 
 
 def send_telegram_notification(message: str) -> bool:
-    """Sends an HTML formatted Telegram alert with higher timeout tolerance."""
     bot_token = TELEGRAM_BOT_TOKEN or os.getenv("TELEGRAM_BOT_TOKEN")
     chat_id = TELEGRAM_CHAT_ID or os.getenv("TELEGRAM_CHAT_ID")
 
@@ -284,7 +277,6 @@ def send_telegram_notification(message: str) -> bool:
 
 
 def close_trade_manually(trade_id: int, exit_price: float, reason: str = "MANUAL_CLOSE") -> bool:
-    """Manually closes an active trade, updates PnL, and notifies via Telegram."""
     conn = get_db_connection()
     if not conn:
         return False
@@ -333,12 +325,10 @@ def close_trade_manually(trade_id: int, exit_price: float, reason: str = "MANUAL
 
 
 def normalize_symbol(symbol: str) -> str:
-    """Normalizes exchange trading pair string format (e.g., XRP/USDT -> XRPUSDT)."""
     return symbol.replace("/", "").replace("-", "").upper()
 
 
 def to_mexc_ws_symbol(symbol: str) -> str:
-    """Converts standard symbol format (e.g. XRP/USDT or XRPUSDT) to MEXC WebSocket format (XRP_USDT)."""
     clean = normalize_symbol(symbol)
     if clean.endswith("USDT"):
         return f"{clean[:-4]}_USDT"
@@ -346,7 +336,6 @@ def to_mexc_ws_symbol(symbol: str) -> str:
 
 
 def check_daily_circuit_breaker(max_loss_pct: float = 3.0, account_balance: float = 100.0) -> bool:
-    """Checks total closed PnL today against max allowed daily loss percentage."""
     conn = get_db_connection()
     if not conn:
         return False

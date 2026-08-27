@@ -122,13 +122,33 @@ def run_backtest_with_friction(
     rsi_series = strategy.calc_rsi(df_close, period=int(rsi_period))
     adx_series = strategy.calc_adx(df, period=int(adx_period))
 
-    struct_long, struct_short = confirm_market_structure(df_close, lookback=max(3, int(rsi_period // 2)))
+    struct_long_arr, struct_short_arr = confirm_market_structure(df_close, lookback=max(3, int(rsi_period // 2)))
 
     # Convert to pure NumPy arrays
     close_arr = df_close.to_numpy()
     tema_arr = tema_series.to_numpy()
     rsi_arr = rsi_series.to_numpy()
     adx_arr = adx_series.to_numpy()
+
+    # ISSUE 1 FIX: Align all array shapes to minimum common length before logical comparison
+    min_len = min(
+        len(close_arr), 
+        len(tema_arr), 
+        len(rsi_arr), 
+        len(adx_arr), 
+        len(struct_long_arr), 
+        len(struct_short_arr)
+    )
+
+    if min_len < 10:
+        return -999.0
+
+    close_arr = close_arr[-min_len:]
+    tema_arr = tema_arr[-min_len:]
+    rsi_arr = rsi_arr[-min_len:]
+    adx_arr = adx_arr[-min_len:]
+    struct_long = struct_long_arr[-min_len:]
+    struct_short = struct_short_arr[-min_len:]
 
     upper_zone = tema_arr * (1.0 + zone_tolerance)
     lower_zone = tema_arr * (1.0 - zone_tolerance)

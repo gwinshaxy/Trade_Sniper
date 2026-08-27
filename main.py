@@ -11,8 +11,18 @@ from common import (
     check_daily_circuit_breaker,
     send_telegram_notification,
 )
-from live_executor import LiveExecutionEngine, MEXCLiveExecutor
-from strategy import fetch_klines, evaluate_signals, safe_float
+from live_executor import LiveExecutionEngine
+from reconciler import reconcile_open_trades
+from strategy import (
+    fetch_klines,
+    evaluate_signals,
+    load_symbol_config,
+    safe_float,
+    calc_tema,
+    calc_rsi,
+    calc_adx,
+    calc_atr,
+)
 from trade_manager import TradeManager
 
 load_dotenv()
@@ -23,14 +33,13 @@ WATCHLIST = [s.strip() for s in raw_symbols.split(",") if s.strip()]
 TIMEFRAME = os.getenv("TIMEFRAME", "1h")
 POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", "60"))
 ACCOUNT_RISK_PCT = float(os.getenv("ACCOUNT_RISK_PCT", "1.0"))
+FALLBACK_BALANCE = float(os.getenv("ACCOUNT_BALANCE", "100.0"))
 
 MEXC_API_KEY = os.getenv("MEXC_API_KEY", "")
 MEXC_SECRET_KEY = os.getenv("MEXC_SECRET_KEY", "")
 
-# Maximum concurrent open trades across all watchlist pairs
 MAX_CONCURRENT_TRADES = 4  
-# Max fraction of total balance per trade slot (25%)
-MAX_ALLOCATION_PER_TRADE = 0.25 
+MAX_ALLOCATION_PER_TRADE = float(os.getenv("MAX_ALLOCATION_PER_TRADE", 0.25))
 
 logging.basicConfig(
     level=logging.INFO,
@@ -42,242 +51,178 @@ logging.basicConfig(
 )
 logger = logging.getLogger("main_engine")
 
-# Safely initialize the engine with API keys from environment
 execution_engine = LiveExecutionEngine(api_key=MEXC_API_KEY, secret_key=MEXC_SECRET_KEY)
 
-def process_symbol(symbol: str, tm: TradeManager):
-    """Fetches data, evaluates strategy, checks open trades, and executes live spot buy orders."""
-    logger.info(f"--- Processing {symbol} [{TIMEFRAME}] (LIVE SPOT MODE) ---")
 
-    # 1. Fetch Latest Kline Data
-    df = fetch_klines(symbol=symbol, timeframe=TIMEFRAME, limit=500)
-    if df is None or df.empty:
-        logger.warning(f"Could not retrieve kline data for {symbol}. Skipping cycle.")
+def save_market_state(pair: str, rsi: float, adx: float, atr: float, tema: float, sentiment_bias: float, regime: str = "NEUTRAL"):
+    """Persists real-time indicator values to PostgreSQL for Streamlit monitoring."""
+    conn = get_db_connection()
+    if not conn:
+        return
+    try:
+        with conn.cursor() as cur:
+            query = """
+            INSERT INTO market_state (pair, rsi, adx, atr, tema, sentiment_bias, regime, updated_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, NOW())
+            ON CONFLICT (pair) DO UPDATE SET
+                rsi = EXCLUDED.rsi,
+                adx = EXCLUDED.adx,
+                atr = EXCLUDED.atr,
+                tema = EXCLUDED.tema,
+                sentiment_bias = EXCLUDED.sentiment_bias,
+                regime = EXCLUDED.regime,
+                updated_at = NOW();
+            """
+            cur.execute(query, (pair, float(rsi), float(adx), float(atr), float(tema), float(sentiment_bias), regime))
+            conn.commit()
+    except Exception as e:
+        logger.error(f"[{pair}] Error logging market state: {e}")
+    finally:
+        release_db_connection(conn)
+
+
+def process_symbol(symbol: str, tm: TradeManager, active_usdt_balance: float):
+    """Fetches market klines, loads strategy params, evaluates signals, and manages orders."""
+    logger.info(f"[{symbol}] Processing market signal check...")
+
+    df_klines = fetch_klines(symbol=symbol, interval=TIMEFRAME, limit=600)
+    if df_klines.empty:
+        logger.warning(f"[{symbol}] Unable to retrieve kline data. Skipping processing cycle.")
         return
 
-    latest_candle = df.iloc[-1]
-    current_price = safe_float(latest_candle["close"])
+    cfg = load_symbol_config(symbol)
+    sentiment_score = 0.5  # Default baseline sentiment
 
-    # 2. Process existing open trades for this pair in the Database
-    db_symbol = symbol.replace("/", "").replace("-", "").strip().upper()
+    # Compute current indicators for DB state logging
+    try:
+        tema_p = int(cfg.get("tema_period", 200))
+        rsi_p = int(cfg.get("rsi_period", 14))
+        adx_p = int(cfg.get("adx_period", 14))
+        atr_p = int(cfg.get("atr_period", 14))
 
-    conn = get_db_connection()
-    if conn:
-        try:
-            cursor = conn.cursor()
-            cursor.execute(
-                """
-                SELECT id, pair, direction, entry_price, stop_loss, take_profit, position_size, account_balance, trade_state
-                FROM trade_setups
-                WHERE (pair = %s OR pair = %s) AND trade_state = 'OPEN';
-                """,
-                (symbol, db_symbol),
+        if len(df_klines) >= max(tema_p, adx_p + 1, atr_p + 1):
+            s_tema = calc_tema(df_klines["close"], period=tema_p).iloc[-1]
+            s_rsi = calc_rsi(df_klines["close"], period=rsi_p).iloc[-1]
+            s_adx = calc_adx(df_klines, period=adx_p).iloc[-1]
+            s_atr = calc_atr(df_klines, period=atr_p).iloc[-1]
+            
+            # Simple regime classifier based on ADX & TEMA
+            current_close = df_klines["close"].iloc[-1]
+            regime = "TRENDING_BULL" if current_close > s_tema and s_adx >= 20 else ("TRENDING_BEAR" if current_close < s_tema and s_adx >= 20 else "RANGING")
+
+            save_market_state(
+                pair=symbol,
+                rsi=s_rsi,
+                adx=s_adx,
+                atr=s_atr,
+                tema=s_tema,
+                sentiment_bias=sentiment_score,
+                regime=regime
             )
-            open_trades = cursor.fetchall()
-            cursor.close()
+    except Exception as state_err:
+        logger.error(f"[{symbol}] Failed to compute/persist market state: {state_err}")
 
-            for trade_row in open_trades:
-                trade_series = pd.Series(
-                    {
-                        "id": trade_row[0],
-                        "pair": trade_row[1],
-                        "direction": trade_row[2],
-                        "entry_price": safe_float(trade_row[3]),
-                        "stop_loss": safe_float(trade_row[4]) if trade_row[4] else None,
-                        "take_profit": safe_float(trade_row[5]) if trade_row[5] else None,
-                        "position_size": safe_float(trade_row[6]),
-                        "account_balance": safe_float(trade_row[7], default=100.0),
-                        "trade_state": trade_row[8],
-                    }
-                )
-
-                action_result = tm.process_trade(trade_series, latest_candle)
-                action = action_result.get("action")
-                
-                if action in ["CLOSE_SL", "CLOSE_TP"]:
-                    logger.info(
-                        f"Trade #{trade_series['id']} condition met via {action} at ${current_price:.5f}. Triggering Exchange & DB update..."
-                    )
-                    close_res = execution_engine.close_live_position_mexc(
-                        symbol=symbol, 
-                        position_size=trade_series['position_size'],
-                        current_price=current_price,
-                        outcome=action
-                    )
-                    
-                    if close_res.get("status") == "SUCCESS":
-                        pnl_usd = close_res.get("pnl_usd", 0.0)
-                        pnl_pct = close_res.get("pnl_pct", 0.0)
-                        send_telegram_notification(
-                            f"<b>🔴 LIVE SPOT POSITION CLOSED ({action})</b>\n\n"
-                            f"<b>Trade ID:</b> <code>#{trade_series['id']}</code>\n"
-                            f"<b>Pair:</b> <code>{symbol}</code>\n"
-                            f"<b>Exit Price:</b> ${close_res.get('exit_price', current_price):.5f}\n"
-                            f"<b>PnL USD:</b> ${pnl_usd:.2f}\n"
-                            f"<b>PnL Return:</b> {pnl_pct:.2f}%"
-                        )
-
-        except Exception as e:
-            logger.error(f"Error querying/updating open trades for {symbol}: {e}")
-        finally:
-            release_db_connection(conn)
-
-    # 3. Check Global Active Portfolio Allocation & Concurrency Limits
-    total_balance = float(os.getenv("ACCOUNT_BALANCE", 100.0))
-    allocated_slot_usd = total_balance * MAX_ALLOCATION_PER_TRADE
-
-    conn = get_db_connection()
-    if conn:
-        try:
-            cursor = conn.cursor()
-            cursor.execute("SELECT COUNT(*), COALESCE(SUM(account_balance), 0) FROM trade_setups WHERE trade_state = 'OPEN';")
-            open_count, total_allocated = cursor.fetchone()
-            cursor.close()
-
-            if open_count >= MAX_CONCURRENT_TRADES:
-                logger.info(f"Skipping {symbol}: Maximum concurrent open trade limit ({MAX_CONCURRENT_TRADES}) reached.")
-                return
-        except Exception as e:
-            logger.error(f"Error checking portfolio allocation limit: {e}")
-        finally:
-            release_db_connection(conn)
-
-    # 4. Check Daily Circuit Breaker before opening new trades
-    if check_daily_circuit_breaker(max_loss_pct=3.0, account_balance=total_balance):
-        logger.warning(
-            f"Daily Circuit Breaker triggered (Max daily loss limit hit). Skipping new signal checks for {symbol}."
-        )
+    if tm.has_open_trade(symbol):
+        logger.info(f"[{symbol}] Open position already exists in trade manager. Skipping new signal checks.")
         return
 
-    # 5. Evaluate Strategy Signals for New Trade Entries
-    signal, details = evaluate_signals(
-        df, 
-        symbol=symbol, 
-        risk_pct=ACCOUNT_RISK_PCT,
-        account_balance=total_balance,
-        allocated_slot_usd=allocated_slot_usd
+    # Fully harmonized parameter passing
+    signal = evaluate_signals(
+        df=df_klines,
+        symbol=symbol,
+        account_balance=active_usdt_balance,
+        tema_period=cfg.get("tema_period", 200),
+        rsi_period=cfg.get("rsi_period", 14),
+        rsi_thresh=cfg.get("rsi_thresh", 42.0),
+        adx_period=cfg.get("adx_period", 14),
+        adx_threshold=cfg.get("adx_threshold", 20.0),
+        use_adx_filter=cfg.get("use_adx_filter", True),
+        use_rsi_filter=cfg.get("use_rsi_filter", True),
+        use_candlestick_confirm=cfg.get("use_candlestick_confirm", True),
+        zone_tolerance=cfg.get("zone_tolerance", 0.0075),
+        max_sl_pct=cfg.get("max_sl_pct", 0.02),
+        min_sentiment=cfg.get("min_sentiment", 0.0),
+        min_rr=cfg.get("min_rr", 2.0),
+        risk_pct=cfg.get("risk_pct", ACCOUNT_RISK_PCT),
+        atr_period=cfg.get("atr_period", 14),
+        atr_mult=cfg.get("atr_mult", 2.0),
+        use_atr_sl=cfg.get("use_atr_sl", True),
+        disable_htf=cfg.get("disable_htf", False),
+        sentiment_score=sentiment_score
     )
 
-    if signal in ["BUY", "SELL"] and isinstance(details, dict):
-        if signal == "SELL":
-            logger.info(f"⚡ SHORT SIGNAL DETECTED for {symbol}: Bypassed (Spot Mode Active).")
-            return
+    action = signal.get("action", "HOLD")
+    reason = signal.get("reason", "")
 
-        logger.info(f"⚡ LIVE BUY SIGNAL DETECTED: {signal} on {symbol}")
+    if action in ["BUY", "LONG"]:
+        entry_p = safe_float(signal.get("entry_price"))
+        sl_p = safe_float(signal.get("stop_loss"))
+        tp_p = safe_float(signal.get("take_profit"))
+        pos_size = safe_float(signal.get("position_size"))
 
-        # Ensure no existing open trade for this pair before placing live buy order
-        conn = get_db_connection()
-        if conn:
-            try:
-                cursor = conn.cursor()
-                cursor.execute(
-                    "SELECT id FROM trade_setups WHERE (pair = %s OR pair = %s) AND trade_state = 'OPEN';",
-                    (symbol, db_symbol),
-                )
-                existing = cursor.fetchone()
+        logger.info(f"[{symbol}] VALID BUY SIGNAL: Entry=${entry_p:.5f}, SL=${sl_p:.5f}, TP=${tp_p:.5f}, Reason: {reason}")
+        
+        trade_amount_usd = min(active_usdt_balance * MAX_ALLOCATION_PER_TRADE, active_usdt_balance * 0.98)
+        
+        exec_success = execution_engine.execute_live_order(
+            pair=symbol,
+            direction="BUY",
+            entry_price=entry_p,
+            stop_loss=sl_p,
+            take_profit=tp_p,
+            amount_usd=trade_amount_usd
+        )
 
-                if not existing:
-                    position_size = details["position_size"]
-                    account_balance = details.get("account_balance", allocated_slot_usd)
-
-                    amount_usd = details.get("position_size_usd") or (position_size * safe_float(details["entry_price"]))
-
-                    # Execute Live Spot Buy Order
-                    order_res = execution_engine.buy_spot_mexc(
-                        symbol=symbol,
-                        amount_usd=amount_usd
-                    )
-
-                    if order_res and (order_res.get("status") == "SUCCESS" or order_res.get("id") or order_res.get("success")):
-                        actual_entry = safe_float(order_res.get("fill_price") or order_res.get("price"), default=details["entry_price"])
-                        actual_qty = safe_float(order_res.get("executed_qty") or order_res.get("amount"), default=position_size)
-
-                        # Calculate percentage or ATR distance from original signal
-                        sl_distance = abs(safe_float(details["entry_price"]) - safe_float(details["stop_loss"]))
-                        tp_distance = abs(safe_float(details["take_profit"]) - safe_float(details["entry_price"]))
-
-                        # Dynamic re-anchoring to actual fill price
-                        dynamic_stop_loss = actual_entry - sl_distance if signal == "BUY" else actual_entry + sl_distance
-                        dynamic_take_profit = actual_entry + tp_distance if signal == "BUY" else actual_entry - tp_distance
-
-                        insert_query = """
-                            INSERT INTO trade_setups (pair, direction, entry_price, stop_loss, take_profit, risk_pct, position_size, account_balance, status, trade_state)
-                            VALUES (%s, 'LONG', %s, %s, %s, %s, %s, %s, 'EXECUTED', 'OPEN')
-                            RETURNING id;
-                        """
-                        cursor.execute(
-                            insert_query,
-                            (
-                                symbol,
-                                actual_entry,
-                                dynamic_stop_loss,
-                                dynamic_take_profit,
-                                ACCOUNT_RISK_PCT,
-                                actual_qty,
-                                account_balance,
-                            ),
-                        )
-                        trade_id = cursor.fetchone()[0]
-                        conn.commit()
-
-                        logger.info(
-                            f"SUCCESS: Live Spot Buy Order Executed & Trade #{trade_id} Recorded [{symbol}]"
-                        )
-
-                        send_telegram_notification(
-                            f"<b>🚀 NEW LIVE SPOT TRADE EXECUTED</b>\n\n"
-                            f"<b>Trade ID:</b> <code>#{trade_id}</code>\n"
-                            f"<b>Pair:</b> <code>{symbol}</code>\n"
-                            f"<b>Direction:</b> <code>LONG (BUY SPOT)</code>\n"
-                            f"<b>Fill Price:</b> ${actual_entry:.5f}\n"
-                            f"<b>Stop Loss:</b> ${dynamic_stop_loss:.5f}\n"
-                            f"<b>Take Profit:</b> ${dynamic_take_profit:.5f}\n"
-                            f"<b>Quantity:</b> {actual_qty:.4f} units\n"
-                            f"<b>Slot Margin:</b> ${account_balance:.2f} USD"
-                        )
-                    else:
-                        logger.error(f"Live Spot Order Execution failed for {symbol}: {order_res}")
-
-                else:
-                    logger.info(
-                        f"Skipping trade execution: Trade #{existing[0]} is already OPEN for {symbol}."
-                    )
-
-                cursor.close()
-            except Exception as e:
-                logger.error(f"Failed to process live trade execution in DB: {e}")
-            finally:
-                release_db_connection(conn)
+        if exec_success:
+            tm.record_executed_trade(
+                pair=symbol,
+                direction="BUY",
+                entry_price=entry_p,
+                stop_loss=sl_p,
+                take_profit=tp_p,
+                position_size=pos_size,
+                account_balance=active_usdt_balance
+            )
+            send_telegram_notification(
+                f"<b>🟢 LIVE SPOT ORDER EXECUTED</b>\n\n"
+                f"<b>Pair:</b> <code>{symbol}</code>\n"
+                f"<b>Entry:</b> ${entry_p:.5f}\n"
+                f"<b>Stop Loss:</b> ${sl_p:.5f}\n"
+                f"<b>Take Profit:</b> ${tp_p:.5f}\n"
+                f"<b>Reason:</b> {reason}"
+            )
+    elif action in ["SELL", "SHORT"]:
+        logger.info(f"[{symbol}] Short signal evaluated ({reason}). Spot execution mode active: Skipping short setup.")
     else:
-        logger.info(f"No entry signal for {symbol} ({details})")
+        logger.info(f"[{symbol}] Hold Signal ({reason})")
+
 
 def main():
-    logger.info(f"Starting Live Trading Bot Engine (Spot Mode) | Active Watchlist: {WATCHLIST}...")
-
     ensure_schema_updated()
     tm = TradeManager()
 
-    send_telegram_notification(
-        f"<b>🟢 BOT STARTED (LIVE SPOT MODE)</b>\nMonitoring pairs: <code>{', '.join(WATCHLIST)}</code>"
-    )
+    logger.info("Initializing Trading Engine Core Loop...")
 
     while True:
         try:
-            for symbol in WATCHLIST:
-                process_symbol(symbol, tm)
-            logger.info(
-                f"Cycle complete. Waiting {POLL_INTERVAL_SECONDS}s for next check..."
-            )
-            time.sleep(POLL_INTERVAL_SECONDS)
-        except KeyboardInterrupt:
-            logger.info("Bot execution stopped manually by user.")
-            send_telegram_notification(
-                "<b>🔴 BOT STOPPED</b>\nExecution loop interrupted manually."
-            )
-            break
-        except Exception as e:
-            logger.error(f"Unexpected error in main loop: {e}", exc_info=True)
-            time.sleep(15)
+            live_balance = execution_engine.fetch_available_usdt_balance()
+            active_usdt_balance = live_balance if live_balance > 1.0 else FALLBACK_BALANCE
+            
+            if check_daily_circuit_breaker(max_loss_pct=3.0, account_balance=active_usdt_balance):
+                logger.warning("Daily Circuit Breaker Triggered. Max loss reached for today. Pausing entry execution.")
+                time.sleep(POLL_INTERVAL_SECONDS)
+                continue
+
+            reconcile_open_trades(execution_engine)
+
+            for sym in WATCHLIST:
+                process_symbol(sym, tm, active_usdt_balance)
+
+        except Exception as loop_err:
+            logger.error(f"Error in main bot execution cycle: {loop_err}")
+
+        time.sleep(POLL_INTERVAL_SECONDS)
+
 
 if __name__ == "__main__":
     main()

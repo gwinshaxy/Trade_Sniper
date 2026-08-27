@@ -14,7 +14,6 @@ from dotenv import load_dotenv
 
 load_dotenv(override=True)
 
-# --- Asset Links Intercept for TWA Verification ---
 query_params = st.query_params
 if "assetlinks" in query_params or st.context.headers.get("Path") == "/.well-known/assetlinks.json":
     try:
@@ -26,15 +25,12 @@ if "assetlinks" in query_params or st.context.headers.get("Path") == "/.well-kno
 
 from lightweight_charts.widgets import StreamlitChart
 
-# Page configuration MUST be the first Streamlit command executed
-st.set_page_config(page_title="MEXC Trading Terminal", layout="wide")
+st.set_page_config(page_title="MEXC Spot Trading Terminal", layout="wide")
 
-
-# Updated PWA Manifest using your GitHub Raw Icons
 pwa_manifest = """
 {
   "short_name": "TradeSniper",
-  "name": "Trade Sniper Terminal",
+  "name": "Trade Sniper Spot Terminal",
   "icons": [
     {
       "src": "https://raw.githubusercontent.com/gwinshaxy/Trade_Sniper/main/icon-192.png",
@@ -58,7 +54,6 @@ pwa_manifest = """
 
 pwa_injector = f"""
 <script>
-  // 1. Inject Manifest
   const manifestBlob = new Blob([{repr(pwa_manifest)}], {{type: 'application/json'}});
   const manifestUrl = URL.createObjectURL(manifestBlob);
   let manifestLink = document.createElement('link');
@@ -66,19 +61,16 @@ pwa_injector = f"""
   manifestLink.href = manifestUrl;
   window.parent.document.head.appendChild(manifestLink);
 
-  // 2. Inject Favicon Link using your 192px GitHub Icon
   let iconLink = document.createElement('link');
   iconLink.rel = 'apple-touch-icon';
   iconLink.href = 'https://raw.githubusercontent.com/gwinshaxy/Trade_Sniper/main/icon-192.png';
   window.parent.document.head.appendChild(iconLink);
 
-  // 3. Set Mobile Theme Color
   let metaTheme = document.createElement('meta');
   metaTheme.name = 'theme-color';
   metaTheme.content = '#0e1117';
   window.parent.document.head.appendChild(metaTheme);
 
-  // 4. Register Service Worker
   if ('serviceWorker' in navigator) {{
     const swCode = `
       self.addEventListener('install', (e) => self.skipWaiting());
@@ -207,7 +199,8 @@ for default_pair in ["XRP/USDT"]:
 
 st.sidebar.subheader("🎛️ Terminal Controls & Tuning")
 
-config_target_pair = st.sidebar.selectbox("Active Execution / Config Pair", available_pairs, index=0)
+selected_pair = st.sidebar.selectbox("Active Execution / Config Pair", available_pairs, index=0)
+config_target_pair = selected_pair
 
 pair_key = config_target_pair.replace("/", "")
 dyn_cfg = strategy.load_symbol_config(config_target_pair)
@@ -253,6 +246,29 @@ adx_threshold = st.sidebar.slider(
     value=float(dyn_cfg.get("adx_threshold", 20.0)), 
     step=1.0, 
     key=f"adx_t_{pair_key}"
+)
+
+atr_period = st.sidebar.number_input(
+    "ATR Period", 
+    value=int(dyn_cfg.get("atr_period", 14)), 
+    min_value=2, 
+    max_value=50, 
+    key=f"atr_p_{pair_key}"
+)
+
+atr_mult = st.sidebar.slider(
+    "ATR Multiplier", 
+    min_value=0.5, 
+    max_value=5.0, 
+    value=float(dyn_cfg.get("atr_mult", 2.0)), 
+    step=0.1, 
+    key=f"atr_m_{pair_key}"
+)
+
+use_atr_sl = st.sidebar.checkbox(
+    "Use ATR Dynamic Stop Loss", 
+    value=bool(dyn_cfg.get("use_atr_sl", True)), 
+    key=f"chk_atr_sl_{pair_key}"
 )
 
 max_sl_pct = st.sidebar.slider(
@@ -303,8 +319,14 @@ use_candlestick_confirm = st.sidebar.checkbox(
     key=f"chk_candle_{pair_key}"
 )
 
+disable_htf = st.sidebar.checkbox(
+    "Disable Higher Timeframe Trend Filter", 
+    value=bool(dyn_cfg.get("disable_htf", False)), 
+    key=f"chk_htf_{pair_key}"
+)
+
 st.sidebar.markdown("---")
-direction = st.sidebar.selectbox("Order Direction", ["LONG", "SHORT"])
+direction = st.sidebar.selectbox("Order Direction", ["BUY"])
 overlay_chart = st.sidebar.checkbox("Overlay Trade Positions on Chart", value=True)
 overlay_gaps = st.sidebar.checkbox("Overlay Volume Profile Gaps", value=True)
 
@@ -319,10 +341,9 @@ st.sidebar.markdown(f"**Risk : Reward Ratio:** `1:{rr_ratio}`")
 
 account_balance = st.sidebar.number_input("Account Balance ($)", min_value=1.0, value=float(os.getenv("ACCOUNT_BALANCE", 100.0)))
 risk_pct = st.sidebar.number_input("Risk Per Trade (%)", min_value=0.01, max_value=100.0, value=1.0)
-calc_position_size = round((account_balance * (risk_pct / 100.0)) / risk, 4) if risk > 0 else 0.0
 
 if st.sidebar.button("🚀 Execute Live Order via MEXC API", use_container_width=True):
-    with st.spinner("Submitting order..."):
+    with st.spinner("Submitting Spot Order..."):
         try:
             success = executor.execute_live_order(
                 pair=config_target_pair,
@@ -333,15 +354,15 @@ if st.sidebar.button("🚀 Execute Live Order via MEXC API", use_container_width
             )
             if success:
                 st.cache_data.clear()
-                st.success(f"Live trade executed for {config_target_pair} on MEXC Futures!")
-                send_telegram_notification(f"<b>🚀 NEW LIVE ORDER EXECUTED</b>\n\n<b>Pair:</b> <code>{config_target_pair}</code>\n<b>Direction:</b> <code>{direction}</code>")
+                st.success(f"Live Spot trade executed for {config_target_pair} on MEXC!")
+                send_telegram_notification(f"<b>🚀 NEW LIVE SPOT ORDER EXECUTED</b>\n\n<b>Pair:</b> <code>{config_target_pair}</code>\n<b>Direction:</b> <code>{direction}</code>")
                 st.rerun()
             else:
-                st.error("Order execution failed. Review engine logs.")
+                st.error("Spot order execution failed. Review engine logs.")
         except Exception as exec_err:
             st.error(f"Execution Error Encountered: {exec_err}")
 
-st.title("📊 Live MEXC Trading Dashboard")
+st.title("📊 Live MEXC Spot Trading Dashboard")
 
 closed_trades = df_all_trades[df_all_trades['status'] == 'CLOSED'] if not df_all_trades.empty and 'status' in df_all_trades.columns else pd.DataFrame()
 net_realized_pnl = float(closed_trades['pnl_usd'].sum()) if not closed_trades.empty and 'pnl_usd' in closed_trades.columns else 0.0
@@ -366,9 +387,7 @@ with col_hdr:
 with col_tf:
     selected_timeframe = st.selectbox("Select Timeframe:", ["5m", "15m", "30m", "1h", "4h", "1d"], index=3, key="chart_timeframe_select")
 
-# Dynamic synchronization between active sidebar pair and main chart selection
-default_chart_idx = available_pairs.index(config_target_pair) if config_target_pair in available_pairs else 0
-chart_symbol = st.selectbox("Select Chart Asset", available_pairs, index=default_chart_idx, key="chart_symbol_select")
+chart_symbol = selected_pair
 
 try:
     df_ohlc = strategy.fetch_klines(symbol=chart_symbol, interval=selected_timeframe)
@@ -396,7 +415,6 @@ if df_ohlc is not None and not df_ohlc.empty:
 
         df_ohlc['tema_custom'] = strategy.calc_tema(df_ohlc['close'], period=min(tema_period, len(df_ohlc)))
         
-        # Defensive calls to compute volume profile
         if hasattr(strategy, 'compute_volume_profile'):
             poc, vah, val = strategy.compute_volume_profile(df_ohlc, num_bins=100, lookback_bars=lookback_bars, va_pct=0.70)
         else:
@@ -407,7 +425,6 @@ if df_ohlc is not None and not df_ohlc.empty:
         else:
             detected_gaps = []
 
-        # Extract min/max bounds with a minor safety buffer
         min_chart_p = float(df_ohlc['low'].min())
         max_chart_p = float(df_ohlc['high'].max())
 
@@ -432,7 +449,6 @@ if df_ohlc is not None and not df_ohlc.empty:
             tema_line = chart.create_line(name=line_name, color="orange", width=2)
             tema_line.set(tema_df)
 
-        # --- Volume Profile Levels (VAH, VAL, POC) ---
         if pd.notnull(vah) and not np.isnan(vah):
             chart.horizontal_line(float(vah), color="#2962ff", style="solid", width=2, text=f"VAH: {vah:.2f}")
 
@@ -442,21 +458,20 @@ if df_ohlc is not None and not df_ohlc.empty:
         if pd.notnull(poc) and not np.isnan(poc):
             chart.horizontal_line(float(poc), color="#f44336", style="solid", width=2, text=f"POC: {poc:.2f}")
 
-        # --- Volume Profile Gaps Overlay ---
         if overlay_gaps and detected_gaps:
             for gap_price in detected_gaps:
                 if pd.notnull(gap_price) and not np.isnan(gap_price):
                     chart.horizontal_line(float(gap_price), color="#ff9800", style="dashed", width=1, text=f"GAP: {gap_price:.2f}")
 
         if overlay_chart and not df_all_trades.empty and 'pair' in df_all_trades.columns and 'status' in df_all_trades.columns:
-            symbol_trades = df_all_trades[(df_all_trades['pair'].apply(normalize_symbol) == normalize_symbol(chart_symbol)) & (df_all_trades['status'].isin(['EXECUTED', 'PENDING']))]
+            symbol_trades = df_all_trades[(df_all_trades['pair'].apply(normalize_symbol) == normalize_symbol(selected_pair)) & (df_all_trades['status'].isin(['EXECUTED', 'PENDING']))]
             for _, tr in symbol_trades.iterrows():
                 entry_p = float(tr['entry_price']) if pd.notnull(tr['entry_price']) else 0.0
                 sl_p = float(tr['stop_loss']) if pd.notnull(tr['stop_loss']) else 0.0
                 tp_p = float(tr['take_profit']) if pd.notnull(tr['take_profit']) else 0.0
 
                 if min_chart_p * 0.5 <= entry_p <= max_chart_p * 1.5:
-                    chart.horizontal_line(entry_p, color="blue", text=f"ENTRY ({tr['direction']})")
+                    chart.horizontal_line(entry_p, color="blue", text=f"ENTRY ({tr.get('direction', 'BUY')})")
                 if sl_p > 0 and (min_chart_p * 0.5 <= sl_p <= max_chart_p * 1.5):
                     chart.horizontal_line(sl_p, color="red", text="SL")
                 if tp_p > 0 and (min_chart_p * 0.5 <= tp_p <= max_chart_p * 1.5):
@@ -528,12 +543,13 @@ with tab_active:
             if st.button("🚨 Market Close on MEXC Exchange", type="primary", use_container_width=True):
                 try:
                     close_res = executor.close_live_position_mexc(
-                        pair=selected_row['pair'],
+                        symbol=selected_row['pair'],
                         position_size=float(selected_row['position_size']),
-                        direction=selected_row['direction']
+                        current_price=manual_exit,
+                        outcome="MANUAL_CLOSE"
                     )
                     
-                    if close_res.get("success") and float(close_res.get("exit_price", 0.0)) > 0.0:
+                    if close_res.get("status") in ["SUCCESS", "FORCE_CLOSED_DB_ONLY"] and float(close_res.get("exit_price", 0.0)) > 0.0:
                         final_p = float(close_res["exit_price"])
                         if close_trade_manually(selected_trade_id, final_p, reason="STREAMLIT_MEXC_MARKET_CLOSE"):
                             st.cache_data.clear()
@@ -542,7 +558,7 @@ with tab_active:
                         else:
                             st.error("Position closed on MEXC, but database update failed.")
                     else:
-                        st.error("🚨 CRITICAL: MEXC close order failed or returned $0.00 price. Live position remains OPEN on exchange. DB was NOT modified.")
+                        st.error(f"🚨 CRITICAL: MEXC close order failed: {close_res.get('error')}. DB was NOT modified.")
                 except Exception as close_err:
                     st.error(f"Error attempting MEXC close: {close_err}")
                     
@@ -618,9 +634,9 @@ with col_log:
     st.markdown("*Live Worker Logs:*")
     log_messages = [
         "[INFO] Database connection established...",
-        "[INFO] Live Execution Engine bound to MEXC API.",
+        "[INFO] Live Execution Engine bound to MEXC Spot API.",
         "[INFO] Pending setups tab synchronized with PostgreSQL.",
-        "[STATUS] Monitoring strategy triggers and active positions."
+        "[STATUS] Monitoring spot strategy triggers and active positions."
     ]
     for log_item in log_messages:
         st.code(log_item, language="text")
