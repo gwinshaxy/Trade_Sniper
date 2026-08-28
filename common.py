@@ -39,11 +39,11 @@ def init_db_pool():
     if _db_pool is None:
         try:
             if DB_URL:
-                _db_pool = pool.ThreadedConnectionPool(1, 20, DB_URL)
+                _db_pool = pool.ThreadedConnectionPool(1, 5, DB_URL)
             elif DB_PASS:
                 _db_pool = pool.ThreadedConnectionPool(
                     minconn=1,
-                    maxconn=20,
+                    maxconn=5,
                     host=DB_HOST,
                     port=DB_PORT,
                     dbname=DB_NAME,

@@ -1,6 +1,7 @@
 import os
 import time
 import logging
+import gc  # Added for explicit memory garbage collection
 import pandas as pd
 from dotenv import load_dotenv
 
@@ -85,7 +86,7 @@ def process_symbol(symbol: str, tm: TradeManager, active_usdt_balance: float):
     """Fetches market klines, loads strategy params, evaluates signals, and manages orders."""
     logger.info(f"[{symbol}] Processing market signal check...")
 
-    df_klines = fetch_klines(symbol=symbol, interval=TIMEFRAME, limit=600)
+    df_klines = fetch_klines(symbol=symbol, interval=TIMEFRAME, limit=300)
     if df_klines.empty:
         logger.warning(f"[{symbol}] Unable to retrieve kline data. Skipping processing cycle.")
         return
