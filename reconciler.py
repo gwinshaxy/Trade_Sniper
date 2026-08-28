@@ -1,5 +1,10 @@
 import logging
-from common import get_db_connection, release_db_connection, send_telegram_notification
+from common import (
+    get_db_connection,
+    release_db_connection,
+    send_telegram_notification,
+    set_asset_cooldown
+)
 from live_executor import MEXCLiveExecutor
 
 logger = logging.getLogger("reconciler")
@@ -11,7 +16,7 @@ def reconcile_open_trades(executor: MEXCLiveExecutor) -> int:
     """
     Scans the database for 'OPEN' trades, compares them against real-time
     MEXC spot holdings, and auto-closes any database records where physical tokens 
-    are missing on the exchange.
+    are missing on the exchange. Applies a 2-hour cooldown to auto-closed assets.
     
     Returns the count of reconciled/closed orphan trades.
     """
@@ -67,6 +72,9 @@ def reconcile_open_trades(executor: MEXCLiveExecutor) -> int:
                     (trade_id,)
                 )
                 conn.commit()
+
+                # Apply 2-hour cooldown for auto-reconciled orphan trade
+                set_asset_cooldown(pair, hours=2)
 
                 reconciled_count += 1
 

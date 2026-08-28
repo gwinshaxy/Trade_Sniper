@@ -1,7 +1,7 @@
 import os
 import time
 import logging
-import gc  # Added for explicit memory garbage collection
+import gc
 import pandas as pd
 from dotenv import load_dotenv
 
@@ -11,6 +11,7 @@ from common import (
     release_db_connection,
     check_daily_circuit_breaker,
     send_telegram_notification,
+    check_asset_cooldown,
 )
 from live_executor import LiveExecutionEngine
 from reconciler import reconcile_open_trades
@@ -84,6 +85,12 @@ def save_market_state(pair: str, rsi: float, adx: float, atr: float, tema: float
 
 def process_symbol(symbol: str, tm: TradeManager, active_usdt_balance: float):
     """Fetches market klines, loads strategy params, evaluates signals, and manages orders."""
+    
+    # Check 2-Hour Asset Cooldown Guard
+    if check_asset_cooldown(symbol):
+        logger.info(f"[{symbol}] Asset is currently in a 2-hour post-trade cooldown. Skipping signal generation.")
+        return
+
     logger.info(f"[{symbol}] Processing market signal check...")
 
     df_klines = fetch_klines(symbol=symbol, interval=TIMEFRAME, limit=300)

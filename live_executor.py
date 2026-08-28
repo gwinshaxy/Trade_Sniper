@@ -2,7 +2,13 @@ import logging
 import time
 import ccxt
 
-logger = logging.getLogger(__name__)
+from common import (
+    get_db_connection,
+    release_db_connection,
+    send_telegram_notification,
+    set_asset_cooldown,
+    logger
+)
 
 MIN_DUST_THRESHOLD = 0.001
 MAX_SLIPPAGE_PCT = 0.002       # 0.2% max slippage ceiling
@@ -259,6 +265,8 @@ class MEXCLiveExecutor:
                 f"[{symbol}] Insufficient {base_asset} balance on exchange (Have: {available_amount}, Need: {position_size}). "
                 "Bypassing MEXC API order and force-closing trade in DB."
             )
+            # Bypassing MEXC API order and force-closing trade in DB -> Trigger 2-hour cooldown
+            set_asset_cooldown(symbol, hours=2)
             return {
                 "status": "FORCE_CLOSED_DB_ONLY",
                 "order_id": "GHOST_POSITION_DB_CLOSE",
@@ -282,6 +290,9 @@ class MEXCLiveExecutor:
             )
             order_id = order.get("id")
             exit_price = safe_float(order.get("average") or order.get("price")) or current_price
+
+            # Position successfully closed -> Apply 2hr cooldown
+            set_asset_cooldown(symbol, hours=2)
 
             return {
                 "status": "SUCCESS",

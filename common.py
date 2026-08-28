@@ -137,8 +137,66 @@ def execute_query(conn, query, params=None, fetch=False):
         raise e
 
 
+def check_asset_cooldown(symbol: str) -> bool:
+    """Returns True if the asset is currently in a cooldown period."""
+    conn = get_db_connection()
+    if not conn:
+        return False
+    try:
+        clean_symbol = normalize_symbol(symbol).replace("/", "").upper()
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT cooldown_until FROM strategy_parameters 
+            WHERE UPPER(TRIM(REPLACE(REPLACE(symbol, '"', ''), '''', ''))) = %s;
+        """, (clean_symbol,))
+        row = cursor.fetchone()
+        cursor.close()
+
+        if row and row[0] is not None:
+            from datetime import datetime, timezone
+            cooldown_until = row[0]
+            if isinstance(cooldown_until, str):
+                cooldown_until = datetime.fromisoformat(cooldown_until)
+            if cooldown_until.tzinfo is None:
+                cooldown_until = cooldown_until.replace(tzinfo=timezone.utc)
+            
+            now = datetime.now(timezone.utc)
+            if now < cooldown_until:
+                return True
+        return False
+    except Exception as e:
+        logger.error(f"[{symbol}] Error checking asset cooldown: {e}")
+        return False
+    finally:
+        release_db_connection(conn)
+
+
+def set_asset_cooldown(symbol: str, hours: int = 2):
+    """Sets a cooldown timer for an asset starting from the current timestamp."""
+    conn = get_db_connection()
+    if not conn:
+        return
+    try:
+        clean_symbol = normalize_symbol(symbol).replace("/", "").upper()
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO strategy_parameters (symbol, cooldown_until, updated_at)
+            VALUES (%s, CURRENT_TIMESTAMP + (%s || ' hours')::INTERVAL, CURRENT_TIMESTAMP)
+            ON CONFLICT (symbol) DO UPDATE SET
+                cooldown_until = CURRENT_TIMESTAMP + (%s || ' hours')::INTERVAL,
+                updated_at = CURRENT_TIMESTAMP;
+        """, (clean_symbol, hours, hours))
+        conn.commit()
+        cursor.close()
+        logger.info(f"[{symbol}] Cooldown set for {hours} hour(s).")
+    except Exception as e:
+        logger.error(f"[{symbol}] Error setting asset cooldown: {e}")
+    finally:
+        release_db_connection(conn)
+
+
 def ensure_schema_updated():
-    """Ensures trade_setups and strategy_parameters tables exist with fully synchronized schemas including ATR parameters."""
+    """Ensures trade_setups and strategy_parameters tables exist with fully synchronized schemas including ATR parameters and cooldown column."""
     conn = get_db_connection()
     if not conn:
         logger.error("Database connection unavailable for schema check.")
@@ -208,6 +266,7 @@ def ensure_schema_updated():
                 use_atr_sl BOOLEAN DEFAULT TRUE,
                 disable_htf BOOLEAN DEFAULT FALSE,
                 fitness_score NUMERIC DEFAULT 0.0,
+                cooldown_until TIMESTAMP WITH TIME ZONE,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         """)
@@ -227,7 +286,8 @@ def ensure_schema_updated():
             "atr_mult FLOAT DEFAULT 2.0",
             "use_atr_sl BOOLEAN DEFAULT TRUE",
             "disable_htf BOOLEAN DEFAULT FALSE",
-            "fitness_score NUMERIC DEFAULT 0.0"
+            "fitness_score NUMERIC DEFAULT 0.0",
+            "cooldown_until TIMESTAMP WITH TIME ZONE"
         ]
         for col in param_columns:
             cursor.execute(f"ALTER TABLE strategy_parameters ADD COLUMN IF NOT EXISTS {col};")
@@ -305,6 +365,9 @@ def close_trade_manually(trade_id: int, exit_price: float, reason: str = "MANUAL
         """, (round(exit_price, 5), pnl_usd, pnl_pct, outcome, trade_id))
         conn.commit()
         cursor.close()
+
+        # Apply 2-hour post-trade cooldown
+        set_asset_cooldown(pair, hours=2)
 
         emoji = "🔴" if pnl_usd < 0 else "🟢"
         send_telegram_notification(
