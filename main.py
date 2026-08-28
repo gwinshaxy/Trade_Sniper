@@ -225,6 +225,10 @@ def main():
         except Exception as loop_err:
             logger.error(f"Error in main bot execution cycle: {loop_err}")
 
+        finally:
+            # Force cleanup of memory overhead after processing all symbols
+            gc.collect()
+
         time.sleep(POLL_INTERVAL_SECONDS)
 
 

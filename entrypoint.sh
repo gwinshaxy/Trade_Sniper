@@ -1,9 +1,11 @@
 #!/bin/bash
 set -e
 
+export PYTHONUNBUFFERED=1
+export MALLOC_TRIM_THRESHOLD_=128000
+
 cleanup() {
     echo "SIGTERM/SIGINT received. Shutting down active background processes gracefully..."
-    # Quote PID expansions to avoid syntax errors if a variable is unset
     kill -TERM "$PID_HEALTH" "$PID_MAIN" "${PID_WS:-}" 2>/dev/null || true
     wait
     echo "All processes terminated cleanly."

@@ -8,6 +8,8 @@ import pandas as pd
 from dotenv import load_dotenv
 from google import genai
 
+from common import get_db_connection, release_db_connection
+
 load_dotenv()
 
 logging.basicConfig(
@@ -43,59 +45,54 @@ def normalize_symbol(symbol: str) -> str:
 
 
 def load_symbol_config(symbol: str) -> dict:
-    """Loads optimized DEAP strategy parameters from PostgreSQL database safely closing connections."""
+    """Loads optimized strategy parameters using the connection pool safely."""
     clean_symbol = normalize_symbol(symbol).replace("/", "").upper()
-    db_url = os.getenv("DATABASE_URL") or os.getenv("DB_URL")
-
-    if db_url:
-        db_url = db_url.strip('"').strip("'").strip()
-
-    if PSYCOPG2_AVAILABLE and db_url:
-        conn = None
+    conn = get_db_connection()
+    
+    if conn:
         try:
-            conn = psycopg2.connect(db_url)
-            with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                cur.execute(
-                    """
-                    SELECT * 
-                    FROM strategy_parameters 
-                    WHERE UPPER(TRIM(REPLACE(REPLACE(symbol, '"', ''), '''', ''))) = %s
-                    ORDER BY updated_at DESC LIMIT 1;
-                    """,
-                    (clean_symbol,),
-                )
-                row = cur.fetchone()
-                if row:
-                    config = dict(row)
-                    config.setdefault("tema_period", int(config.get("tema_period", 200)))
-                    config.setdefault("rsi_period", int(config.get("rsi_period", 14)))
-                    config.setdefault("rsi_thresh", float(config.get("rsi_thresh", 42.0)))
-                    config.setdefault("adx_period", int(config.get("adx_period", 14)))
-                    config.setdefault("adx_threshold", float(config.get("adx_threshold", 20.0)))
-                    config.setdefault("max_sl_pct", float(config.get("max_sl_pct", 0.02)))
-                    config.setdefault("zone_tolerance", float(config.get("zone_tolerance", 0.0075)))
-                    config.setdefault("min_sentiment", float(config.get("min_sentiment", 0.0)))
-                    config.setdefault("risk_pct", float(config.get("risk_pct", 1.0)))
-                    config.setdefault("min_rr", float(config.get("min_rr", 2.0)))
-                    config.setdefault("use_rsi_filter", True)
-                    config.setdefault("use_candlestick_confirm", True)
-                    config.setdefault("use_adx_filter", True)
-                    config.setdefault("lookback_bars", 600)
-                    config.setdefault("vp_detection_pct", 0.07)
-                    config.setdefault("vp_va_pct", 0.70)
-                    config.setdefault("atr_period", 14)
-                    config.setdefault("atr_mult", 2.0)
-                    config.setdefault("use_atr_sl", True)
-                    config.setdefault("disable_htf", False)
-                    return config
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT * 
+                FROM strategy_parameters 
+                WHERE UPPER(TRIM(REPLACE(REPLACE(symbol, '"', ''), '''', ''))) = %s
+                ORDER BY updated_at DESC LIMIT 1;
+                """,
+                (clean_symbol,),
+            )
+            row = cursor.fetchone()
+            cursor.close()
+            
+            if row:
+                colnames = [desc[0] for desc in cursor.description] if cursor.description else []
+                config = dict(zip(colnames, row)) if isinstance(row, tuple) else dict(row)
+                
+                config.setdefault("tema_period", int(config.get("tema_period", 200)))
+                config.setdefault("rsi_period", int(config.get("rsi_period", 14)))
+                config.setdefault("rsi_thresh", float(config.get("rsi_thresh", 42.0)))
+                config.setdefault("adx_period", int(config.get("adx_period", 14)))
+                config.setdefault("adx_threshold", float(config.get("adx_threshold", 20.0)))
+                config.setdefault("max_sl_pct", float(config.get("max_sl_pct", 0.02)))
+                config.setdefault("zone_tolerance", float(config.get("zone_tolerance", 0.0075)))
+                config.setdefault("min_sentiment", float(config.get("min_sentiment", 0.0)))
+                config.setdefault("risk_pct", float(config.get("risk_pct", 1.0)))
+                config.setdefault("min_rr", float(config.get("min_rr", 2.0)))
+                config.setdefault("use_rsi_filter", True)
+                config.setdefault("use_candlestick_confirm", True)
+                config.setdefault("use_adx_filter", True)
+                config.setdefault("lookback_bars", 600)
+                config.setdefault("vp_detection_pct", 0.07)
+                config.setdefault("vp_va_pct", 0.70)
+                config.setdefault("atr_period", 14)
+                config.setdefault("atr_mult", 2.0)
+                config.setdefault("use_atr_sl", True)
+                config.setdefault("disable_htf", False)
+                return config
         except Exception as e:
             logging.error(f"[load_symbol_config] DB query failed for {clean_symbol}: {e}")
         finally:
-            if conn:
-                try:
-                    conn.close()
-                except Exception:
-                    pass
+            release_db_connection(conn)
 
     return {
         "tema_period": 200,
