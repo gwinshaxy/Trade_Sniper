@@ -101,15 +101,15 @@ class MEXCLiveExecutor:
             logger.warning(f"[{pair}] Attempted {clean_direction} execution. Spot execution only supports BUY/LONG positions.")
             return False
 
-        res = self.buy_spot_mexc(symbol=pair, amount_usd=amount_usd)
+        res = self.buy_spot_mexc(symbol=pair, amount_usd=amount_usd, stop_loss=stop_loss, take_profit=take_profit)
         if res.get("status") == "SUCCESS":
-            logger.info(f"[{pair}] Live spot order executed successfully via Dashboard wrapper: Order ID {res.get('order_id')}")
+            logger.info(f"[{pair}] Live spot order executed successfully: Order ID {res.get('order_id')}")
             return True
         else:
             logger.error(f"[{pair}] Live spot order execution failed: {res.get('error') or res.get('reason')}")
             return False
 
-    def buy_spot_mexc(self, symbol: str, amount_usd: float) -> dict:
+    def buy_spot_mexc(self, symbol: str, amount_usd: float, stop_loss: float = 0.0, take_profit: float = 0.0) -> dict:
         clean_symbol = symbol.replace("/", "").upper()
         if "/" not in symbol and clean_symbol.endswith("USDT"):
             symbol = f"{clean_symbol[:-4]}/USDT"
@@ -191,6 +191,40 @@ class MEXCLiveExecutor:
                 fill_price = ask_price
 
             logger.info(f"[{symbol}] Limit Buy Executed successfully. Fill Price: {fill_price:.6f}, Qty: {executed_qty}")
+
+            # Step 4: Exchange-Level Native Order Placement (MEXC Stop-Loss & Take-Profit)
+            if stop_loss > 0:
+                try:
+                    sl_trigger = safe_float(self.exchange.price_to_precision(symbol, stop_loss))
+                    sl_exec_price = safe_float(self.exchange.price_to_precision(symbol, stop_loss * 0.995))
+                    sl_order = self.exchange.create_order(
+                        symbol=symbol,
+                        type='STOP_LIMIT',
+                        side='sell',
+                        amount=executed_qty,
+                        price=sl_exec_price,
+                        params={
+                            'stopPrice': sl_trigger,
+                            'triggerPrice': sl_trigger
+                        }
+                    )
+                    logger.info(f"[{symbol}] Native MEXC Stop-Loss order placed successfully @ Trigger: ${sl_trigger}")
+                except Exception as sl_err:
+                    logger.error(f"[{symbol}] Failed to place native MEXC Stop-Loss order: {sl_err}")
+
+            if take_profit > 0:
+                try:
+                    tp_price = safe_float(self.exchange.price_to_precision(symbol, take_profit))
+                    tp_order = self.exchange.create_order(
+                        symbol=symbol,
+                        type='limit',
+                        side='sell',
+                        amount=executed_qty,
+                        price=tp_price
+                    )
+                    logger.info(f"[{symbol}] Native MEXC Take-Profit Limit order placed @ ${tp_price}")
+                except Exception as tp_err:
+                    logger.error(f"[{symbol}] Failed to place native MEXC Take-Profit order: {tp_err}")
 
             return {
                 "status": "SUCCESS",

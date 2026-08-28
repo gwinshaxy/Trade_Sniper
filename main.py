@@ -159,8 +159,9 @@ def process_symbol(symbol: str, tm: TradeManager, active_usdt_balance: float):
         sl_p = safe_float(signal.get("stop_loss"))
         tp_p = safe_float(signal.get("take_profit"))
         pos_size = safe_float(signal.get("position_size"))
+        rr_ratio = safe_float(signal.get("risk_reward_ratio", 2.0))
 
-        logger.info(f"[{symbol}] VALID BUY SIGNAL: Entry=${entry_p:.5f}, SL=${sl_p:.5f}, TP=${tp_p:.5f}, Reason: {reason}")
+        logger.info(f"[{symbol}] VALID BUY SIGNAL: Entry=${entry_p:.5f}, SL=${sl_p:.5f}, TP=${tp_p:.5f}, R:R={rr_ratio}, Reason: {reason}")
         
         trade_amount_usd = min(active_usdt_balance * MAX_ALLOCATION_PER_TRADE, active_usdt_balance * 0.98)
         
@@ -181,7 +182,8 @@ def process_symbol(symbol: str, tm: TradeManager, active_usdt_balance: float):
                 stop_loss=sl_p,
                 take_profit=tp_p,
                 position_size=pos_size,
-                account_balance=active_usdt_balance
+                account_balance=active_usdt_balance,
+                risk_reward_ratio=rr_ratio
             )
             send_telegram_notification(
                 f"<b>🟢 LIVE SPOT ORDER EXECUTED</b>\n\n"
@@ -189,6 +191,7 @@ def process_symbol(symbol: str, tm: TradeManager, active_usdt_balance: float):
                 f"<b>Entry:</b> ${entry_p:.5f}\n"
                 f"<b>Stop Loss:</b> ${sl_p:.5f}\n"
                 f"<b>Take Profit:</b> ${tp_p:.5f}\n"
+                f"<b>R:R Ratio:</b> {rr_ratio}\n"
                 f"<b>Reason:</b> {reason}"
             )
     elif action in ["SELL", "SHORT"]:

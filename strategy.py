@@ -173,7 +173,6 @@ def fetch_cryptocompare_klines(symbol: str = "ETH/USDT", limit: int = 1000) -> p
 
 
 def fetch_klines(symbol: str = "BNB/USDT", interval: str = "1h", limit: int = 1000, timeframe: str = None) -> pd.DataFrame:
-    # Map timeframe to interval if passed
     actual_interval = timeframe if timeframe is not None else interval
     norm_sym = normalize_symbol(symbol)
     binance_symbol = norm_sym.replace("/", "")
@@ -278,7 +277,6 @@ def calc_adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
 
 
 def calc_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
-    """Calculates Average True Range (ATR)."""
     if df.empty or len(df) < period + 1:
         return pd.Series(0.0, index=df.index)
     high = df["high"]
@@ -515,6 +513,11 @@ def evaluate_signals(df: pd.DataFrame, symbol: str = "ETH/USDT", account_balance
         take_profit = round(max(min(tp_candidates), min_tp), 5) if tp_candidates else round(min_tp, 5)
 
         computed_rr = round((take_profit - current_close) / risk_distance, 2)
+
+        # HARD R:R FILTER GUARD ENFORCEMENT
+        if computed_rr < min_rr:
+            return {"action": "HOLD", "reason": f"Computed R:R ({computed_rr}) below minimum threshold ({min_rr})"}
+
         risk_amt = account_balance * (risk_pct / 100.0)
         position_size = round(risk_amt / risk_distance, 4)
 
@@ -554,6 +557,11 @@ def evaluate_signals(df: pd.DataFrame, symbol: str = "ETH/USDT", account_balance
         take_profit = round(min(max(tp_candidates), min_tp), 5) if tp_candidates else round(min_tp, 5)
 
         computed_rr = round((current_close - take_profit) / risk_distance, 2)
+
+        # HARD R:R FILTER GUARD ENFORCEMENT
+        if computed_rr < min_rr:
+            return {"action": "HOLD", "reason": f"Computed R:R ({computed_rr}) below minimum threshold ({min_rr})"}
+
         risk_amt = account_balance * (risk_pct / 100.0)
         position_size = round(risk_amt / risk_distance, 4)
 

@@ -46,9 +46,10 @@ class TradeManager:
         stop_loss: float, 
         take_profit: float, 
         position_size: float, 
-        account_balance: float
+        account_balance: float,
+        risk_reward_ratio: float = 2.0
     ) -> bool:
-        """Records a successfully executed live trade into the database."""
+        """Records a successfully executed live trade directly with risk_reward_ratio into the database."""
         conn = get_db_connection()
         if not conn:
             logger.error(f"[{pair}] Database connection failed when recording trade.")
@@ -59,13 +60,13 @@ class TradeManager:
             cursor.execute(
                 """
                 INSERT INTO trade_setups 
-                (pair, direction, entry_price, stop_loss, take_profit, position_size, account_balance, trade_state, status) 
-                VALUES (%s, %s, %s, %s, %s, %s, %s, 'OPEN', 'EXECUTED');
+                (pair, direction, entry_price, stop_loss, take_profit, risk_reward_ratio, position_size, account_balance, trade_state, status) 
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'OPEN', 'EXECUTED');
                 """,
-                (pair, direction, entry_price, stop_loss, take_profit, position_size, account_balance)
+                (pair, direction, entry_price, stop_loss, take_profit, risk_reward_ratio, position_size, account_balance)
             )
             conn.commit()
-            logger.info(f"[{pair}] Open trade recorded successfully in database.")
+            logger.info(f"[{pair}] Open trade recorded successfully in database with R:R {risk_reward_ratio}.")
             return True
         except Exception as e:
             logger.error(f"[{pair}] Failed to record executed trade: {e}")
@@ -142,7 +143,7 @@ class TradeManager:
                         "new_sl": new_sl,
                         "new_state": "BE_LOCKED",
                         "msg": (
-                            f"🔒 <b>BREAK-EVEN TRIGGERED</b>\n\n"
+                            f"🛡 <b>BREAK-EVEN TRIGGERED</b>\n\n"
                             f"<b>Trade ID:</b> <code>#{trade_id}</code>\n"
                             f"<b>Pair:</b> <code>{pair}</code>\n"
                             f"<b>New Stop Loss:</b> ${new_sl:.5f} (1:1 R:R achieved)"
