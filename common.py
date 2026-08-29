@@ -137,17 +137,22 @@ def execute_query(conn, query, params=None, fetch=False):
         raise e
 
 
+def normalize_symbol(symbol: str) -> str:
+    """Normalizes pairs by stripping slashes, underscores, and dashes (e.g. 'XRP/USDT' or 'XRP_USDT' -> 'XRPUSDT')."""
+    return symbol.replace("/", "").replace("_", "").replace("-", "").upper()
+
+
 def check_asset_cooldown(symbol: str) -> bool:
     """Returns True if the asset is currently in a cooldown period."""
     conn = get_db_connection()
     if not conn:
         return False
     try:
-        clean_symbol = normalize_symbol(symbol).replace("/", "").upper()
+        clean_symbol = normalize_symbol(symbol)
         cursor = conn.cursor()
         cursor.execute("""
             SELECT cooldown_until FROM strategy_parameters 
-            WHERE UPPER(TRIM(REPLACE(REPLACE(symbol, '"', ''), '''', ''))) = %s;
+            WHERE UPPER(TRIM(REPLACE(REPLACE(REPLACE(symbol, '"', ''), '''', ''), '_', ''))) = %s;
         """, (clean_symbol,))
         row = cursor.fetchone()
         cursor.close()
@@ -177,7 +182,7 @@ def set_asset_cooldown(symbol: str, hours: int = 2):
     if not conn:
         return
     try:
-        clean_symbol = normalize_symbol(symbol).replace("/", "").upper()
+        clean_symbol = normalize_symbol(symbol)
         cursor = conn.cursor()
         cursor.execute("""
             INSERT INTO strategy_parameters (symbol, cooldown_until, updated_at)
@@ -195,7 +200,7 @@ def set_asset_cooldown(symbol: str, hours: int = 2):
         release_db_connection(conn)
 
 
-def ensure_schema_updated():
+def verify_base_schema():
     """Ensures trade_setups and strategy_parameters tables exist with fully synchronized schemas including ATR parameters and cooldown column."""
     conn = get_db_connection()
     if not conn:
@@ -294,7 +299,7 @@ def ensure_schema_updated():
             
         conn.commit()
         cursor.close()
-        logger.info("Database schema verified and updated successfully.")
+        logger.info("Database base schema verified successfully.")
     except Exception as e:
         logger.error(f"Schema auto-update error: {e}")
     finally:
@@ -387,10 +392,6 @@ def close_trade_manually(trade_id: int, exit_price: float, reason: str = "MANUAL
         release_db_connection(conn)
 
 
-def normalize_symbol(symbol: str) -> str:
-    return symbol.replace("/", "").replace("-", "").upper()
-
-
 def to_mexc_ws_symbol(symbol: str) -> str:
     clean = normalize_symbol(symbol)
     if clean.endswith("USDT"):
@@ -418,5 +419,28 @@ def check_daily_circuit_breaker(max_loss_pct: float = 3.0, account_balance: floa
     except Exception as e:
         logger.error(f"[Circuit Breaker Error]: {e}")
         return False
+    finally:
+        release_db_connection(conn)
+
+
+def ensure_schema_updated():
+    """Ensures database tables have required high-water mark and trailing stop tracking columns."""
+    verify_base_schema()
+    conn = get_db_connection()
+    if not conn:
+        return
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                ALTER TABLE trade_setups 
+                ADD COLUMN IF NOT EXISTS highest_price NUMERIC,
+                ADD COLUMN IF NOT EXISTS trailing_stop_price NUMERIC;
+                """
+            )
+            conn.commit()
+            logger.info("Schema verification: 'highest_price' and 'trailing_stop_price' columns ready.")
+    except Exception as e:
+        logger.error(f"Error ensuring schema column updates: {e}")
     finally:
         release_db_connection(conn)

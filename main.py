@@ -12,9 +12,10 @@ from common import (
     check_daily_circuit_breaker,
     send_telegram_notification,
     check_asset_cooldown,
+    set_asset_cooldown
 )
 from live_executor import LiveExecutionEngine
-from reconciler import reconcile_open_trades
+from reconciler import reconcile_open_trades, DUST_THRESHOLD
 from strategy import (
     fetch_klines,
     evaluate_signals,
@@ -83,6 +84,56 @@ def save_market_state(pair: str, rsi: float, adx: float, atr: float, tema: float
         release_db_connection(conn)
 
 
+def run_trailing_stop_engine(tm: TradeManager):
+    """Iterates through all active positions, evaluates high-water marks, and triggers trailing SL exits."""
+    open_trades = tm.get_all_open_trades()
+    if not open_trades:
+        return
+
+    logger.info("📈 Running Dynamic Trailing Stop Loss Engine...")
+
+    for trade in open_trades:
+        trade_id = trade['id']
+        pair = trade['pair']
+        
+        # Query current ticker price directly from exchange engine
+        curr_price = execution_engine.get_current_price(pair)
+        if curr_price <= 0:
+            continue
+
+        # Fetch recent ATR for volatility-adjusted trailing step
+        df_klines = fetch_klines(symbol=pair, interval=TIMEFRAME, limit=50)
+        atr_val = 0.0
+        if not df_klines.empty and len(df_klines) >= 14:
+            atr_val = calc_atr(df_klines, period=14).iloc[-1]
+
+        # Evaluate trailing high-water mark logic
+        result = tm.update_high_water_mark_and_trailing(
+            trade_id=trade_id, 
+            current_price=curr_price, 
+            atr=atr_val, 
+            trail_pct=0.02
+        )
+
+        if result.get("action") == "CLOSE_TRAILING_SL":
+            logger.warning(f"[{pair}] Trailing stop loss triggered. Executing live market sell...")
+            
+            # Execute Market Sell Order on Exchange
+            sell_success = execution_engine.execute_live_order(
+                pair=pair,
+                direction="SELL",
+                entry_price=curr_price,
+                stop_loss=0.0,
+                take_profit=0.0,
+                amount_usd=0.0  # Sells full physical balance on exchange
+            )
+
+            if sell_success:
+                tm.close_trade_in_db(trade_id=trade_id, exit_price=curr_price, reason="TRAILING_SL_HIT")
+                set_asset_cooldown(pair, hours=2)
+                send_telegram_notification(result.get("msg", f"Closed {pair} on Trailing SL."))
+
+
 def process_symbol(symbol: str, tm: TradeManager, active_usdt_balance: float):
     """Fetches market klines, loads strategy params, evaluates signals, and manages orders."""
     
@@ -114,7 +165,6 @@ def process_symbol(symbol: str, tm: TradeManager, active_usdt_balance: float):
             s_adx = calc_adx(df_klines, period=adx_p).iloc[-1]
             s_atr = calc_atr(df_klines, period=atr_p).iloc[-1]
             
-            # Simple regime classifier based on ADX & TEMA
             current_close = df_klines["close"].iloc[-1]
             regime = "TRENDING_BULL" if current_close > s_tema and s_adx >= 20 else ("TRENDING_BEAR" if current_close < s_tema and s_adx >= 20 else "RANGING")
 
@@ -134,7 +184,7 @@ def process_symbol(symbol: str, tm: TradeManager, active_usdt_balance: float):
         logger.info(f"[{symbol}] Open position already exists in trade manager. Skipping new signal checks.")
         return
 
-    # Fully harmonized parameter passing
+    # Signal Evaluation
     signal = evaluate_signals(
         df=df_klines,
         symbol=symbol,
@@ -183,25 +233,29 @@ def process_symbol(symbol: str, tm: TradeManager, active_usdt_balance: float):
         )
 
         if exec_success:
-            tm.record_executed_trade(
-                pair=symbol,
-                direction="BUY",
-                entry_price=entry_p,
-                stop_loss=sl_p,
-                take_profit=tp_p,
-                position_size=pos_size,
-                account_balance=active_usdt_balance,
-                risk_reward_ratio=rr_ratio
-            )
-            send_telegram_notification(
-                f"<b>🟢 LIVE SPOT ORDER EXECUTED</b>\n\n"
-                f"<b>Pair:</b> <code>{symbol}</code>\n"
-                f"<b>Entry:</b> ${entry_p:.5f}\n"
-                f"<b>Stop Loss:</b> ${sl_p:.5f}\n"
-                f"<b>Take Profit:</b> ${tp_p:.5f}\n"
-                f"<b>R:R Ratio:</b> {rr_ratio}\n"
-                f"<b>Reason:</b> {reason}"
-            )
+            spot_bal = execution_engine.get_spot_balance(symbol)
+            if spot_bal >= DUST_THRESHOLD:
+                tm.record_executed_trade(
+                    pair=symbol,
+                    direction="BUY",
+                    entry_price=entry_p,
+                    stop_loss=sl_p,
+                    take_profit=tp_p,
+                    position_size=pos_size,
+                    account_balance=active_usdt_balance,
+                    risk_reward_ratio=rr_ratio
+                )
+                send_telegram_notification(
+                    f"<b>🟢 LIVE SPOT ORDER EXECUTED</b>\n\n"
+                    f"<b>Pair:</b> <code>{symbol}</code>\n"
+                    f"<b>Entry:</b> ${entry_p:.5f}\n"
+                    f"<b>Stop Loss:</b> ${sl_p:.5f}\n"
+                    f"<b>Take Profit:</b> ${tp_p:.5f}\n"
+                    f"<b>R:R Ratio:</b> {rr_ratio}\n"
+                    f"<b>Reason:</b> {reason}"
+                )
+            else:
+                logger.error(f"[{symbol}] Order reported success but live spot balance ({spot_bal}) is below dust threshold. Skipping DB record.")
     elif action in ["SELL", "SHORT"]:
         logger.info(f"[{symbol}] Short signal evaluated ({reason}). Spot execution mode active: Skipping short setup.")
     else:
@@ -224,8 +278,13 @@ def main():
                 time.sleep(POLL_INTERVAL_SECONDS)
                 continue
 
+            # 1. Run Reconciliation & Auto-Healing Scan
             reconcile_open_trades(execution_engine)
 
+            # 2. Run High-Water Mark Trailing Stop Engine
+            run_trailing_stop_engine(tm)
+
+            # 3. Process Watchlist Signals for New Trade Entries
             for sym in WATCHLIST:
                 process_symbol(sym, tm, active_usdt_balance)
 
@@ -233,7 +292,6 @@ def main():
             logger.error(f"Error in main bot execution cycle: {loop_err}")
 
         finally:
-            # Force cleanup of memory overhead after processing all symbols
             gc.collect()
 
         time.sleep(POLL_INTERVAL_SECONDS)
