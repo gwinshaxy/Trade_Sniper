@@ -39,11 +39,11 @@ def init_db_pool():
     if _db_pool is None:
         try:
             if DB_URL:
-                _db_pool = pool.ThreadedConnectionPool(1, 5, DB_URL)
+                _db_pool = pool.ThreadedConnectionPool(1, 10, DB_URL)
             elif DB_PASS:
                 _db_pool = pool.ThreadedConnectionPool(
                     minconn=1,
-                    maxconn=5,
+                    maxconn=10,
                     host=DB_HOST,
                     port=DB_PORT,
                     dbname=DB_NAME,
@@ -120,26 +120,38 @@ def release_db_connection(conn):
                 pass
 
 
-def execute_query(conn, query, params=None, fetch=False):
-    cursor = conn.cursor()
+def finalize_trade_in_db(trade_id: int, exit_price: float, pnl_usd: float, pnl_pct: float, outcome: str):
+    """Centralized database update wrapper to record trade state upon closure."""
+    conn = get_db_connection()
+    if not conn:
+        return
     try:
-        cursor.execute(query, params or ())
-        if fetch:
-            result = cursor.fetchall()
-        else:
+        with conn.cursor() as cur:
+            cur.execute("""
+                UPDATE trade_setups 
+                SET trade_state = 'CLOSED', 
+                    status = 'CLOSED', 
+                    exit_price = %s, 
+                    pnl_usd = %s, 
+                    pnl_pct = %s, 
+                    outcome = %s, 
+                    closed_at = CURRENT_TIMESTAMP 
+                WHERE id = %s;
+            """, (round(exit_price, 5), pnl_usd, pnl_pct, outcome, trade_id))
             conn.commit()
-            result = None
-        cursor.close()
-        return result
+            logger.info(f"Database Record #{trade_id} successfully finalized with state CLOSED (PnL: ${pnl_usd:.2f}).")
     except Exception as e:
-        conn.rollback()
-        cursor.close()
-        raise e
+        logger.error(f"Failed to finalize trade record #{trade_id} in database: {e}")
+    finally:
+        release_db_connection(conn)
 
 
 def normalize_symbol(symbol: str) -> str:
-    """Normalizes pairs by stripping slashes, underscores, and dashes (e.g. 'XRP/USDT' or 'XRP_USDT' -> 'XRPUSDT')."""
-    return symbol.replace("/", "").replace("_", "").replace("-", "").upper()
+    """Normalizes any input symbol format to clean uppercase pair (e.g., 'XRPUSDT')."""
+    if not symbol:
+        return ""
+    clean = symbol.split(":")[0]
+    return clean.replace("/", "").replace("_", "").replace("-", "").strip().upper()
 
 
 def check_asset_cooldown(symbol: str) -> bool:
@@ -185,8 +197,10 @@ def set_asset_cooldown(symbol: str, hours: int = 2):
         clean_symbol = normalize_symbol(symbol)
         cursor = conn.cursor()
         cursor.execute("""
-            INSERT INTO strategy_parameters (symbol, cooldown_until, updated_at)
-            VALUES (%s, CURRENT_TIMESTAMP + (%s || ' hours')::INTERVAL, CURRENT_TIMESTAMP)
+            INSERT INTO strategy_parameters (
+                symbol, tema_period, rsi_period, cooldown_until, updated_at
+            )
+            VALUES (%s, 200, 14, CURRENT_TIMESTAMP + (%s || ' hours')::INTERVAL, CURRENT_TIMESTAMP)
             ON CONFLICT (symbol) DO UPDATE SET
                 cooldown_until = CURRENT_TIMESTAMP + (%s || ' hours')::INTERVAL,
                 updated_at = CURRENT_TIMESTAMP;
@@ -201,7 +215,7 @@ def set_asset_cooldown(symbol: str, hours: int = 2):
 
 
 def verify_base_schema():
-    """Ensures trade_setups and strategy_parameters tables exist with fully synchronized schemas including ATR parameters and cooldown column."""
+    """Ensures trade_setups and strategy_parameters tables exist with synchronized schemas."""
     conn = get_db_connection()
     if not conn:
         logger.error("Database connection unavailable for schema check.")
@@ -228,6 +242,8 @@ def verify_base_schema():
                 pnl_usd NUMERIC(18, 8),
                 pnl_pct NUMERIC(18, 8),
                 outcome VARCHAR(20),
+                highest_price NUMERIC(18, 8),
+                trailing_stop_price NUMERIC(18, 8),
                 created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
                 closed_at TIMESTAMP WITH TIME ZONE
             );
@@ -243,6 +259,8 @@ def verify_base_schema():
             "pnl_usd NUMERIC(18, 8)",
             "pnl_pct NUMERIC(18, 8)",
             "outcome VARCHAR(20)",
+            "highest_price NUMERIC(18, 8)",
+            "trailing_stop_price NUMERIC(18, 8)",
             "closed_at TIMESTAMP WITH TIME ZONE"
         ]
         for col in trade_columns:
@@ -358,20 +376,13 @@ def close_trade_manually(trade_id: int, exit_price: float, reason: str = "MANUAL
             return False
 
         direction, entry_price, position_size, account_balance, pair = row
-        pnl_usd, pnl_pct, outcome = calculate_pnl(
-            direction, float(entry_price), float(exit_price), float(position_size), float(account_balance or 10000.0)
-        )
-
-        cursor.execute("""
-            UPDATE trade_setups
-            SET exit_price = %s, pnl_usd = %s, pnl_pct = %s, outcome = %s,
-                status = 'CLOSED', trade_state = 'CLOSED', closed_at = CURRENT_TIMESTAMP
-            WHERE id = %s;
-        """, (round(exit_price, 5), pnl_usd, pnl_pct, outcome, trade_id))
-        conn.commit()
         cursor.close()
 
-        # Apply 2-hour post-trade cooldown
+        pnl_usd, pnl_pct, outcome = calculate_pnl(
+            direction, float(entry_price), float(exit_price), float(position_size), float(account_balance or 100.0)
+        )
+
+        finalize_trade_in_db(trade_id, exit_price, pnl_usd, pnl_pct, outcome)
         set_asset_cooldown(pair, hours=2)
 
         emoji = "🔴" if pnl_usd < 0 else "🟢"
@@ -390,13 +401,6 @@ def close_trade_manually(trade_id: int, exit_price: float, reason: str = "MANUAL
         return False
     finally:
         release_db_connection(conn)
-
-
-def to_mexc_ws_symbol(symbol: str) -> str:
-    clean = normalize_symbol(symbol)
-    if clean.endswith("USDT"):
-        return f"{clean[:-4]}_USDT"
-    return clean
 
 
 def check_daily_circuit_breaker(max_loss_pct: float = 3.0, account_balance: float = 100.0) -> bool:

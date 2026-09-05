@@ -1,139 +1,239 @@
 import logging
+import time
+from typing import Dict, List, Set
 from common import (
     get_db_connection,
     release_db_connection,
     send_telegram_notification,
-    set_asset_cooldown
+    set_asset_cooldown,
+    finalize_trade_in_db
 )
-from live_executor import MEXCLiveExecutor
+from live_executor import BybitFuturesLiveExecutor, format_ccxt_futures_symbol
 
 logger = logging.getLogger("reconciler")
 
-# Minimum asset threshold below which a token is considered sold/absent
 DUST_THRESHOLD = 0.001
+RETRY_THRESHOLD = 3
+
+consecutive_zero_counts: Dict[int, int] = {}
 
 
-def reconcile_open_trades(executor: MEXCLiveExecutor) -> int:
-    """
-    Scans database and exchange state to perform auto-healing and orphan reconciliation.
-    - If DB is OPEN but physical balance is missing/dust (< DUST_THRESHOLD): Cancels open orders on MEXC and marks DB CLOSED.
-    - If physical balance exists on MEXC (> DUST_THRESHOLD) but DB lacks active trade: Auto-heals DB record to OPEN.
-    
-    Returns count of updated/reconciled trades.
-    """
-    logger.info("🔍 Running Database <-> Exchange Position Reconciliation & Auto-Healing...")
+def check_active_or_pending_orders(executor: BybitFuturesLiveExecutor, ccxt_symbol: str) -> bool:
+    try:
+        open_orders = executor.exchange.fetch_open_orders(ccxt_symbol)
+        if open_orders:
+            return True
 
+        since = int((time.time() - 300) * 1000)
+        recent_closed = executor.exchange.fetch_closed_orders(ccxt_symbol, since=since, limit=5)
+        for order in recent_closed:
+            status = str(order.get("status", "")).lower()
+            if status in ["open", "untriggered", "new"]:
+                return True
+    except Exception:
+        return False
+    return False
+
+
+def fetch_all_live_exchange_positions(executor: BybitFuturesLiveExecutor) -> Dict[str, dict]:
+    active_positions = {}
+    try:
+        positions = executor.exchange.fetch_positions()
+        for p in positions:
+            contracts = float(p.get("contracts", 0) or 0)
+            if contracts > DUST_THRESHOLD:
+                raw_symbol = p.get("symbol", "")
+                ccxt_symbol = format_ccxt_futures_symbol(raw_symbol)
+                side = str(p.get("side", "")).lower()
+                if not side or side == "none":
+                    side = "long" if float(p.get("side", 0) or 0) > 0 else "short"
+
+                active_positions[ccxt_symbol] = {
+                    "symbol": ccxt_symbol,
+                    "side": side,
+                    "contracts": contracts,
+                    "entry_price": float(p.get("entryPrice", 0) or 0),
+                    "stop_loss": float(p.get("stopLoss", 0) or 0),       # Fetch live SL from Bybit
+                    "take_profit": float(p.get("takeProfit", 0) or 0),   # Fetch live TP from Bybit
+                    "unrealized_pnl": float(p.get("unrealizedPnl", 0) or 0),
+                    "leverage": float(p.get("leverage", 1) or 1)
+                }
+    except Exception as e:
+        logger.error(f"Reconciler: Failed to fetch live exchange positions: {e}")
+    return active_positions
+
+
+def reconcile_open_trades(executor: BybitFuturesLiveExecutor) -> int:
+    global consecutive_zero_counts
+    logger.info("🔍 Running Database <-> Bybit Futures Position Reconciliation & Auto-Healing...")
+
+    open_db_trades = []
     conn = get_db_connection()
     if not conn:
-        logger.error("Reconciliation skipped: Unable to acquire database connection.")
         return 0
 
-    reconciled_count = 0
-
     try:
-        cursor = conn.cursor()
-        
-        # 1. Fetch all trades currently marked as OPEN in DB
-        cursor.execute(
-            """
-            SELECT id, pair, direction, entry_price, position_size 
-            FROM trade_setups 
-            WHERE trade_state IN ('OPEN', 'BE_LOCKED', 'TRAILING');
-            """
-        )
-        open_db_trades = cursor.fetchall()
-        open_db_pairs = {trade[1]: trade for trade in open_db_trades}
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT id, pair, direction, entry_price, position_size, account_balance, stop_loss, take_profit 
+                FROM trade_setups 
+                WHERE trade_state IN ('OPEN', 'EXECUTED', 'BE_LOCKED', 'TRAILING');
+                """
+            )
+            open_db_trades = cursor.fetchall()
+    except Exception as e:
+        logger.error(f"Error fetching open trades for reconciliation: {e}")
+        return 0
+    finally:
+        release_db_connection(conn)
 
-        # 2. Iterate through open database records
-        for trade in open_db_trades:
-            trade_id, pair, direction, entry_price, position_size = trade
-            base_asset = pair.split('/')[0].upper()
+    reconciled_count = 0
+    current_trade_ids: Set[int] = {trade[0] for trade in open_db_trades}
 
-            # Query real-time spot balance directly from MEXC
-            live_balance = executor.get_spot_balance(pair)
+    for cached_id in list(consecutive_zero_counts.keys()):
+        if cached_id not in current_trade_ids:
+            del consecutive_zero_counts[cached_id]
 
-            # Case A: Database claims OPEN, but physical tokens are missing on MEXC
-            if live_balance < DUST_THRESHOLD:
-                logger.warning(
-                    f"⚠️ ORPHAN DETECTED: Trade #{trade_id} ({pair}) is OPEN in DB, "
-                    f"but MEXC balance is {live_balance:.5f} (Below limit {DUST_THRESHOLD}). "
-                    f"Auto-closing DB record..."
-                )
+    live_exchange_positions = fetch_all_live_exchange_positions(executor)
+    tracked_ccxt_symbols: Set[str] = set()
 
-                # Cancel any hanging open limit orders on MEXC before closing DB record
+    for trade in open_db_trades:
+        trade_id, pair, direction, entry_price, position_size, account_balance, db_sl, db_tp = trade
+        ccxt_symbol = format_ccxt_futures_symbol(pair)
+        tracked_ccxt_symbols.add(ccxt_symbol)
+
+        try:
+            pos_info = executor.get_futures_position(ccxt_symbol)
+
+            # Skip cycle if fetching positions resulted in an API error
+            if pos_info.get("error", False):
+                logger.warning(f"[{pair}] Skipping reconciliation check due to API fetch error.")
+                continue
+
+            live_contracts = pos_info.get("contracts", 0.0)
+
+            if live_contracts < DUST_THRESHOLD:
+                if check_active_or_pending_orders(executor, ccxt_symbol):
+                    consecutive_zero_counts[trade_id] = 0
+                    continue
+
+                consecutive_zero_counts[trade_id] = consecutive_zero_counts.get(trade_id, 0) + 1
+                current_zeros = consecutive_zero_counts[trade_id]
+
+                if current_zeros < RETRY_THRESHOLD:
+                    continue
+
+                logger.warning(f"🚨 GHOST DB RECORD CONFIRMED: Trade #{trade_id} ({pair}) reached zero checks limit. Auto-closing...")
+                
+                exit_price = float(entry_price)
                 try:
-                    executor.cancel_all_open_orders(pair)
-                    logger.info(f"[{pair}] Cancelled hanging exchange orders during reconciliation.")
-                except Exception as cancel_err:
-                    logger.error(f"[{pair}] Failed to cancel open orders for {pair}: {cancel_err}")
+                    ticker = executor.exchange.fetch_ticker(ccxt_symbol)
+                    exit_price = float(ticker.get('last') or ticker.get('close') or entry_price)
+                except Exception:
+                    pass
 
-                # Update database trade status to CLOSED
-                cursor.execute(
-                    """
-                    UPDATE trade_setups 
-                    SET trade_state = 'CLOSED', status = 'AUTO_RECONCILED' 
-                    WHERE id = %s;
-                    """,
-                    (trade_id,)
+                bal = float(account_balance or 100.0)
+                from common import calculate_pnl
+                pnl_usd, pnl_pct, outcome = calculate_pnl(direction, float(entry_price), exit_price, float(position_size), bal)
+
+                finalize_trade_in_db(
+                    trade_id=trade_id,
+                    exit_price=exit_price,
+                    pnl_usd=pnl_usd,
+                    pnl_pct=pnl_pct,
+                    outcome=outcome
                 )
-                conn.commit()
 
-                # Apply 2-hour cooldown for auto-reconciled asset
                 set_asset_cooldown(pair, hours=2)
-
                 reconciled_count += 1
+                del consecutive_zero_counts[trade_id]
 
                 send_telegram_notification(
                     f"<b>⚠️ DB RECONCILIATION APPLIED</b>\n\n"
                     f"<b>Trade ID:</b> <code>#{trade_id}</code>\n"
                     f"<b>Pair:</b> <code>{pair}</code>\n"
-                    f"<b>Action:</b> <code>AUTO_CLOSED (Orphan Record)</code>\n"
-                    f"<b>Reason:</b> Token balance missing on MEXC spot wallet ({live_balance:.4f} {base_asset})"
+                    f"<b>Action:</b> <code>AUTO_CLOSED (Ghost Record)</code>\n"
+                    f"<b>Reason:</b> Position closed on exchange over {RETRY_THRESHOLD} checks."
                 )
+            else:
+                consecutive_zero_counts[trade_id] = 0
 
-        # 3. Check Auto-Healing Case: Physical tokens present on MEXC, but missing active DB record
-        # Example watchlist symbols check or query spot balances
-        try:
-            balances = executor.get_all_spot_balances() if hasattr(executor, 'get_all_spot_balances') else {}
-            for pair, balance in balances.items():
-                if balance >= DUST_THRESHOLD and pair not in open_db_pairs:
-                    logger.warning(f"🛠️ AUTO-HEAL TRIGGERED: {pair} has physical balance ({balance:.4f}) but no active DB trade.")
+                # SYNC SL/TP TO DB IF POSITIONS EXIST ON BYBIT BUT DB HAS NONE/0
+                ex_pos = live_exchange_positions.get(ccxt_symbol)
+                if ex_pos:
+                    live_sl = ex_pos.get('stop_loss', 0.0)
+                    live_tp = ex_pos.get('take_profit', 0.0)
                     
-                    # Fetch recent execution trade price from MEXC API
-                    recent_trades = executor.get_recent_trades(pair) if hasattr(executor, 'get_recent_trades') else []
-                    entry_p = float(recent_trades[0]['price']) if recent_trades else executor.get_current_price(pair)
-                    
-                    initial_sl = entry_p * 0.98  # Default 2% protective SL
-                    initial_tp = entry_p * 1.04  # Default 4% TP
+                    db_sl_val = float(db_sl or 0.0)
+                    db_tp_val = float(db_tp or 0.0)
 
-                    cursor.execute(
-                        """
-                        INSERT INTO trade_setups 
-                        (pair, direction, entry_price, stop_loss, take_profit, position_size, 
-                         trade_state, status, highest_price, trailing_stop_price) 
-                        VALUES (%s, 'BUY', %s, %s, %s, %s, 'OPEN', 'AUTO_HEALED', %s, %s);
-                        """,
-                        (pair, entry_p, initial_sl, initial_tp, balance, entry_p, initial_sl)
-                    )
-                    conn.commit()
-                    reconciled_count += 1
+                    if (live_sl > 0 and db_sl_val == 0.0) or (live_tp > 0 and db_tp_val == 0.0):
+                        conn_sync = get_db_connection()
+                        if conn_sync:
+                            try:
+                                with conn_sync.cursor() as cursor:
+                                    cursor.execute("""
+                                        UPDATE trade_setups 
+                                        SET stop_loss = COALESCE(NULLIF(%s, 0.0), stop_loss),
+                                            take_profit = COALESCE(NULLIF(%s, 0.0), take_profit)
+                                        WHERE id = %s;
+                                    """, (live_sl, live_tp, trade_id))
+                                    conn_sync.commit()
+                                    logger.info(f"Updated DB SL/TP for Trade #{trade_id} from exchange live parameters.")
+                            except Exception as sync_err:
+                                logger.error(f"Failed to sync exchange SL/TP to DB for trade #{trade_id}: {sync_err}")
+                            finally:
+                                release_db_connection(conn_sync)
 
-                    send_telegram_notification(
-                        f"<b>🛠️ DB AUTO-HEALED POSITION RESTORED</b>\n\n"
-                        f"<b>Pair:</b> <code>{pair}</code>\n"
-                        f"<b>Balance:</b> {balance:.4f}\n"
-                        f"<b>Est. Entry Price:</b> ${entry_p:.5f}\n"
-                        f"<b>Status:</b> Re-adopted into active trade tracking engine."
-                    )
-        except Exception as heal_err:
-            logger.error(f"Error during balance auto-healing scan: {heal_err}")
+        except Exception as err:
+            logger.error(f"Error reconciling trade ID #{trade_id}: {err}")
 
-    except Exception as e:
-        logger.error(f"Error occurred during reconciliation cycle: {e}")
-        if conn:
-            conn.rollback()
-    finally:
-        release_db_connection(conn)
+    # Auto-adopt un-tracked exchange positions into DB
+    if live_exchange_positions:
+        for ex_symbol, ex_pos in live_exchange_positions.items():
+            if ex_symbol not in tracked_ccxt_symbols:
+                logger.warning(f"🚨 ORPHAN POSITION DETECTED: {ex_symbol}. Inserting missing position into DB...")
+                
+                conn_adopt = get_db_connection()
+                if conn_adopt:
+                    try:
+                        with conn_adopt.cursor() as cursor:
+                            db_pair = ex_symbol
+                            direction = "BUY" if ex_pos['side'].lower() in ["long", "buy"] else "SELL"
+                            entry_price = float(ex_pos.get('entry_price', 0.0))
+                            position_size = float(ex_pos.get('contracts', 0.0))
+                            
+                            cursor.execute("""
+                                INSERT INTO trade_setups (
+                                    pair, direction, entry_price, position_size, 
+                                    stop_loss, take_profit, status, trade_state, created_at
+                                ) VALUES (%s, %s, %s, %s, %s, %s, 'EXECUTED', 'OPEN', NOW())
+                                RETURNING id;
+                            """, (
+                                db_pair, 
+                                direction, 
+                                entry_price, 
+                                position_size,
+                                ex_pos.get('stop_loss', 0.0),
+                                ex_pos.get('take_profit', 0.0)
+                            ))
+                            
+                            new_id = cursor.fetchone()[0]
+                            conn_adopt.commit()
+                            reconciled_count += 1
+                            
+                            send_telegram_notification(
+                                f"<b>✅ AUTO-ADOPTED EXCHANGE POSITION</b>\n\n"
+                                f"<b>Trade ID:</b> <code>#{new_id}</code>\n"
+                                f"<b>Pair:</b> <code>{db_pair}</code>\n"
+                                f"<b>Side:</b> <code>{direction}</code>\n"
+                                f"<b>Contracts:</b> <code>{position_size}</code>\n"
+                                f"<b>SL:</b> <code>${ex_pos.get('stop_loss', 0.0)}</code> | <b>TP:</b> <code>${ex_pos.get('take_profit', 0.0)}</code>"
+                            )
+                    except Exception as db_err:
+                        logger.error(f"Failed to auto-insert orphan position for {ex_symbol}: {db_err}")
+                    finally:
+                        release_db_connection(conn_adopt)
 
-    logger.info(f"Reconciliation cycle complete. Total records updated: {reconciled_count}")
     return reconciled_count

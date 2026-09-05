@@ -1,5 +1,5 @@
 {
-  "account_balance": 17.0,
+  "account_balance": 100,
   "risk_pct": 0.5,
   "leverage": 100,
   "margin_mode": "isolated",
@@ -18,9 +18,7 @@
   "enable_live_trading": true,
   "watchlist": [
     "XRP/USDT",
-    "LINK/USDT",
-    "SOL/USDT",
-    "BNB/USDT"
+    "SOL/USDT"
   ],
   "use_mtf_tema_alignment": true,
   "htf_tema_period": 200,

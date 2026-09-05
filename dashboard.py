@@ -25,12 +25,12 @@ if "assetlinks" in query_params or st.context.headers.get("Path") == "/.well-kno
 
 from lightweight_charts.widgets import StreamlitChart
 
-st.set_page_config(page_title="MEXC Spot Trading Terminal", layout="wide")
+st.set_page_config(page_title="Bybit Futures Trading Terminal", layout="wide")
 
 pwa_manifest = """
 {
   "short_name": "TradeSniper",
-  "name": "Trade Sniper Spot Terminal",
+  "name": "Trade Sniper Futures Terminal",
   "icons": [
     {
       "src": "https://raw.githubusercontent.com/gwinshaxy/Trade_Sniper/main/icon-192.png",
@@ -134,6 +134,7 @@ from common import (
     get_db_connection,
     release_db_connection,
     send_telegram_notification,
+    normalize_symbol,
     logger
 )
 from live_executor import LiveExecutionEngine
@@ -151,16 +152,6 @@ except Exception as init_err:
     st.error(f"Failed to initialize trading core engine: {init_err}")
     st.stop()
 
-def normalize_symbol(symbol: str) -> str:
-    if not symbol:
-        return ""
-    s = str(symbol).replace('"', '').replace("'", "").strip().upper()
-    if "/" in s:
-        return s
-    if s.endswith("USDT") and len(s) > 4:
-        return f"{s[:-4]}/{s[-4:]}"
-    return s
-
 symbols_env = os.getenv("SYMBOLS") or os.getenv("SYMBOL", "XRP/USDT")
 env_symbols = [normalize_symbol(s) for s in symbols_env.split(",")]
 
@@ -168,16 +159,20 @@ database_url = os.getenv("DATABASE_URL") or os.getenv("DB_URL")
 if database_url:
     database_url = database_url.strip('"').strip("'")
 
-conn = get_db_connection()
-if conn:
-    try:
-        with conn.cursor() as cur:
-            cur.execute("""UPDATE trade_setups SET pair = REPLACE(REPLACE(pair::text, '"', ''), '''', '') WHERE pair IS NOT NULL;""")
-            conn.commit()
-    except Exception as db_err:
-        logger.warning(f"Failed to normalize DB pairs on startup: {db_err}")
-    finally:
-        release_db_connection(conn)
+@st.cache_resource
+def run_startup_db_maintenance():
+    conn = get_db_connection()
+    if conn:
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""UPDATE trade_setups SET pair = REPLACE(REPLACE(pair::text, '"', ''), '''', '') WHERE pair IS NOT NULL;""")
+                conn.commit()
+        except Exception as db_err:
+            logger.warning(f"Failed to normalize DB pairs on startup: {db_err}")
+        finally:
+            release_db_connection(conn)
+
+run_startup_db_maintenance()
 
 @st.cache_data(ttl=5, max_entries=20)
 def fetch_trades_from_db(db_url: str) -> pd.DataFrame:
@@ -193,7 +188,7 @@ df_all_trades = fetch_trades_from_db(database_url)
 
 db_pairs = [normalize_symbol(p) for p in df_all_trades['pair'].unique().tolist()] if not df_all_trades.empty and 'pair' in df_all_trades.columns else []
 available_pairs = list(dict.fromkeys(env_symbols + db_pairs))
-for default_pair in ["XRP/USDT"]:
+for default_pair in [normalize_symbol("XRP/USDT")]:
     if default_pair not in available_pairs:
         available_pairs.append(default_pair)
 
@@ -289,18 +284,6 @@ zone_tolerance_pct = st.sidebar.slider(
     key=f"zone_{pair_key}"
 )
 
-vp_cfg_val = float(dyn_cfg.get("vp_detection_pct", 0.07))
-vp_init_slider = (vp_cfg_val * 100.0) if vp_cfg_val <= 1.0 else vp_cfg_val
-
-node_detection_pct = st.sidebar.slider(
-    "Node Detection (%)", 
-    min_value=0.5, 
-    max_value=15.0, 
-    value=float(np.clip(vp_init_slider, 0.5, 15.0)), 
-    step=0.5, 
-    key=f"node_{pair_key}"
-) / 100.0
-
 use_adx_filter = st.sidebar.checkbox(
     "Enable ADX Trend Filter", 
     value=bool(dyn_cfg.get("use_adx_filter", True)), 
@@ -326,7 +309,8 @@ disable_htf = st.sidebar.checkbox(
 )
 
 st.sidebar.markdown("---")
-direction = st.sidebar.selectbox("Order Direction", ["BUY"])
+direction = st.sidebar.selectbox("Order Direction", ["BUY", "SELL"])
+leverage = st.sidebar.number_input("Leverage", min_value=1, max_value=100, value=10)
 overlay_chart = st.sidebar.checkbox("Overlay Trade Positions on Chart", value=True)
 overlay_gaps = st.sidebar.checkbox("Overlay Volume Profile Gaps", value=True)
 
@@ -342,27 +326,52 @@ st.sidebar.markdown(f"**Risk : Reward Ratio:** `1:{rr_ratio}`")
 account_balance = st.sidebar.number_input("Account Balance ($)", min_value=1.0, value=float(os.getenv("ACCOUNT_BALANCE", 100.0)))
 risk_pct = st.sidebar.number_input("Risk Per Trade (%)", min_value=0.01, max_value=100.0, value=1.0)
 
-if st.sidebar.button("🚀 Execute Live Order via MEXC API", use_container_width=True):
-    with st.spinner("Submitting Spot Order..."):
+if st.sidebar.button("🚀 Execute Live Futures Order via Bybit API", use_container_width=True):
+    with st.spinner("Submitting Futures Order..."):
         try:
-            success = executor.execute_live_order(
-                pair=config_target_pair,
+            allocated_usd = min(account_balance * (risk_pct / 100.0), account_balance * 0.95)
+            
+            res = executor.order_futures_bybit(
+                symbol=config_target_pair,
                 direction=direction,
-                entry_price=entry_price,
+                amount_usd=allocated_usd,
                 stop_loss=stop_loss,
-                take_profit=take_profit
+                take_profit=take_profit,
+                leverage=leverage
             )
-            if success:
+            
+            if res.get("status") == "SUCCESS":
+                fill_price = res["fill_price"]
+                executed_qty = res["executed_qty"]
+                
+                conn_exec = get_db_connection()
+                if conn_exec:
+                    try:
+                        with conn_exec.cursor() as cur:
+                            cur.execute("""
+                                INSERT INTO trade_setups 
+                                (pair, direction, entry_price, stop_loss, take_profit, position_size, status, trade_state, account_balance, risk_pct)
+                                VALUES (%s, %s, %s, %s, %s, %s, 'EXECUTED', 'OPEN', %s, %s);
+                            """, (config_target_pair, direction, fill_price, stop_loss, take_profit, executed_qty, account_balance, risk_pct))
+                            conn_exec.commit()
+                    finally:
+                        release_db_connection(conn_exec)
+
                 st.cache_data.clear()
-                st.success(f"Live Spot trade executed for {config_target_pair} on MEXC!")
-                send_telegram_notification(f"<b>🚀 NEW LIVE SPOT ORDER EXECUTED</b>\n\n<b>Pair:</b> <code>{config_target_pair}</code>\n<b>Direction:</b> <code>{direction}</code>")
+                st.success(f"Live Futures {direction} trade executed for {config_target_pair} at ${fill_price:.5f}!")
+                send_telegram_notification(
+                    f"<b>🚀 MANUAL DASHBOARD FUTURES ORDER EXECUTED ({direction})</b>\n\n"
+                    f"<b>Pair:</b> <code>{config_target_pair}</code>\n"
+                    f"<b>Entry:</b> ${fill_price:.5f}\n"
+                    f"<b>Qty:</b> {executed_qty}"
+                )
                 st.rerun()
             else:
-                st.error("Spot order execution failed. Review engine logs.")
+                st.error(f"Futures order execution failed: {res.get('error') or res.get('reason')}")
         except Exception as exec_err:
             st.error(f"Execution Error Encountered: {exec_err}")
 
-st.title("📊 Live MEXC Spot Trading Dashboard")
+st.title("📊 Live Bybit Futures Trading Dashboard")
 
 closed_trades = df_all_trades[df_all_trades['status'] == 'CLOSED'] if not df_all_trades.empty and 'status' in df_all_trades.columns else pd.DataFrame()
 net_realized_pnl = float(closed_trades['pnl_usd'].sum()) if not closed_trades.empty and 'pnl_usd' in closed_trades.columns else 0.0
@@ -390,7 +399,7 @@ with col_tf:
 chart_symbol = selected_pair
 
 try:
-    df_ohlc = strategy.fetch_klines(symbol=chart_symbol, interval=selected_timeframe)
+    df_ohlc = strategy.fetch_klines(symbol=chart_symbol, interval=selected_timeframe, limit=lookback_bars)
 except Exception as fetch_err:
     df_ohlc = None
     st.error(f"API Fetch Error: {fetch_err}")
@@ -413,16 +422,17 @@ if df_ohlc is not None and not df_ohlc.empty:
             if col in df_ohlc.columns:
                 df_ohlc[col] = pd.to_numeric(df_ohlc[col], errors='coerce')
 
-        df_ohlc['tema_custom'] = strategy.calc_tema(df_ohlc['close'], period=min(tema_period, len(df_ohlc)))
+        df_ohlc['tema_custom'] = strategy.calculate_tema(df_ohlc['close'], period=min(tema_period, len(df_ohlc)))
         
-        if hasattr(strategy, 'compute_volume_profile'):
-            poc, vah, val = strategy.compute_volume_profile(df_ohlc, num_bins=100, lookback_bars=lookback_bars, va_pct=0.70)
+        if hasattr(strategy, 'calculate_volume_profile_gaps'):
+            # To this:
+            vp_res = strategy.calculate_volume_profile_gaps(df_ohlc, num_bins=100, lookback_bars=lookback_bars)
+            poc = vp_res.get("poc")
+            vah = vp_res.get("vah")
+            val = vp_res.get("val")
+            detected_gaps = vp_res.get("overhead_gaps", []) + vp_res.get("underneath_gaps", [])
         else:
             poc, vah, val = None, None, None
-
-        if hasattr(strategy, 'calculate_volume_profile_gaps'):
-            detected_gaps = strategy.calculate_volume_profile_gaps(df_ohlc, num_bins=100, lookback_bars=lookback_bars, detection_pct=node_detection_pct)
-        else:
             detected_gaps = []
 
         min_chart_p = float(df_ohlc['low'].min())
@@ -436,7 +446,7 @@ if df_ohlc is not None and not df_ohlc.empty:
 
         df_chart = df_chart.drop_duplicates(subset=['time']).sort_values('time', ascending=True).reset_index(drop=True)
 
-        chart = StreamlitChart(width=None, height=650)
+        chart = StreamlitChart(width=None, height=600)
         chart.layout(background_color='#131722', text_color='#d1d4dc')
         chart.volume_config(scale_margin_top=0.85, scale_margin_bottom=0.0, up_color='#26a69a', down_color='#ef5350')
         
@@ -449,13 +459,13 @@ if df_ohlc is not None and not df_ohlc.empty:
             tema_line = chart.create_line(name=line_name, color="orange", width=2)
             tema_line.set(tema_df)
 
-        if pd.notnull(vah) and not np.isnan(vah):
+        if vah is not None and pd.notnull(vah) and not np.isnan(vah) and vah > 0:
             chart.horizontal_line(float(vah), color="#2962ff", style="solid", width=2, text=f"VAH: {vah:.2f}")
 
-        if pd.notnull(val) and not np.isnan(val):
+        if val is not None and pd.notnull(val) and not np.isnan(val) and val > 0:
             chart.horizontal_line(float(val), color="#2962ff", style="solid", width=2, text=f"VAL: {val:.2f}")
 
-        if pd.notnull(poc) and not np.isnan(poc):
+        if poc is not None and pd.notnull(poc) and not np.isnan(poc) and poc > 0:
             chart.horizontal_line(float(poc), color="#f44336", style="solid", width=2, text=f"POC: {poc:.2f}")
 
         if overlay_gaps and detected_gaps:
@@ -538,11 +548,11 @@ with tab_active:
         st.markdown("---")
         manual_exit = st.number_input("Fallback Exit Price ($) [Used for Market Close/DB Override]", value=float(selected_row['entry_price']) if pd.notnull(selected_row['entry_price']) else 0.0, format="%.5f")
         
-        col_mexc, col_db_only = st.columns(2)
-        with col_mexc:
-            if st.button("🚨 Market Close on MEXC Exchange", type="primary", use_container_width=True):
+        col_bybit, col_db_only = st.columns(2)
+        with col_bybit:
+            if st.button("🚨 Market Close on Bybit Exchange", type="primary", use_container_width=True):
                 try:
-                    close_res = executor.close_live_position_mexc(
+                    close_res = executor.close_live_position_bybit(
                         symbol=selected_row['pair'],
                         position_size=float(selected_row['position_size']),
                         current_price=manual_exit,
@@ -551,19 +561,19 @@ with tab_active:
                     
                     if close_res.get("status") in ["SUCCESS", "FORCE_CLOSED_DB_ONLY"] and float(close_res.get("exit_price", 0.0)) > 0.0:
                         final_p = float(close_res["exit_price"])
-                        if close_trade_manually(selected_trade_id, final_p, reason="STREAMLIT_MEXC_MARKET_CLOSE"):
+                        if close_trade_manually(selected_trade_id, final_p, reason="STREAMLIT_BYBIT_MARKET_CLOSE"):
                             st.cache_data.clear()
-                            st.success(f"Position #{selected_trade_id} closed on MEXC at ${final_p:.5f}.")
+                            st.success(f"Position #{selected_trade_id} closed on Bybit at ${final_p:.5f}.")
                             st.rerun()
                         else:
-                            st.error("Position closed on MEXC, but database update failed.")
+                            st.error("Position closed on Bybit, but database update failed.")
                     else:
-                        st.error(f"🚨 CRITICAL: MEXC close order failed: {close_res.get('error')}. DB was NOT modified.")
+                        st.error(f"🚨 CRITICAL: Bybit close order failed: {close_res.get('error')}. DB was NOT modified.")
                 except Exception as close_err:
-                    st.error(f"Error attempting MEXC close: {close_err}")
+                    st.error(f"Error attempting Bybit close: {close_err}")
                     
         with col_db_only:
-            if st.button("⚠️ Force DB Close Only (No MEXC Order)", use_container_width=True):
+            if st.button("⚠️ Force DB Close Only (No Bybit Order)", use_container_width=True):
                 if close_trade_manually(selected_trade_id, manual_exit, reason="STREAMLIT_MANUAL_DB_ONLY_OVERRIDE"):
                     st.cache_data.clear()
                     st.warning(f"Position #{selected_trade_id} marked as closed in DB at ${manual_exit:.5f}. (Note: No exchange order sent).")
@@ -634,9 +644,9 @@ with col_log:
     st.markdown("*Live Worker Logs:*")
     log_messages = [
         "[INFO] Database connection established...",
-        "[INFO] Live Execution Engine bound to MEXC Spot API.",
+        "[INFO] Live Execution Engine bound to Bybit Futures API.",
         "[INFO] Pending setups tab synchronized with PostgreSQL.",
-        "[STATUS] Monitoring spot strategy triggers and active positions."
+        "[STATUS] Monitoring futures strategy triggers and active positions."
     ]
     for log_item in log_messages:
         st.code(log_item, language="text")

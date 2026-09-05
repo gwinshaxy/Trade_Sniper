@@ -13,10 +13,9 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.end_headers()
-        self.wfile.write(b'{"status": "healthy", "service": "Trading Bot System"}')
+        self.wfile.write(b'{"status": "healthy", "service": "Bybit Futures Trading Bot System"}')
 
     def log_message(self, format, *args):
-        # Prevent spamming the logs on every Render ping
         return
 
 def run():

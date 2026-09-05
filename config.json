@@ -17,10 +17,10 @@
   "alert_cooldown_hours": 4,
   "enable_live_trading": true,
   "watchlist": [
-    "XRP/USDT"
-	"LINK/USDT"
-	"SOL/USDT"
-	"BNB/USDT"
+    "XRP/USDT",
+    "LINK/USDT",
+    "SOL/USDT",
+    "BNB/USDT"
   ],
   "use_mtf_tema_alignment": true,
   "htf_tema_period": 200,
@@ -29,6 +29,5 @@
   "atr_trail_mult": 2.0,
   "use_equity_curve_filter": true,
   "eq_ma_period": 10,
-  "reduced_risk_factor": 0.3,
-  }
+  "reduced_risk_factor": 0.3
 }
