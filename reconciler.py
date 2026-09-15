@@ -30,12 +30,17 @@ def check_active_or_pending_orders(executor: BybitFuturesLiveExecutor, ccxt_symb
             status = str(order.get("status", "")).lower()
             if status in ["open", "untriggered", "new"]:
                 return True
-    except Exception:
+    except Exception as e:
+        logger.debug(f"[{ccxt_symbol}] Exception checking pending orders: {e}")
         return False
     return False
 
 
 def fetch_all_live_exchange_positions(executor: BybitFuturesLiveExecutor) -> Dict[str, dict]:
+    """
+    Fetch all active futures positions across the exchange using uniform symbol normalization.
+    Returns empty dict on network error to avoid false ghost triggers.
+    """
     active_positions = {}
     try:
         positions = executor.exchange.fetch_positions()
@@ -53,13 +58,15 @@ def fetch_all_live_exchange_positions(executor: BybitFuturesLiveExecutor) -> Dic
                     "side": side,
                     "contracts": contracts,
                     "entry_price": float(p.get("entryPrice", 0) or 0),
-                    "stop_loss": float(p.get("stopLoss", 0) or 0),       # Fetch live SL from Bybit
-                    "take_profit": float(p.get("takeProfit", 0) or 0),   # Fetch live TP from Bybit
+                    "stop_loss": float(p.get("stopLoss", 0) or 0),
+                    "take_profit": float(p.get("takeProfit", 0) or 0),
                     "unrealized_pnl": float(p.get("unrealizedPnl", 0) or 0),
                     "leverage": float(p.get("leverage", 1) or 1)
                 }
     except Exception as e:
-        logger.error(f"Reconciler: Failed to fetch live exchange positions: {e}")
+        logger.error(f"Reconciler: Network/API error fetching bulk positions: {e}. Preserving DB state.")
+        return {}
+
     return active_positions
 
 
@@ -91,6 +98,7 @@ def reconcile_open_trades(executor: BybitFuturesLiveExecutor) -> int:
     reconciled_count = 0
     current_trade_ids: Set[int] = {trade[0] for trade in open_db_trades}
 
+    # Clean up tracking cache for trades no longer open in DB
     for cached_id in list(consecutive_zero_counts.keys()):
         if cached_id not in current_trade_ids:
             del consecutive_zero_counts[cached_id]
@@ -104,14 +112,21 @@ def reconcile_open_trades(executor: BybitFuturesLiveExecutor) -> int:
         tracked_ccxt_symbols.add(ccxt_symbol)
 
         try:
+            # Check using CCXT Symbol
             pos_info = executor.get_futures_position(ccxt_symbol)
 
-            # Skip cycle if fetching positions resulted in an API error
-            if pos_info.get("error", False):
-                logger.warning(f"[{pair}] Skipping reconciliation check due to API fetch error.")
+            # Fallback check using raw pair if CCXT returned 0 contracts without error
+            if not pos_info.get("error") and pos_info.get("contracts", 0.0) < DUST_THRESHOLD:
+                pos_info_fallback = executor.get_futures_position(pair)
+                if pos_info_fallback.get("contracts", 0.0) > DUST_THRESHOLD:
+                    pos_info = pos_info_fallback
+
+            # STRICT GATE: Skip evaluation entirely if network/API error is flagged or response invalid
+            if not pos_info or pos_info.get("error", True) or "contracts" not in pos_info:
+                logger.warning(f"[{pair}] API or connectivity glitch detected during check. Preserving state & skipping cycle.")
                 continue
 
-            live_contracts = pos_info.get("contracts", 0.0)
+            live_contracts = float(pos_info.get("contracts", 0.0))
 
             if live_contracts < DUST_THRESHOLD:
                 if check_active_or_pending_orders(executor, ccxt_symbol):
@@ -122,6 +137,7 @@ def reconcile_open_trades(executor: BybitFuturesLiveExecutor) -> int:
                 current_zeros = consecutive_zero_counts[trade_id]
 
                 if current_zeros < RETRY_THRESHOLD:
+                    logger.info(f"[{pair}] Zero contracts detected ({current_zeros}/{RETRY_THRESHOLD}). Waiting for confirmation.")
                     continue
 
                 logger.warning(f"🚨 GHOST DB RECORD CONFIRMED: Trade #{trade_id} ({pair}) reached zero checks limit. Auto-closing...")

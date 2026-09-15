@@ -37,21 +37,38 @@ class StateMachineEngine:
     async def _handle_trade_signal(self, payload: dict):
         symbol = payload["symbol"]
         direction = payload["direction"].upper()
-        entry_price = payload["entry_price"]
-        stop_loss = payload["stop_loss"]
-        take_profit = payload["take_profit"]
-        amount_usd = payload["amount_usd"]
-        leverage = payload.get("leverage", 10)
+        entry_price = float(payload.get("entry_price", 0.0))
+        stop_loss = float(payload.get("stop_loss", 0.0))
+        take_profit = float(payload.get("take_profit", 0.0))
+        amount_usd = float(payload.get("amount_usd", 25.0))
+        account_balance = float(payload.get("account_balance", 100.0))
+        leverage = int(payload.get("leverage", 10))
 
-        # 1. Check Atomic In-Memory Lock Guard
         acquired = await event_bus.guard.try_acquire_trade_lock(symbol)
         if not acquired:
             logger.warning(f"[{symbol}] Atomic Lock Guard: Active trade lock in-flight. Discarding signal.")
             return
 
         try:
-            # 2. Fix: Check live position directly on exchange prior to placing any entry order
+            # Verify global max concurrent open positions before execution
+            conn = get_db_connection()
+            if conn:
+                try:
+                    with conn.cursor() as cur:
+                        cur.execute("""
+                            SELECT COUNT(*) FROM trade_setups 
+                            WHERE status = 'EXECUTED' AND trade_state != 'CLOSED';
+                        """)
+                        active_positions_count = cur.fetchone()[0]
+                        if active_positions_count >= 4:
+                            logger.warning(f"[{symbol}] Execution Blocked: Max open positions cap (4) reached.")
+                            return
+                finally:
+                    release_db_connection(conn)
+
             loop = asyncio.get_running_loop()
+            
+            # Check active positions directly on exchange prior to placing entry orders
             pos_info = await loop.run_in_executor(None, self.executor.get_futures_position, symbol)
             if pos_info.get("contracts", 0.0) > 0.001:
                 logger.warning(
@@ -60,36 +77,38 @@ class StateMachineEngine:
                 )
                 return
 
-            logger.info(f"[{symbol}] Processing {direction} trade signal via State Machine...")
-            
+            logger.info(f"[{symbol}] Processing {direction} trade signal via State Machine (Ref Entry Price: ${entry_price:.5f})...")
+
             exec_result = await loop.run_in_executor(
                 None,
                 self.executor.order_futures_bybit,
                 symbol,
                 direction,
                 amount_usd,
+                entry_price,
                 stop_loss,
                 take_profit,
-                leverage
+                leverage,
+                account_balance,
+                1.0  # Fixed Risk Pct (1%)
             )
-            # ... rest of _handle_trade_signal logic remains unchanged ...
 
             if exec_result.get("status") == "SUCCESS":
                 executed_qty = exec_result["executed_qty"]
                 fill_price = exec_result["fill_price"]
                 
-                conn = get_db_connection()
-                if conn:
+                conn_db = get_db_connection()
+                if conn_db:
                     try:
-                        with conn.cursor() as cur:
+                        with conn_db.cursor() as cur:
                             cur.execute("""
                                 INSERT INTO trade_setups 
-                                (pair, direction, entry_price, stop_loss, take_profit, position_size, status, trade_state)
-                                VALUES (%s, %s, %s, %s, %s, %s, 'EXECUTED', 'OPEN')
+                                (pair, direction, entry_price, stop_loss, take_profit, position_size, account_balance, status, trade_state)
+                                VALUES (%s, %s, %s, %s, %s, %s, %s, 'EXECUTED', 'OPEN')
                                 RETURNING id;
-                            """, (symbol, direction, fill_price, stop_loss, take_profit, executed_qty))
+                            """, (symbol, direction, fill_price, stop_loss, take_profit, executed_qty, account_balance))
                             trade_id = cur.fetchone()[0]
-                            conn.commit()
+                            conn_db.commit()
 
                         emoji = "🟢" if direction in ["BUY", "LONG"] else "🔴"
                         send_telegram_notification(
@@ -101,7 +120,7 @@ class StateMachineEngine:
                             f"<b>SL:</b> ${stop_loss:.5f} | <b>TP:</b> ${take_profit:.5f}"
                         )
                     finally:
-                        release_db_connection(conn)
+                        release_db_connection(conn_db)
             else:
                 logger.error(f"[{symbol}] Futures Trade Execution failed: {exec_result.get('error')}")
 

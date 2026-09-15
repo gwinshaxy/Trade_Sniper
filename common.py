@@ -9,6 +9,7 @@ base_dir = os.path.dirname(os.path.abspath(__file__))
 env_path = os.path.join(base_dir, ".env")
 load_dotenv(dotenv_path=env_path)
 
+# Initialize single logger instance with handler check guard
 logger = logging.getLogger("trading_agent")
 if not logger.handlers:
     handler = logging.StreamHandler()
@@ -35,33 +36,36 @@ _db_pool = None
 
 
 def init_db_pool():
+    """Idempotent database connection pool initialization guard."""
     global _db_pool
-    if _db_pool is None:
-        try:
-            if DB_URL:
-                _db_pool = pool.ThreadedConnectionPool(1, 10, DB_URL)
-            elif DB_PASS:
-                _db_pool = pool.ThreadedConnectionPool(
-                    minconn=1,
-                    maxconn=10,
-                    host=DB_HOST,
-                    port=DB_PORT,
-                    dbname=DB_NAME,
-                    user=DB_USER,
-                    password=DB_PASS,
-                    sslmode=DB_SSLMODE,
-                    keepalives=1,
-                    keepalives_idle=30,
-                    keepalives_interval=10,
-                    keepalives_count=5
-                )
-            else:
-                raise ValueError("Neither DATABASE_URL/DB_URL nor DB_PASS environment variables are defined!")
-            
-            logger.info("Database connection pool initialized successfully.")
-        except Exception as e:
-            logger.error(f"Failed to initialize DB connection pool: {e}")
-            raise e
+    if _db_pool is not None:
+        return
+
+    try:
+        if DB_URL:
+            _db_pool = pool.ThreadedConnectionPool(1, 10, DB_URL)
+        elif DB_PASS:
+            _db_pool = pool.ThreadedConnectionPool(
+                minconn=1,
+                maxconn=10,
+                host=DB_HOST,
+                port=DB_PORT,
+                dbname=DB_NAME,
+                user=DB_USER,
+                password=DB_PASS,
+                sslmode=DB_SSLMODE,
+                keepalives=1,
+                keepalives_idle=30,
+                keepalives_interval=10,
+                keepalives_count=5
+            )
+        else:
+            raise ValueError("Neither DATABASE_URL/DB_URL nor DB_PASS environment variables are defined!")
+        
+        logger.info("Database connection pool initialized successfully.")
+    except Exception as e:
+        logger.error(f"Failed to initialize DB connection pool: {e}")
+        raise e
 
 
 def get_db_pool():

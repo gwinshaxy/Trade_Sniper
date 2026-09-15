@@ -147,7 +147,8 @@ class UnifiedWebSocketEngine:
                     ping_interval=None,
                     ping_timeout=None,
                     close_timeout=5,
-                    ssl=ssl_context
+                    ssl=ssl_context,
+                    proxy=None  # <--- ADD THIS PARAMETER
                 ) as ws:
                     logger.info(f"Connected to Bybit Private Feed: {self.private_ws_endpoint}")
                     if not await self._authenticate_private_ws(ws):
@@ -187,7 +188,8 @@ class UnifiedWebSocketEngine:
                     ping_interval=None,
                     ping_timeout=None,
                     close_timeout=5,
-                    ssl=ssl_context
+                    ssl=ssl_context,
+                    proxy=None  # <--- ADD THIS PARAMETER
                 ) as ws:
                     logger.info(f"Connected to Bybit Feed: {endpoint}")
 

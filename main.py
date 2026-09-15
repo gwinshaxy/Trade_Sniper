@@ -3,6 +3,22 @@ import asyncio
 import logging
 from dotenv import load_dotenv
 
+# =====================================================================
+# PROXY BYPASS FOR WEBSOCKETS IN ENTRY SCRIPT
+# Exclude Bybit WebSocket endpoints and localhost from HTTP proxy
+# =====================================================================
+no_proxy_entries = os.getenv("NO_PROXY", "")
+ws_bypasses = "stream-testnet.bybit.com,stream-testnet.bybitglobal.com,stream.bybit.com,stream.bybitglobal.com,localhost,127.0.0.1"
+
+if no_proxy_entries:
+    os.environ["NO_PROXY"] = f"{no_proxy_entries},{ws_bypasses}"
+else:
+    os.environ["NO_PROXY"] = ws_bypasses
+
+os.environ["no_proxy"] = os.environ["NO_PROXY"]
+
+load_dotenv()
+
 from config import BYBIT_API_KEY, BYBIT_SECRET_KEY, BYBIT_TESTNET
 from common import (
     get_db_connection,
@@ -26,9 +42,6 @@ from strategy import (
 )
 from dynamic_trade_manager import DynamicTradeManager
 
-load_dotenv()
-
-# Prevent duplicate log output across re-imports and child modules
 root_logger = logging.getLogger()
 if root_logger.hasHandlers():
     root_logger.handlers.clear()
@@ -45,6 +58,7 @@ TIMEFRAME = os.getenv("TIMEFRAME", "1h")
 POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", "60"))
 ACCOUNT_RISK_PCT = float(os.getenv("ACCOUNT_RISK_PCT", "1.0"))
 FALLBACK_BALANCE = float(os.getenv("ACCOUNT_BALANCE", "100.0"))
+MAX_CONCURRENT_POSITIONS = 4  # Locked max concurrent position threshold
 
 logger = logging.getLogger("main_orchestrator")
 
@@ -54,7 +68,6 @@ trade_manager = DynamicTradeManager()
 
 
 async def dynamic_trade_management_loop():
-    """Phase 2: Dynamic Active Position Management & Trailing Stop Updates using finalize_trade_in_db."""
     logger.info("Starting Dynamic Position Management & Trailing Stop Loop.")
     while True:
         try:
@@ -83,14 +96,15 @@ async def dynamic_trade_management_loop():
                         interval="1h",
                         limit=300
                     )
-                    if df_active.empty or len(df_active) < 200:
+                    
+                    if df_active is None or df_active.empty or len(df_active) < 200:
+                        logger.warning(f"[{pair}] K-line data insufficient/empty for active trade #{trade_id}. Skipping iteration.")
                         continue
 
                     cfg = load_symbol_config(pair)
                     df_active['tema'] = calc_tema(df_active['close'], period=int(cfg.get("tema_period", 200)))
                     df_active['atr'] = calc_atr(df_active, period=int(cfg.get("atr_period", 14)))
 
-                    # Safely convert Pandas Series row to dictionary
                     latest_candle = df_active.iloc[-1].to_dict()
                     
                     result = trade_manager.process_trade(trade, latest_candle)
@@ -146,8 +160,29 @@ async def strategy_evaluation_loop():
                 await asyncio.sleep(POLL_INTERVAL_SECONDS)
                 continue
 
+            # --- GLOBAL EQUAL-WEIGHT FRACTIONAL LOCK ---
+            conn_global = await asyncio.to_thread(get_db_connection)
+            global_active_count = 0
+            if conn_global:
+                try:
+                    with conn_global.cursor() as cur:
+                        cur.execute("""
+                            SELECT COUNT(*) FROM trade_setups 
+                            WHERE status = 'EXECUTED' AND trade_state != 'CLOSED';
+                        """)
+                        global_active_count = cur.fetchone()[0]
+                finally:
+                    release_db_connection(conn_global)
+
+            if global_active_count >= MAX_CONCURRENT_POSITIONS:
+                logger.info(f"Max concurrent positions reached ({global_active_count}/{MAX_CONCURRENT_POSITIONS}). Skipping trade evaluations.")
+                await asyncio.sleep(POLL_INTERVAL_SECONDS)
+                continue
+
+            # Calculate Equal-Weight Allocated Margin per Trade
+            allocated_margin_per_trade = active_usdt_balance / MAX_CONCURRENT_POSITIONS
+
             for symbol in WATCHLIST:
-                # Check local DB for active open trades for this pair before signal evaluation
                 conn = await asyncio.to_thread(get_db_connection)
                 if conn:
                     try:
@@ -173,7 +208,7 @@ async def strategy_evaluation_loop():
                     limit=300
                 )
                 
-                if df_klines.empty:
+                if df_klines is None or df_klines.empty:
                     logger.warning(f"[{symbol}] Kline data empty. Skipping evaluation.")
                     continue
 
@@ -182,6 +217,7 @@ async def strategy_evaluation_loop():
                     df=df_klines,
                     symbol=symbol,
                     account_balance=active_usdt_balance,
+                    risk_pct=cfg.get("risk_pct", ACCOUNT_RISK_PCT),
                     tema_period=cfg.get("tema_period", 200),
                     rsi_period=cfg.get("rsi_period", 14),
                     rsi_thresh=cfg.get("rsi_thresh", 42.0),
@@ -194,7 +230,6 @@ async def strategy_evaluation_loop():
                     max_sl_pct=cfg.get("max_sl_pct", 0.02),
                     min_sentiment=cfg.get("min_sentiment", 0.0),
                     min_rr=cfg.get("min_rr", 2.0),
-                    risk_pct=cfg.get("risk_pct", ACCOUNT_RISK_PCT),
                     atr_period=cfg.get("atr_period", 14),
                     atr_mult=cfg.get("atr_mult", 2.0),
                     use_atr_sl=cfg.get("use_atr_sl", True),
@@ -211,7 +246,6 @@ async def strategy_evaluation_loop():
                 )
 
                 if action in ["BUY", "LONG", "SELL", "SHORT"]:
-                    amount_usd = min(active_usdt_balance * 0.25, active_usdt_balance * 0.98)
                     await event_bus.publish("TRADE_SIGNAL", {
                         "pair": symbol,
                         "symbol": symbol,
@@ -219,7 +253,8 @@ async def strategy_evaluation_loop():
                         "entry_price": float(signal.get("entry_price", 0.0)),
                         "stop_loss": float(signal.get("stop_loss", 0.0)),
                         "take_profit": float(signal.get("take_profit", 0.0)),
-                        "amount_usd": amount_usd,
+                        "amount_usd": allocated_margin_per_trade,
+                        "account_balance": active_usdt_balance,
                         "leverage": cfg.get("leverage", 10)
                     })
 
@@ -245,6 +280,8 @@ async def main():
     ensure_schema_updated()
 
     from ws_engine import UnifiedWebSocketEngine
+
+    # Matches standard UnifiedWebSocketEngine class signature
     ws_engine = UnifiedWebSocketEngine(
         symbols=WATCHLIST,
         is_testnet=BYBIT_TESTNET,
