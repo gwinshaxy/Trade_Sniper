@@ -1,29 +1,36 @@
+import os
 import asyncio
 import json
 import logging
 import ssl
 import websockets
 from typing import List, Dict
+from websockets_proxy import Proxy, proxy_connect
 from event_bus import event_bus
 from common import get_db_connection, release_db_connection, finalize_trade_in_db
 
 logger = logging.getLogger("ws_engine")
 
+# Load Fixie Proxy URL
+FIXIE_URL = (
+    os.getenv("FIXIE_URL")
+    or os.getenv("HTTP_PROXY")
+    or os.getenv("HTTPS_PROXY")
+    or os.getenv("PROXY_URL")
+)
+
 class UnifiedWebSocketEngine:
     def __init__(self, symbols: List[str], is_testnet: bool = True, api_key: str = None, api_secret: str = None):
-        # Clean symbol to XRPUSDT format for Bybit V5 WS
         self.symbols = [
             s.split(":")[0].replace("/", "").replace("_", "").upper() 
             for s in symbols
         ]
         
-        # Local price cache for ticker deltas
         self.last_prices: Dict[str, float] = {}
         self.is_testnet = is_testnet
         self.api_key = api_key
         self.api_secret = api_secret
         
-        # Select correct endpoints based on network mode
         if is_testnet:
             self.ws_endpoints = [
                 "wss://stream-testnet.bybit.com/v5/public/linear",
@@ -139,18 +146,21 @@ class UnifiedWebSocketEngine:
         ssl_context.check_hostname = False
         ssl_context.verify_mode = ssl.CERT_NONE
 
+        proxy = Proxy.from_url(FIXIE_URL) if FIXIE_URL else None
+        retry_delay = 5
+
         while True:
             try:
-                async with websockets.connect(
-                    self.private_ws_endpoint,
-                    open_timeout=20,
-                    ping_interval=None,
-                    ping_timeout=None,
-                    close_timeout=5,
-                    ssl=ssl_context,
-                    proxy=None  # <--- ADD THIS PARAMETER
-                ) as ws:
+                connect_ctx = (
+                    proxy_connect(self.private_ws_endpoint, proxy=proxy, ssl=ssl_context, open_timeout=20, close_timeout=5)
+                    if proxy else
+                    websockets.connect(self.private_ws_endpoint, ssl=ssl_context, open_timeout=20, close_timeout=5)
+                )
+
+                async with connect_ctx as ws:
                     logger.info(f"Connected to Bybit Private Feed: {self.private_ws_endpoint}")
+                    retry_delay = 5  # Reset backoff on success
+                    
                     if not await self._authenticate_private_ws(ws):
                         await asyncio.sleep(10)
                         continue
@@ -165,33 +175,35 @@ class UnifiedWebSocketEngine:
                             for exec_item in data.get("data", []):
                                 await self._handle_private_execution(exec_item)
             except Exception as e:
-                logger.warning(f"Private WS connection dropped: {e}. Reconnecting in 5s...")
-                await asyncio.sleep(5)
+                logger.warning(f"Private WS dropped: {e}. Reconnecting in {retry_delay}s...")
+                await asyncio.sleep(retry_delay)
+                retry_delay = min(retry_delay * 2, 60)  # Exponential backoff capped at 60s
 
     async def start(self):
         ssl_context = ssl.create_default_context()
         ssl_context.check_hostname = False
         ssl_context.verify_mode = ssl.CERT_NONE
 
-        # Launch Private Listener concurrently if credentials are present
         if self.api_key and self.api_secret:
             asyncio.create_task(self.start_private_listener())
+
+        proxy = Proxy.from_url(FIXIE_URL) if FIXIE_URL else None
+        retry_delay = 3
 
         while True:
             endpoint = self._get_active_endpoint()
             logger.info(f"Connecting to Bybit WebSocket: {endpoint}...")
 
             try:
-                async with websockets.connect(
-                    endpoint,
-                    open_timeout=20,
-                    ping_interval=None,
-                    ping_timeout=None,
-                    close_timeout=5,
-                    ssl=ssl_context,
-                    proxy=None  # <--- ADD THIS PARAMETER
-                ) as ws:
+                connect_ctx = (
+                    proxy_connect(endpoint, proxy=proxy, ssl=ssl_context, open_timeout=20, close_timeout=5)
+                    if proxy else
+                    websockets.connect(endpoint, ssl=ssl_context, open_timeout=20, close_timeout=5)
+                )
+
+                async with connect_ctx as ws:
                     logger.info(f"Connected to Bybit Feed: {endpoint}")
+                    retry_delay = 3  # Reset backoff on success
 
                     asyncio.create_task(self._ping_loop(ws))
 
@@ -218,6 +230,7 @@ class UnifiedWebSocketEngine:
                                     "price": last_price
                                 })
             except Exception as e:
-                logger.warning(f"WebSocket connection error ({endpoint}): {e}. Switching endpoints...")
+                logger.warning(f"WebSocket error ({endpoint}): {e}. Switching endpoints in {retry_delay}s...")
                 self._switch_endpoint()
-                await asyncio.sleep(3)
+                await asyncio.sleep(retry_delay)
+                retry_delay = min(retry_delay * 2, 60)
