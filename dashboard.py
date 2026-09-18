@@ -14,12 +14,10 @@ from dotenv import load_dotenv
 
 load_dotenv(override=True)
 
-# Explicitly ensure global environment proxy flags are not set by the dashboard process
+# Step 1: Clear environment proxy settings causing 407 Proxy Auth errors
 for proxy_var in ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"]:
-    if proxy_var in os.environ:
-        del os.environ[proxy_var]
+    os.environ.pop(proxy_var, None)
 
-# Explicitly set NO_PROXY for any underlying urllib/requests instances in Streamlit
 os.environ["NO_PROXY"] = "localhost,127.0.0.1,.supabase.co,api.binance.com,api.mexc.com,api.telegram.org"
 os.environ["no_proxy"] = os.environ["NO_PROXY"]
 
@@ -195,8 +193,8 @@ for default_pair in [normalize_symbol("XRP/USDT")]:
 
 st.sidebar.subheader("🎛️ Terminal Controls & Tuning")
 
-fixie_status = "Configured (Isolated to Bybit)" if os.getenv("FIXIE_URL") or os.getenv("PROXY_URL") else "Not Set (Direct Connection)"
-st.sidebar.text(f"Fixie Proxy: {fixie_status}")
+worker_status = os.getenv("CLOUDFLARE_WORKER_URL", "https://bybit-proxy.gspark4u.workers.dev")
+st.sidebar.text(f"Proxy Worker: Configured")
 
 selected_pair = st.sidebar.selectbox("Active Execution / Config Pair", available_pairs, index=0)
 config_target_pair = selected_pair
@@ -376,7 +374,7 @@ if st.sidebar.button("🚀 Execute Live Futures Order via Bybit API", use_contai
             st.error(f"Execution Error Encountered: {exec_err}")
 
 st.title("📊 Live Bybit Futures Trading Dashboard")
-st.info("Dashboard running on direct connection without global proxy leakage.")
+st.info("Dashboard routing through Cloudflare Worker Reverse Proxy.")
 
 closed_trades = df_all_trades[df_all_trades['status'] == 'CLOSED'] if not df_all_trades.empty and 'status' in df_all_trades.columns else pd.DataFrame()
 net_realized_pnl = float(closed_trades['pnl_usd'].sum()) if not closed_trades.empty and 'pnl_usd' in closed_trades.columns else 0.0
@@ -648,7 +646,7 @@ with col_log:
     st.markdown("*Live Worker Logs:*")
     log_messages = [
         "[INFO] Database connection established...",
-        "[INFO] Live Execution Engine bound to Bybit Futures API.",
+        "[INFO] Live Execution Engine bound to Bybit Futures API via Cloudflare Worker Proxy.",
         "[INFO] Pending setups tab synchronized with PostgreSQL.",
         "[STATUS] Monitoring futures strategy triggers and active positions."
     ]

@@ -5,6 +5,10 @@ from psycopg2 import pool
 import requests
 from dotenv import load_dotenv
 
+# Unset environment proxies early to avoid 407 Proxy Authentication Required issues
+for proxy_var in ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"]:
+    os.environ.pop(proxy_var, None)
+
 base_dir = os.path.dirname(os.path.abspath(__file__))
 env_path = os.path.join(base_dir, ".env")
 load_dotenv(dotenv_path=env_path)
@@ -158,12 +162,8 @@ def normalize_symbol(symbol: str) -> str:
     if not symbol:
         return ""
     
-    # 1. Strip CCXT contract/margin suffix (e.g. SOL/USDT:USDT -> SOL/USDT)
     symbol_base = symbol.split(":")[0].strip()
-    
-    # 2. Clean delimiters and normalize string
     clean = symbol_base.replace("/", "").replace("_", "").replace("-", "").strip().upper()
-    
     return clean
 
 
