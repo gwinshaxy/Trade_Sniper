@@ -205,11 +205,11 @@ def reconcile_open_trades(executor: BybitFuturesLiveExecutor) -> int:
         except Exception as err:
             logger.error(f"Error reconciling trade ID #{trade_id}: {err}")
 
-    # Auto-adopt un-tracked exchange positions into DB
+    # Auto-adopt un-tracked exchange positions into DB with ON CONFLICT resolution
     if live_exchange_positions:
         for ex_symbol, ex_pos in live_exchange_positions.items():
             if ex_symbol not in tracked_ccxt_symbols:
-                logger.warning(f"🚨 ORPHAN POSITION DETECTED: {ex_symbol}. Inserting missing position into DB...")
+                logger.warning(f"🚨 ORPHAN POSITION DETECTED: {ex_symbol}. Inserting/updating position in DB...")
                 
                 conn_adopt = get_db_connection()
                 if conn_adopt:
@@ -225,6 +225,13 @@ def reconcile_open_trades(executor: BybitFuturesLiveExecutor) -> int:
                                     pair, direction, entry_price, position_size, 
                                     stop_loss, take_profit, status, trade_state, created_at
                                 ) VALUES (%s, %s, %s, %s, %s, %s, 'EXECUTED', 'OPEN', NOW())
+                                ON CONFLICT ON CONSTRAINT idx_unique_open_pair
+                                DO UPDATE SET
+                                    position_size = EXCLUDED.position_size,
+                                    entry_price = EXCLUDED.entry_price,
+                                    stop_loss = COALESCE(NULLIF(EXCLUDED.stop_loss, 0.0), trade_setups.stop_loss),
+                                    take_profit = COALESCE(NULLIF(EXCLUDED.take_profit, 0.0), trade_setups.take_profit),
+                                    updated_at = CURRENT_TIMESTAMP
                                 RETURNING id;
                             """, (
                                 db_pair, 
@@ -235,18 +242,20 @@ def reconcile_open_trades(executor: BybitFuturesLiveExecutor) -> int:
                                 ex_pos.get('take_profit', 0.0)
                             ))
                             
-                            new_id = cursor.fetchone()[0]
-                            conn_adopt.commit()
-                            reconciled_count += 1
-                            
-                            send_telegram_notification(
-                                f"<b>✅ AUTO-ADOPTED EXCHANGE POSITION</b>\n\n"
-                                f"<b>Trade ID:</b> <code>#{new_id}</code>\n"
-                                f"<b>Pair:</b> <code>{db_pair}</code>\n"
-                                f"<b>Side:</b> <code>{direction}</code>\n"
-                                f"<b>Contracts:</b> <code>{position_size}</code>\n"
-                                f"<b>SL:</b> <code>${ex_pos.get('stop_loss', 0.0)}</code> | <b>TP:</b> <code>${ex_pos.get('take_profit', 0.0)}</code>"
-                            )
+                            fetched = cursor.fetchone()
+                            if fetched:
+                                new_id = fetched[0]
+                                conn_adopt.commit()
+                                reconciled_count += 1
+                                
+                                send_telegram_notification(
+                                    f"<b>✅ AUTO-ADOPTED EXCHANGE POSITION</b>\n\n"
+                                    f"<b>Trade ID:</b> <code>#{new_id}</code>\n"
+                                    f"<b>Pair:</b> <code>{db_pair}</code>\n"
+                                    f"<b>Side:</b> <code>{direction}</code>\n"
+                                    f"<b>Contracts:</b> <code>{position_size}</code>\n"
+                                    f"<b>SL:</b> <code>${ex_pos.get('stop_loss', 0.0)}</code> | <b>TP:</b> <code>${ex_pos.get('take_profit', 0.0)}</code>"
+                                )
                     except Exception as db_err:
                         logger.error(f"Failed to auto-insert orphan position for {ex_symbol}: {db_err}")
                     finally:

@@ -1,21 +1,26 @@
 import os
+import sys
+
+# =====================================================================
+# PROXY BYPASS FOR WEBSOCKETS & REST APIs AT APPLICATION ENTRY POINT
+# Define explicit domain bypasses BEFORE any HTTP/network clients initialize
+# =====================================================================
+NO_PROXY_DOMAINS = (
+    "api.binance.com,api.mexc.com,api.telegram.org,.supabase.co,"
+    "stream.bybit.com,stream-testnet.bybit.com,localhost,127.0.0.1"
+)
+os.environ["NO_PROXY"] = NO_PROXY_DOMAINS
+os.environ["no_proxy"] = NO_PROXY_DOMAINS
+
+# Ensure global proxy environment variables are wiped to prevent ambient proxy leakage
+os.environ.pop("HTTP_PROXY", None)
+os.environ.pop("HTTPS_PROXY", None)
+os.environ.pop("http_proxy", None)
+os.environ.pop("https_proxy", None)
+
 import asyncio
 import logging
 from dotenv import load_dotenv
-
-# =====================================================================
-# PROXY BYPASS FOR WEBSOCKETS IN ENTRY SCRIPT
-# Exclude Bybit WebSocket endpoints and localhost from HTTP proxy
-# =====================================================================
-no_proxy_entries = os.getenv("NO_PROXY", "")
-ws_bypasses = "stream-testnet.bybit.com,stream-testnet.bybitglobal.com,stream.bybit.com,stream.bybitglobal.com,localhost,127.0.0.1"
-
-if no_proxy_entries:
-    os.environ["NO_PROXY"] = f"{no_proxy_entries},{ws_bypasses}"
-else:
-    os.environ["NO_PROXY"] = ws_bypasses
-
-os.environ["no_proxy"] = os.environ["NO_PROXY"]
 
 load_dotenv()
 
@@ -264,14 +269,39 @@ async def strategy_evaluation_loop():
         await asyncio.sleep(POLL_INTERVAL_SECONDS)
 
 
-async def reconciler_background_task():
+async def reconciler_background_task(executor):
+    """
+    Event-driven position reconciliation loop.
+    Triggers instantly on WS execution events or runs every 1 hour (3600s) as a safety net.
+    """
+    exec_queue = asyncio.Queue()
+
+    async def on_execution_event(payload):
+        await exec_queue.put(payload)
+
+    # Subscribe queue listener to execution events
+    event_bus.subscribe("EXECUTION_EVENT", on_execution_event)
+
+    # Fallback polling interval in seconds (1 hour)
+    SAFETY_INTERVAL = 3600
+
     while True:
         try:
-            logger.info("Running background position reconciliation safety net...")
-            await asyncio.to_thread(reconcile_open_trades, executor)
+            # Wait for either an incoming WS execution event or the safety timer expiry
+            try:
+                event_payload = await asyncio.wait_for(exec_queue.get(), timeout=SAFETY_INTERVAL)
+                logger.info(f"⚡ [Event-Driven] Triggering reconciliation via WS execution event ({event_payload.get('symbol')}).")
+            except asyncio.TimeoutError:
+                logger.info("⏰ [Safety Check] Running scheduled background position reconciliation...")
+
+            # Execute position reconciliation in a thread to keep async loop non-blocking
+            reconciled_count = await asyncio.to_thread(reconcile_open_trades, executor)
+            if reconciled_count > 0:
+                logger.info(f"Reconciliation finished: {reconciled_count} record(s) healed/updated.")
+
         except Exception as rec_err:
             logger.error(f"Reconciler task error: {rec_err}")
-        await asyncio.sleep(30)
+            await asyncio.sleep(10)  # Brief delay before retrying on loop errors
 
 
 async def main():
@@ -281,7 +311,6 @@ async def main():
 
     from ws_engine import UnifiedWebSocketEngine
 
-    # Matches standard UnifiedWebSocketEngine class signature
     ws_engine = UnifiedWebSocketEngine(
         symbols=WATCHLIST,
         is_testnet=BYBIT_TESTNET,
@@ -294,7 +323,7 @@ async def main():
         state_machine.run(),
         strategy_evaluation_loop(),
         dynamic_trade_management_loop(),
-        reconciler_background_task()
+        reconciler_background_task(executor)
     )
 
 
@@ -303,3 +332,4 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         logger.info("Bybit Futures Trading Agent system shut down cleanly.")
+        sys.exit(0)

@@ -151,11 +151,20 @@ def finalize_trade_in_db(trade_id: int, exit_price: float, pnl_usd: float, pnl_p
 
 
 def normalize_symbol(symbol: str) -> str:
-    """Normalizes any input symbol format to clean uppercase pair (e.g., 'XRPUSDT')."""
+    """
+    Normalizes any input symbol format to clean uppercase pair.
+    Strips CCXT exchange contract parameters (e.g. SOL/USDT:USDT -> SOLUSDT or SOL/USDT).
+    """
     if not symbol:
         return ""
-    clean = symbol.split(":")[0]
-    return clean.replace("/", "").replace("_", "").replace("-", "").strip().upper()
+    
+    # 1. Strip CCXT contract/margin suffix (e.g. SOL/USDT:USDT -> SOL/USDT)
+    symbol_base = symbol.split(":")[0].strip()
+    
+    # 2. Clean delimiters and normalize string
+    clean = symbol_base.replace("/", "").replace("_", "").replace("-", "").strip().upper()
+    
+    return clean
 
 
 def check_asset_cooldown(symbol: str) -> bool:

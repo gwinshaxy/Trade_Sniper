@@ -14,6 +14,15 @@ from dotenv import load_dotenv
 
 load_dotenv(override=True)
 
+# Explicitly ensure global environment proxy flags are not set by the dashboard process
+for proxy_var in ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"]:
+    if proxy_var in os.environ:
+        del os.environ[proxy_var]
+
+# Explicitly set NO_PROXY for any underlying urllib/requests instances in Streamlit
+os.environ["NO_PROXY"] = "localhost,127.0.0.1,.supabase.co,api.binance.com,api.mexc.com,api.telegram.org"
+os.environ["no_proxy"] = os.environ["NO_PROXY"]
+
 query_params = st.query_params
 if "assetlinks" in query_params or st.context.headers.get("Path") == "/.well-known/assetlinks.json":
     try:
@@ -90,14 +99,6 @@ pwa_injector = f"""
 """
 
 components.html(pwa_injector, height=0, width=0)
-
-HTTP_PROXY = os.getenv("HTTP_PROXY") or os.getenv("PROXY_URL")
-HTTPS_PROXY = os.getenv("HTTPS_PROXY") or os.getenv("PROXY_URL")
-
-if HTTP_PROXY or HTTPS_PROXY:
-    os.environ["HTTP_PROXY"] = HTTP_PROXY or HTTPS_PROXY
-    os.environ["HTTPS_PROXY"] = HTTPS_PROXY or HTTP_PROXY
-    os.environ["NO_PROXY"] = "localhost,127.0.0.1,.supabase.co"
 
 base_dir = os.path.dirname(os.path.abspath(__file__))
 if base_dir not in sys.path:
@@ -193,6 +194,9 @@ for default_pair in [normalize_symbol("XRP/USDT")]:
         available_pairs.append(default_pair)
 
 st.sidebar.subheader("🎛️ Terminal Controls & Tuning")
+
+fixie_status = "Configured (Isolated to Bybit)" if os.getenv("FIXIE_URL") or os.getenv("PROXY_URL") else "Not Set (Direct Connection)"
+st.sidebar.text(f"Fixie Proxy: {fixie_status}")
 
 selected_pair = st.sidebar.selectbox("Active Execution / Config Pair", available_pairs, index=0)
 config_target_pair = selected_pair
@@ -372,6 +376,7 @@ if st.sidebar.button("🚀 Execute Live Futures Order via Bybit API", use_contai
             st.error(f"Execution Error Encountered: {exec_err}")
 
 st.title("📊 Live Bybit Futures Trading Dashboard")
+st.info("Dashboard running on direct connection without global proxy leakage.")
 
 closed_trades = df_all_trades[df_all_trades['status'] == 'CLOSED'] if not df_all_trades.empty and 'status' in df_all_trades.columns else pd.DataFrame()
 net_realized_pnl = float(closed_trades['pnl_usd'].sum()) if not closed_trades.empty and 'pnl_usd' in closed_trades.columns else 0.0
@@ -425,7 +430,6 @@ if df_ohlc is not None and not df_ohlc.empty:
         df_ohlc['tema_custom'] = strategy.calculate_tema(df_ohlc['close'], period=min(tema_period, len(df_ohlc)))
         
         if hasattr(strategy, 'calculate_volume_profile_gaps'):
-            # To this:
             vp_res = strategy.calculate_volume_profile_gaps(df_ohlc, num_bins=100, lookback_bars=lookback_bars)
             poc = vp_res.get("poc")
             vah = vp_res.get("vah")

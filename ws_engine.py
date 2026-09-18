@@ -138,6 +138,14 @@ class UnifiedWebSocketEngine:
                     logger.error(f"Error handling private WS execution data for DB sync: {db_err}")
                 finally:
                     release_db_connection(conn)
+
+            # Publish event to trigger instant reconciler check on position state updates
+            await event_bus.publish("EXECUTION_EVENT", {
+                "symbol": symbol,
+                "order_status": order_status,
+                "exec_type": exec_type
+            })
+
         except Exception as e:
             logger.error(f"Error processing execution websocket message: {e}")
 

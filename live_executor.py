@@ -2,7 +2,8 @@ import asyncio
 import logging
 import os
 import time
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, Tuple
+import ccxt.async_support as ccxt_async
 import ccxt
 
 from config import BYBIT_API_KEY, BYBIT_SECRET_KEY, BYBIT_TESTNET
@@ -17,35 +18,38 @@ from common import (
 from event_bus import event_bus
 
 # =====================================================================
-# FIXIE PROXY INITIALIZATION & ENVIRONMENT SETUP
+# CLOUDFLARE WORKER REVERSE PROXY CONFIGURATION
+# Bypasses local IP restrictions via Cloudflare Worker edge nodes.
+# Clean environment of any legacy HTTP proxy variables.
 # =====================================================================
-FIXIE_URL = (
-    os.getenv("FIXIE_URL")
-    or os.getenv("HTTP_PROXY")
-    or os.getenv("HTTPS_PROXY")
-    or os.getenv("PROXY_URL")
+os.environ.pop("HTTP_PROXY", None)
+os.environ.pop("HTTPS_PROXY", None)
+os.environ.pop("http_proxy", None)
+os.environ.pop("https_proxy", None)
+
+# Set your Cloudflare Worker URL here or pull from environment variables
+CLOUDFLARE_WORKER_URL = (
+    os.getenv("CLOUDFLARE_WORKER_URL")
+    or os.getenv("WORKER_URL")
+    or "https://bybit-proxy.gspark4u.workers.dev"  # Default worker domain
 )
 
-if FIXIE_URL:
-    # Ensure URL formatting clean-up
-    FIXIE_URL = FIXIE_URL.strip('"').strip("'")
-    
-    # Export standard proxy environment variables for requests / urllib
-    os.environ["HTTP_PROXY"] = FIXIE_URL
-    os.environ["HTTPS_PROXY"] = FIXIE_URL
-    os.environ["http_proxy"] = FIXIE_URL
-    os.environ["https_proxy"] = FIXIE_URL
-    os.environ["NO_PROXY"] = "localhost,127.0.0.1,.supabase.co"
-    os.environ["no_proxy"] = "localhost,127.0.0.1,.supabase.co"
-    logger.info("Fixie proxy successfully integrated into environment execution pipeline.")
+if CLOUDFLARE_WORKER_URL:
+    CLOUDFLARE_WORKER_URL = CLOUDFLARE_WORKER_URL.strip('"').strip("'").rstrip('/')
+
+# Throttling interval for private execution polling loop
+POLL_INTERVAL_SECONDS = 1080  # 18 minutes
 
 MIN_DUST_THRESHOLD = 0.001
 MAX_SLIPPAGE_PCT = 0.002       # 0.2% max execution limit offset
 MAX_ALLOWED_SPREAD_PCT = 0.003 # 0.3% max spread threshold
-ENTRY_TOLERANCE_PCT = 0.005    # 0.5% max strategy-to-exchange price deviation ceiling
+
+# Environment-aware entry deviation tolerances
+ENTRY_TOLERANCE_PCT_LIVE = 0.005    # 0.5% tolerance for live production trading
+ENTRY_TOLERANCE_PCT_TESTNET = 0.05  # 5.0% extended tolerance to absorb testnet drift
 
 
-def safe_float(val, default=0.0):
+def safe_float(val: Any, default: float = 0.0) -> float:
     try:
         if val is None:
             return default
@@ -74,42 +78,172 @@ def format_ccxt_futures_symbol(symbol: str) -> str:
 
 class BybitFuturesLiveExecutor:
     def __init__(self):
-        exchange_config = {
+        # 1. Private Exchange Config (Routed via Cloudflare Worker Reverse Proxy)
+        private_exchange_config = {
             'apiKey': BYBIT_API_KEY,
             'secret': BYBIT_SECRET_KEY,
             'enableRateLimit': True,
             'options': {
-                'defaultType': 'future',
+                'defaultType': 'linear',
                 'recvWindow': 20000,
                 'adjustForTimeDifference': True
             }
         }
 
-        # Inject Fixie Proxy into CCXT configuration if present
-        if FIXIE_URL:
-            exchange_config['proxies'] = {
-                'http': FIXIE_URL,
-                'https': FIXIE_URL
+        if CLOUDFLARE_WORKER_URL:
+            logger.info(f"Routing CCXT Private Execution through Cloudflare Worker: {CLOUDFLARE_WORKER_URL}")
+            private_exchange_config['urls'] = {
+                'api': {
+                    'public': CLOUDFLARE_WORKER_URL,
+                    'private': CLOUDFLARE_WORKER_URL,
+                }
             }
-            exchange_config['aiohttp_proxy'] = FIXIE_URL
+        else:
+            logger.warning("No CLOUDFLARE_WORKER_URL specified. Operating on direct connection.")
 
-        self.exchange = ccxt.bybit(exchange_config)
+        self.exchange = ccxt.bybit(private_exchange_config)
+
+        # 2. Public Exchange Config (Also routed through Worker to avoid regional blocks)
+        public_exchange_config = {
+            'enableRateLimit': True,
+            'options': {
+                'defaultType': 'linear'
+            }
+        }
+
+        if CLOUDFLARE_WORKER_URL:
+            public_exchange_config['urls'] = {
+                'api': {
+                    'public': CLOUDFLARE_WORKER_URL,
+                    'private': CLOUDFLARE_WORKER_URL,
+                }
+            }
+
+        self.public_exchange = ccxt.bybit(public_exchange_config)
 
         if BYBIT_TESTNET:
             self.exchange.set_sandbox_mode(True)
+            self.public_exchange.set_sandbox_mode(True)
 
         try:
-            self.exchange.load_markets()
+            self.public_exchange.load_markets()
         except Exception as e:
-            logger.warning(f"Could not refresh market structures on init: {e}")
+            logger.warning(f"Could not refresh public market structures on init: {e}")
 
     def format_ccxt_futures_symbol(self, raw_symbol: str) -> str:
         return format_ccxt_futures_symbol(raw_symbol)
 
+    async def fetch_ticker_direct_async(self, symbol: str) -> float:
+        """Asynchronously fetches current ticker price directly via Cloudflare Worker."""
+        ccxt_symbol = format_ccxt_futures_symbol(symbol)
+        try:
+            async_config = {'enableRateLimit': True, 'options': {'defaultType': 'linear'}}
+            if CLOUDFLARE_WORKER_URL:
+                async_config['urls'] = {
+                    'api': {
+                        'public': CLOUDFLARE_WORKER_URL,
+                        'private': CLOUDFLARE_WORKER_URL,
+                    }
+                }
+            async_public = ccxt_async.bybit(async_config)
+            if BYBIT_TESTNET:
+                async_public.set_sandbox_mode(True)
+            ticker = await async_public.fetch_ticker(ccxt_symbol)
+            await async_public.close()
+            return safe_float(ticker.get('last') or ticker.get('close'))
+        except Exception as e:
+            logger.error(f"[{ccxt_symbol}] Direct async ticker fetch error: {e}")
+            return 0.0
+
+    def fetch_ticker_data(self, symbol: str) -> Dict[str, Any]:
+        """
+        Fetches ticker using public exchange instance routed through Cloudflare Worker.
+        Prioritizes actual market execution prices (last traded price and orderbook prices)
+        over testnet mark price drift.
+        """
+        ccxt_symbol = format_ccxt_futures_symbol(symbol)
+        try:
+            ticker = self.public_exchange.fetch_ticker(ccxt_symbol)
+            bid = safe_float(ticker.get('bid'))
+            ask = safe_float(ticker.get('ask'))
+            last = safe_float(ticker.get('last'))
+            info = ticker.get('info', {})
+            
+            mark_price = safe_float(ticker.get('markPrice') or info.get('markPrice') or info.get('indexPrice'))
+
+            # Prioritize last traded price, then orderbook midpoint, using mark_price purely as fallback
+            if last > 0:
+                exec_price = last
+            elif bid > 0 and ask > 0:
+                exec_price = (bid + ask) / 2.0
+            else:
+                exec_price = mark_price
+
+            spread_pct = (ask - bid) / bid if (bid > 0 and ask > 0) else 0.0
+
+            return {
+                "exec_price": exec_price,
+                "bid": bid,
+                "ask": ask,
+                "last": last,
+                "mark_price": mark_price,
+                "spread_pct": spread_pct
+            }
+        except Exception as e:
+            logger.error(f"[{ccxt_symbol}] Failed to fetch direct public ticker data: {e}")
+            return {
+                "exec_price": 0.0,
+                "bid": 0.0,
+                "ask": 0.0,
+                "last": 0.0,
+                "mark_price": 0.0,
+                "spread_pct": 0.0
+            }
+
+    def fetch_ticker_price(self, symbol: str) -> float:
+        """Fetches the primary market execution reference price for a given symbol."""
+        data = self.fetch_ticker_data(symbol)
+        return data["exec_price"]
+
+    def validate_entry_price_deviation(self, symbol: str, strategy_entry_price: float, ticker_data: Dict[str, Any]) -> Tuple[bool, str]:
+        """
+        Validates strategy entry price against current ticker prices using environment-specific tolerance.
+        """
+        if strategy_entry_price <= 0:
+            return True, "No strategy entry price specified; skipping deviation check."
+
+        exec_price = ticker_data.get("exec_price", 0.0)
+        mark_price = ticker_data.get("mark_price", 0.0)
+
+        if exec_price <= 0:
+            return False, f"[{symbol}] Invalid live execution price: {exec_price}"
+
+        # Set dynamic tolerance depending on testnet vs live environment
+        tolerance_pct = ENTRY_TOLERANCE_PCT_TESTNET if BYBIT_TESTNET else ENTRY_TOLERANCE_PCT_LIVE
+
+        # Calculate deviation relative to strategy entry price
+        price_dev = abs(exec_price - strategy_entry_price) / strategy_entry_price
+
+        if price_dev > tolerance_pct:
+            msg = (
+                f"[{symbol}] Execution Rejected: Live market price (${exec_price:.5f}) "
+                f"deviates from Strategy Entry (${strategy_entry_price:.5f}) by {price_dev * 100:.2f}% "
+                f"(Max allowed: {tolerance_pct * 100:.2f}% | Testnet Mark Price: ${mark_price:.5f})."
+            )
+            logger.error(msg)
+            return False, msg
+
+        logger.info(
+            f"[{symbol}] Price deviation check passed: {price_dev * 100:.2f}% deviation "
+            f"(Live: ${exec_price:.5f} vs Strategy: ${strategy_entry_price:.5f})."
+        )
+        return True, "Price deviation within accepted tolerance."
+
     async def get_futures_position_async(self, symbol: str) -> Dict[str, Any]:
         return await asyncio.to_thread(self.get_futures_position, symbol)
 
-    def get_futures_position(self, symbol: str) -> dict:
+    def get_futures_position(self, symbol: str) -> Dict[str, Any]:
+        """Position lookup via Cloudflare Worker proxy."""
         ccxt_symbol = format_ccxt_futures_symbol(symbol)
         clean_target = symbol.replace("/", "").replace(":", "").replace("_", "").replace("-", "").upper()
         try:
@@ -118,7 +252,6 @@ class BybitFuturesLiveExecutor:
                 pos_symbol = str(pos.get('symbol', '')).replace("/", "").replace(":", "").replace("_", "").replace("-", "").upper()
                 contracts = safe_float(pos.get('contracts', 0.0))
                 
-                # Match normalized symbols rather than exact string equality
                 if clean_target in pos_symbol or pos_symbol in clean_target:
                     if contracts > 0:
                         return {
@@ -171,42 +304,27 @@ class BybitFuturesLiveExecutor:
     def get_available_usdt_balance(self) -> float:
         return self.fetch_available_usdt_balance()
 
-    def fetch_ticker_data(self, symbol: str) -> dict:
-        ccxt_symbol = format_ccxt_futures_symbol(symbol)
-        try:
-            ticker = self.exchange.fetch_ticker(ccxt_symbol)
-            bid = safe_float(ticker.get('bid'))
-            ask = safe_float(ticker.get('ask'))
-            last = safe_float(ticker.get('last'))
-            info = ticker.get('info', {})
-            
-            mark_price = safe_float(ticker.get('markPrice') or info.get('markPrice') or info.get('indexPrice'))
+    async def throttled_execution_loop(self, symbols: list):
+        """
+        Execution loop monitoring active positions and prices via Cloudflare Worker proxy.
+        """
+        logger.info(f"Starting execution loop via Cloudflare Worker (Poll interval: {POLL_INTERVAL_SECONDS}s)...")
+        while True:
+            try:
+                for symbol in symbols:
+                    # 1. Market Price Fetch
+                    current_price = self.fetch_ticker_price(symbol)
+                    logger.debug(f"[{symbol}] Direct Market Price: ${current_price:.5f}")
 
-            if BYBIT_TESTNET and mark_price > 0:
-                bid = mark_price
-                ask = mark_price
-                last = mark_price
+                    # 2. Private Position Verification
+                    position = await self.get_futures_position_async(symbol)
+                    if position["contracts"] > MIN_DUST_THRESHOLD:
+                        logger.info(f"[{symbol}] Active position detected: {position['contracts']} contracts {position['side']}")
 
-            spread_pct = (ask - bid) / bid if (bid > 0 and ask > 0) else 0.0
+            except Exception as loop_err:
+                logger.error(f"Error in execution loop iteration: {loop_err}")
 
-            return {
-                "bid": bid,
-                "ask": ask,
-                "last": last,
-                "mark_price": mark_price,
-                "spread_pct": spread_pct
-            }
-        except Exception as e:
-            logger.error(f"[{ccxt_symbol}] Failed to fetch ticker data: {e}")
-            return {"bid": 0.0, "ask": 0.0, "last": 0.0, "mark_price": 0.0, "spread_pct": 0.0}
-
-    def fetch_ticker_price(self, symbol: str) -> float:
-        data = self.fetch_ticker_data(symbol)
-        if data["mark_price"] > 0 and BYBIT_TESTNET:
-            return data["mark_price"]
-        if data["bid"] > 0 and data["ask"] > 0:
-            return (data["bid"] + data["ask"]) / 2.0
-        return data["last"]
+            await asyncio.sleep(POLL_INTERVAL_SECONDS)
 
     def execute_live_order(
         self, 
@@ -251,10 +369,10 @@ class BybitFuturesLiveExecutor:
         entry_price: float = 0.0,
         stop_loss: float = 0.0, 
         take_profit: float = 0.0,
-        leverage: int = 5.0,
+        leverage: float = 5.0,
         account_balance: float = 100.0,
         risk_pct: float = 1.0
-    ) -> dict:
+    ) -> Dict[str, Any]:
         ccxt_symbol = format_ccxt_futures_symbol(symbol)
         dir_clean = direction.upper().strip()
         is_long = dir_clean in ["BUY", "LONG"]
@@ -269,45 +387,36 @@ class BybitFuturesLiveExecutor:
             logger.warning(f"[{symbol}] Guard Triggered: Active futures position exists ({pos_info['contracts']} contracts {pos_info['side']}). Blocking execution.")
             return {"status": "SKIPPED", "reason": "Active futures position detected on exchange"}
 
-        # Check available USDT Balance
         available_usdt = self.fetch_available_usdt_balance()
         if available_usdt <= 1.0:
             return {"status": "FAILED", "error": f"Insufficient live USDT balance: ${available_usdt:.2f}"}
 
         ticker_data = self.fetch_ticker_data(ccxt_symbol)
-        ref_price = ticker_data["ask"] if is_long else ticker_data["bid"]
+        ref_price = ticker_data["ask"] if (is_long and ticker_data["ask"] > 0) else ticker_data["bid"] if (not is_long and ticker_data["bid"] > 0) else ticker_data["exec_price"]
         spread_pct = ticker_data["spread_pct"]
 
         if ref_price <= 0:
             return {"status": "FAILED", "error": "Invalid reference ticker price prior to execution"}
 
-        # Strategy Entry Price Deviation Ceiling Check
-        if entry_price > 0:
-            price_dev = abs(ref_price - entry_price) / entry_price
-            if price_dev > ENTRY_TOLERANCE_PCT:
-                logger.error(
-                    f"[{symbol}] Execution Rejected: Live reference price (${ref_price:.5f}) deviates "
-                    f"from Strategy Entry Price (${entry_price:.5f}) by {price_dev * 100:.2f}% (Limit: {ENTRY_TOLERANCE_PCT * 100}%)."
-                )
-                return {"status": "FAILED", "error": f"Strategy entry price deviation too high ({price_dev * 100:.2f}%)"}
+        # Validate entry price deviation using updated environment-aware method
+        is_valid_entry, dev_reason = self.validate_entry_price_deviation(symbol, entry_price, ticker_data)
+        if not is_valid_entry:
+            return {"status": "FAILED", "error": dev_reason}
 
         if spread_pct > MAX_ALLOWED_SPREAD_PCT and not BYBIT_TESTNET:
             logger.warning(f"[{symbol}] Order Rejected: High Spread detected ({spread_pct * 100:.3f}% > Max allowed {MAX_ALLOWED_SPREAD_PCT * 100:.2f}%).")
             return {"status": "FAILED", "error": f"Spread too high ({spread_pct * 100:.3f}%)"}
 
         try:
-            self.exchange.set_leverage(leverage, ccxt_symbol)
+            self.exchange.set_leverage(int(leverage), ccxt_symbol)
         except Exception as lev_err:
             logger.debug(f"[{symbol}] Leverage setting notice: {lev_err}")
 
-        # --- FIXED-RISK & EQUAL-WEIGHT SIZING LOGIC ---
         if stop_loss > 0 and abs(ref_price - stop_loss) > 0:
-            # Fixed-Risk Sizing: (Balance * Risk%) / SL Distance
             risk_amount_usd = account_balance * (risk_pct / 100.0)
             sl_distance = abs(ref_price - stop_loss)
             target_contracts = risk_amount_usd / sl_distance
             
-            # Verify required margin does not exceed Equal-Weight Allocated cap
             required_margin = (target_contracts * ref_price) / leverage
             if required_margin > amount_usd:
                 logger.info(f"[{symbol}] Fixed-Risk margin (${required_margin:.2f}) capped by Equal-Weight cap (${amount_usd:.2f}).")
@@ -317,7 +426,6 @@ class BybitFuturesLiveExecutor:
             raw_qty = target_contracts
             trade_amount_usd = required_margin
         else:
-            # Fallback to pure Equal-Weight Allocation sizing if SL isn't defined
             trade_amount_usd = min(amount_usd, available_usdt * 0.98)
             notional_value = trade_amount_usd * leverage
             raw_qty = notional_value / ref_price
@@ -333,7 +441,6 @@ class BybitFuturesLiveExecutor:
 
         params = {'timeInForce': 'IOC'}
 
-        # Stop Loss Sanity Floor Checks
         if stop_loss > 0:
             if is_long and stop_loss >= ref_price:
                 logger.error(f"[{symbol}] Invalid Long Stop Loss (${stop_loss:.5f}) >= Reference Price (${ref_price:.5f}). Stripping SL parameter.")
@@ -406,7 +513,7 @@ class BybitFuturesLiveExecutor:
             logger.error(f"[{symbol}] Bybit Futures Order Exception: {e}")
             return {"status": "FAILED", "error": str(e)}
 
-    def close_live_position_bybit(self, symbol: str, position_size: float, current_price: float, outcome: str = "CLOSE") -> dict:
+    def close_live_position_bybit(self, symbol: str, position_size: float, current_price: float, outcome: str = "CLOSE") -> Dict[str, Any]:
         ccxt_symbol = format_ccxt_futures_symbol(symbol)
         pos_info = self.get_futures_position(ccxt_symbol)
         
@@ -485,5 +592,4 @@ class BybitFuturesLiveExecutor:
             return {"status": "FAILED", "error": str(e)}
 
 
-# Class alias to maintain backward compatibility for Dashboard / Streamlit imports
 LiveExecutionEngine = BybitFuturesLiveExecutor
