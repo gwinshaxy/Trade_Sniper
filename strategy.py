@@ -69,7 +69,7 @@ def get_ai_sentiment_score(text: str, api_key: Optional[str] = None) -> float:
 # 2. MULTI-EXCHANGE KLINE DATA FETCHING & FALLBACKS
 # ---------------------------------------------------------------------------
 
-def fetch_cryptocompare_klines(symbol: str, interval: str = "1h", limit: int = 300) -> pd.DataFrame:
+def fetch_cryptocompare_klines(symbol: str, interval: str = "15m", limit: int = 400) -> pd.DataFrame:
     """Fallback fetcher querying CryptoCompare REST API."""
     try:
         clean_sym = symbol.replace("/", "").replace("_", "").upper()
@@ -109,7 +109,7 @@ def fetch_cryptocompare_klines(symbol: str, interval: str = "1h", limit: int = 3
     return pd.DataFrame()
 
 
-def fetch_klines(symbol: str, interval: str = "1h", limit: int = 300) -> pd.DataFrame:
+def fetch_klines(symbol: str, interval: str = "15m", limit: int = 400) -> pd.DataFrame:
     base_symbol = symbol.split(":")[0]
     clean_symbol = base_symbol.replace("/", "").replace("_", "").replace("-", "").upper()
     
@@ -159,7 +159,7 @@ def fetch_klines(symbol: str, interval: str = "1h", limit: int = 300) -> pd.Data
     # Tier 3: Bybit Spot REST API
     try:
         bybit_interval_map = {"1m": "1", "5m": "5", "15m": "15", "1h": "60", "4h": "240", "1d": "D"}
-        bybit_tf = bybit_interval_map.get(interval, "60")
+        bybit_tf = bybit_interval_map.get(interval, "15")
         url = "https://api.bybit.com/v5/market/kline"
         params = {"category": "spot", "symbol": clean_symbol, "interval": bybit_tf, "limit": limit}
         resp = requests.get(url, params=params, timeout=6)
@@ -249,9 +249,10 @@ def calculate_adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
 # 4. GRANULAR VOLUME PROFILE & LIQUIDITY GAP ALGORITHM
 # ---------------------------------------------------------------------------
 
-def compute_volume_profile(df: pd.DataFrame, num_bins: int = 100, lookback_bars: int = 600, va_pct: float = 0.70):
+def compute_volume_profile(df: pd.DataFrame, num_bins: int = 100, lookback_bars: int = 1200, va_pct: float = 0.70):
     """
     Computes exact Volume Profile levels (POC, VAH, VAL) using granular price-bin distribution.
+    Updated default lookback_bars to 1200 (~12.5 days on 15m).
     """
     if df.empty or "volume" not in df.columns or "high" not in df.columns or "low" not in df.columns:
         return np.nan, np.nan, np.nan
@@ -321,7 +322,7 @@ def compute_volume_profile(df: pd.DataFrame, num_bins: int = 100, lookback_bars:
     return float(poc), float(vaH), float(vaL)
 
 
-def calculate_volume_profile_gaps(df: pd.DataFrame, num_bins: int = 100, lookback_bars: int = 600, detection_pct: float = 0.07) -> Dict[str, Any]:
+def calculate_volume_profile_gaps(df: pd.DataFrame, num_bins: int = 100, lookback_bars: int = 1200, detection_pct: float = 0.07) -> Dict[str, Any]:
     """
     Identifies Low Volume Nodes (Liquidity Gaps) across the specified lookback range.
     Returns gap categories alongside VAH/VAL/POC levels.
@@ -448,17 +449,17 @@ def load_symbol_config(symbol: str) -> Dict[str, Any]:
                     config["rsi_period"] = int(config.get("rsi_period", 14))
                     config["rsi_thresh"] = float(config.get("rsi_thresh", 42.0))
                     config["adx_period"] = int(config.get("adx_period", 14))
-                    config["adx_threshold"] = float(config.get("adx_threshold", 20.0))
-                    config["max_sl_pct"] = float(config.get("max_sl_pct", 0.02))
-                    config["zone_tolerance"] = float(config.get("zone_tolerance", 0.0075))
+                    config["adx_threshold"] = float(config.get("adx_threshold", 22.0))
+                    config["max_sl_pct"] = float(config.get("max_sl_pct", 0.015))
+                    config["zone_tolerance"] = float(config.get("zone_tolerance", 0.005))
                     config["min_sentiment"] = float(config.get("min_sentiment", 0.0))
-                    config["risk_pct"] = float(config.get("risk_pct", 1.0))
+                    config["risk_pct"] = float(config.get("risk_pct", 0.5))
                     config["min_rr"] = float(config.get("min_rr", 2.0))
-                    config["lookback_bars"] = int(config.get("lookback_bars", 600))
+                    config["lookback_bars"] = int(config.get("lookback_bars", 1200))
                     config["vp_detection_pct"] = float(config.get("vp_detection_pct", 0.07))
                     config["vp_va_pct"] = float(config.get("vp_va_pct", 0.70))
                     config["atr_period"] = int(config.get("atr_period", 14))
-                    config["atr_mult"] = float(config.get("atr_mult", 2.0))
+                    config["atr_mult"] = float(config.get("atr_mult", 1.5))
 
                     config.setdefault("use_rsi_filter", True)
                     config.setdefault("use_candlestick_confirm", True)
@@ -473,25 +474,26 @@ def load_symbol_config(symbol: str) -> Dict[str, Any]:
             finally:
                 release_db_connection(conn)
 
+    # 15-Minute Fallback Defaults
     return {
         "tema_period": 200,
         "rsi_period": 14,
         "rsi_thresh": 42.0,
         "adx_period": 14,
-        "adx_threshold": 20.0,
+        "adx_threshold": 22.0,
         "use_adx_filter": True,
         "use_rsi_filter": True,
         "use_candlestick_confirm": True,
-        "zone_tolerance": 0.0075,
-        "max_sl_pct": 0.02,
+        "zone_tolerance": 0.005,
+        "max_sl_pct": 0.015,
         "min_sentiment": 0.0,
         "min_rr": 2.0,
-        "risk_pct": 1.0,
+        "risk_pct": 0.5,
         "vp_detection_pct": 0.07,
-        "lookback_bars": 600,
+        "lookback_bars": 1200,
         "vp_va_pct": 0.70,
         "atr_period": 14,
-        "atr_mult": 2.0,
+        "atr_mult": 1.5,
         "use_atr_sl": True,
         "disable_htf": False,
         "spot_only": False
@@ -527,10 +529,10 @@ def evaluate_signals(
     sentiment_score: Optional[float] = None
 ) -> Dict[str, Any]:
     """
-    Harmonized Core Strategy Evaluator:
+    Harmonized Core Strategy Evaluator (Optimized for 15m Execution):
     - Safely resolves missing runtime parameters by querying database config via `load_symbol_config(symbol)`.
     - Explicitly casts all numeric configuration values to float/int to prevent Decimal arithmetic errors.
-    - Evaluates LONG and SHORT entry signals with High-Timeframe confluence.
+    - Evaluates LONG and SHORT entry signals with High-Timeframe (1H) confluence.
     - Utilizes dynamic Volume Profile levels for Take-Profit targeting.
     """
     no_signal = {
@@ -567,7 +569,7 @@ def evaluate_signals(
     disable_htf = disable_htf if disable_htf is not None else sym_cfg["disable_htf"]
     spot_only = spot_only if spot_only is not None else sym_cfg.get("spot_only", False)
 
-    lookback_bars = int(sym_cfg.get("lookback_bars", 600))
+    lookback_bars = int(sym_cfg.get("lookback_bars", 1200))
     vp_detection_pct = float(sym_cfg.get("vp_detection_pct", 0.07))
 
     if df.empty or len(df) < max(tema_period, 50):
@@ -595,13 +597,13 @@ def evaluate_signals(
         no_signal["reason"] = f"Sentiment score ({final_sentiment:.2f}) below threshold ({min_sentiment:.2f})"
         return no_signal
 
-    # Evaluate High Timeframe (4H) Trend Confluence
+    # Evaluate High Timeframe (1H) Trend Confluence
     macro_trend_long = True
     macro_trend_short = True
 
     if not disable_htf:
         try:
-            df_htf = fetch_klines(symbol, interval="4h", limit=100)
+            df_htf = fetch_klines(symbol, interval="1h", limit=100)
             if not df_htf.empty and len(df_htf) >= 30:
                 df_htf["tema_htf"] = calculate_tema(df_htf["close"], 50)
                 htf_last = df_htf.iloc[-1]
@@ -611,7 +613,7 @@ def evaluate_signals(
                 macro_trend_long = float(htf_last["close"]) > float(htf_last["tema_htf"]) and htf_slope > 0
                 macro_trend_short = float(htf_last["close"]) < float(htf_last["tema_htf"]) and htf_slope < 0
         except Exception as e:
-            logger.warning(f"[{symbol}] Could not calculate HTF 4H confluence: {e}")
+            logger.warning(f"[{symbol}] Could not calculate HTF 1H confluence: {e}")
 
     # Volume Profile Analysis using loaded DB lookback parameters
     vp_data = calculate_volume_profile_gaps(df, num_bins=100, lookback_bars=lookback_bars, detection_pct=vp_detection_pct)
@@ -622,7 +624,7 @@ def evaluate_signals(
     underneath_gaps = vp_data["underneath_gaps"]
 
     adx_valid = (not use_adx_filter) or (current_adx >= adx_threshold)
-    MIN_SL_PCT = 0.005  
+    MIN_SL_PCT = 0.002  # Lowered to 0.20% for 15-minute execution sensitivity
 
     # ---------------------------------------------------------------------------
     # EVALUATE LONG (BUY) PATH
