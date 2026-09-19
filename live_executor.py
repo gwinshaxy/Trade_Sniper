@@ -5,6 +5,7 @@ import time
 from typing import Dict, Any, Optional, Tuple, List
 import ccxt.async_support as ccxt_async
 import ccxt
+import requests
 
 from config import BYBIT_API_KEY, BYBIT_SECRET_KEY, BYBIT_TESTNET
 from common import (
@@ -21,7 +22,7 @@ from event_bus import event_bus
 for proxy_var in ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"]:
     os.environ.pop(proxy_var, None)
 
-# Set your Cloudflare Worker Proxy URL
+# Set Cloudflare Worker Proxy URL
 CLOUDFLARE_WORKER_URL = (
     os.getenv("CLOUDFLARE_WORKER_URL")
     or os.getenv("WORKER_URL")
@@ -31,7 +32,7 @@ CLOUDFLARE_WORKER_URL = (
 if CLOUDFLARE_WORKER_URL:
     CLOUDFLARE_WORKER_URL = CLOUDFLARE_WORKER_URL.strip('"').strip("'").rstrip('/')
 
-POLL_INTERVAL_SECONDS = 10  # Set to 10s to preserve Cloudflare Worker free tier limits (~8,640 requests/day per symbol)
+POLL_INTERVAL_SECONDS = 10  # Preserve Cloudflare Worker free tier limits
 MIN_DUST_THRESHOLD = 0.001
 MAX_SLIPPAGE_PCT = 0.002       # 0.2% max execution limit offset
 MAX_ALLOWED_SPREAD_PCT = 0.003 # 0.3% max spread threshold
@@ -67,6 +68,51 @@ def format_ccxt_futures_symbol(symbol: str) -> str:
     return f"{raw}/USDT:USDT"
 
 
+def fetch_cryptocompare_fallback_kline(symbol: str, limit: int = 50) -> List[Dict[str, Any]]:
+    """Fallback market data engine routing requests correctly to CryptoCompare API v2."""
+    try:
+        clean_symbol = symbol.split(":")[0].replace("/", "").replace("_", "").replace("-", "").upper()
+        if clean_symbol.endswith("USDT"):
+            fsym = clean_symbol[:-4]
+            tsym = "USDT"
+        elif clean_symbol.endswith("USD"):
+            fsym = clean_symbol[:-3]
+            tsym = "USD"
+        else:
+            fsym = clean_symbol
+            tsym = "USDT"
+
+        url = "https://min-api.cryptocompare.com/data/v2/histominute"
+        params = {
+            "fsym": fsym,
+            "tsym": tsym,
+            "limit": limit,
+            "e": "CCCAGG"
+        }
+        res = requests.get(url, params=params, timeout=10)
+        data = res.json()
+        
+        if data.get("Response") == "Success":
+            raw_candles = data.get("Data", {}).get("Data", [])
+            formatted = []
+            for c in raw_candles:
+                formatted.append({
+                    "timestamp": c.get("time") * 1000,
+                    "open": float(c.get("open", 0.0)),
+                    "high": float(c.get("high", 0.0)),
+                    "low": float(c.get("low", 0.0)),
+                    "close": float(c.get("close", 0.0)),
+                    "volume": float(c.get("volumeto", 0.0))
+                })
+            return formatted
+        else:
+            logger.error(f"[{symbol}] CryptoCompare fallback error: {data.get('Message')}")
+            return []
+    except Exception as e:
+        logger.error(f"[{symbol}] Exception in CryptoCompare fallback: {e}")
+        return []
+
+
 class BybitFuturesLiveExecutor:
     def __init__(self):
         # Initialize CCXT Bybit instance with options
@@ -81,17 +127,6 @@ class BybitFuturesLiveExecutor:
             }
         })
 
-        # Route CCXT REST requests through your Worker proxy
-        if CLOUDFLARE_WORKER_URL:
-            logger.info(f"Routing CCXT Private Execution through Cloudflare Worker: {CLOUDFLARE_WORKER_URL}")
-            self.exchange.urls['api'] = {
-                'public': CLOUDFLARE_WORKER_URL,
-                'private': CLOUDFLARE_WORKER_URL,
-            }
-        else:
-            logger.warning("No CLOUDFLARE_WORKER_URL specified. Operating on direct connection.")
-
-        # Public Exchange Config routed through Cloudflare Worker
         self.public_exchange = ccxt.bybit({
             'enableRateLimit': True,
             'options': {
@@ -99,11 +134,17 @@ class BybitFuturesLiveExecutor:
             }
         })
 
+        # Route ALL CCXT REST requests through Worker proxy
         if CLOUDFLARE_WORKER_URL:
-            self.public_exchange.urls['api'] = {
+            logger.info(f"Routing CCXT Private Execution through Cloudflare Worker: {CLOUDFLARE_WORKER_URL}")
+            endpoints = {
                 'public': CLOUDFLARE_WORKER_URL,
                 'private': CLOUDFLARE_WORKER_URL,
             }
+            self.exchange.urls['api'] = endpoints
+            self.public_exchange.urls['api'] = endpoints
+        else:
+            logger.warning("No CLOUDFLARE_WORKER_URL specified. Operating on direct connection.")
 
         if BYBIT_TESTNET:
             self.exchange.set_sandbox_mode(True)
@@ -112,13 +153,13 @@ class BybitFuturesLiveExecutor:
         try:
             self.public_exchange.load_markets()
         except Exception as e:
-            logger.warning(f"Could not refresh public market structures on init: {e}")
+            logger.warning(f"Could not refresh public market structures on init via proxy: {e}")
 
     def format_ccxt_futures_symbol(self, raw_symbol: str) -> str:
         return format_ccxt_futures_symbol(raw_symbol)
 
     async def fetch_ticker_direct_async(self, symbol: str) -> float:
-        """Asynchronously fetches current ticker price directly via Cloudflare Worker."""
+        """Asynchronously fetches current ticker price via Cloudflare Worker."""
         ccxt_symbol = format_ccxt_futures_symbol(symbol)
         try:
             async_config = {'enableRateLimit': True, 'options': {'defaultType': 'linear'}}
@@ -140,7 +181,7 @@ class BybitFuturesLiveExecutor:
             return 0.0
 
     async def fetch_tickers_batch_async(self, symbols: List[str]) -> Dict[str, float]:
-        """Asynchronously fetches multiple tickers in a single batched HTTP request to conserve Worker subrequests."""
+        """Asynchronously fetches multiple tickers via Worker proxy."""
         formatted_symbols = [format_ccxt_futures_symbol(s) for s in symbols]
         price_map = {}
         try:
@@ -305,7 +346,7 @@ class BybitFuturesLiveExecutor:
         return self.fetch_available_usdt_balance()
 
     async def poll_market_and_positions(self, symbols: list):
-        """Asynchronous REST HTTP Polling loop optimized with multi-symbol batching and longer intervals."""
+        """Asynchronous REST HTTP Polling loop routed through Worker."""
         logger.info(f"Starting REST HTTP Polling loop via Cloudflare Worker (Interval: {POLL_INTERVAL_SECONDS}s)...")
         while True:
             try:
@@ -313,14 +354,12 @@ class BybitFuturesLiveExecutor:
                     await asyncio.sleep(POLL_INTERVAL_SECONDS)
                     continue
 
-                # Batch Market Ticker Fetch to minimize worker subrequests
                 prices = await self.fetch_tickers_batch_async(symbols)
                 
                 for symbol in symbols:
                     current_price = prices.get(symbol, 0.0)
                     logger.debug(f"[{symbol}] Polled Market Price: ${current_price:.5f}")
 
-                    # Check position conditionally / asynchronously
                     position = await self.get_futures_position_async(symbol)
                     if position["contracts"] > MIN_DUST_THRESHOLD:
                         logger.info(f"[{symbol}] Polled Active Position: {position['contracts']} contracts {position['side']}")
@@ -526,7 +565,6 @@ class BybitFuturesLiveExecutor:
 
         contracts = pos_info["contracts"]
         current_side = pos_info["side"]
-        entry_price = pos_info["entry_price"]
 
         conn = get_db_connection()
         trade_id = None
@@ -586,5 +624,4 @@ class BybitFuturesLiveExecutor:
             logger.error(f"[{symbol}] Error executing market close on Bybit: {close_err}")
             return {"status": "FAILED", "error": str(close_err)}
 
-# Class alias to maintain backward/dashboard compatibility
 LiveExecutionEngine = BybitFuturesLiveExecutor

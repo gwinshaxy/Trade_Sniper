@@ -26,11 +26,12 @@ class UnifiedWebSocketEngine:
         self.api_key = api_key
         self.api_secret = api_secret
         
+        # Route WebSockets directly to standard endpoints (bypassing worker HTTP proxy limits) or via direct SOCKS/HTTP proxy
         if is_testnet:
             self.ws_endpoints = [
-                "wss://bybit-proxy.gspark4u.workers.dev/v5/public/linear"
+                "wss://stream-testnet.bybit.com/v5/public/linear"
             ]
-            self.private_ws_endpoint = "wss://bybit-proxy.gspark4u.workers.dev/v5/private"
+            self.private_ws_endpoint = "wss://stream-testnet.bybit.com/v5/private"
         else:
             self.ws_endpoints = [
                 "wss://stream.bybit.com/v5/public/linear",
@@ -129,7 +130,6 @@ class UnifiedWebSocketEngine:
                 finally:
                     release_db_connection(conn)
 
-            # Publish event to trigger instant reconciler check on position state updates
             await event_bus.publish("EXECUTION_EVENT", {
                 "symbol": symbol,
                 "order_status": order_status,
@@ -148,7 +148,6 @@ class UnifiedWebSocketEngine:
 
         while True:
             try:
-                # Direct connection without proxy wrappers
                 async with websockets.connect(self.private_ws_endpoint, ssl=ssl_context, open_timeout=20, close_timeout=5) as ws:
                     logger.info(f"Connected to Bybit Private Feed: {self.private_ws_endpoint}")
                     retry_delay = 5
@@ -186,7 +185,6 @@ class UnifiedWebSocketEngine:
             logger.info(f"Connecting to Bybit WebSocket: {endpoint}...")
 
             try:
-                # Direct connection without proxy wrappers
                 async with websockets.connect(endpoint, ssl=ssl_context, open_timeout=20, close_timeout=5) as ws:
                     logger.info(f"Connected to Bybit Feed: {endpoint}")
                     retry_delay = 3
