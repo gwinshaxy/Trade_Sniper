@@ -105,6 +105,7 @@ def force_ccxt_worker_urls(exchange_instance, worker_url: str):
 def fetch_cryptocompare_fallback_kline(symbol: str, limit: int = 50) -> List[Dict[str, Any]]:
     """Fallback market data engine routing requests correctly to CryptoCompare API v2."""
     try:
+        # Strip CCXT contract formatting and slashes completely
         clean_symbol = symbol.split(":")[0].replace("/", "").replace("_", "").replace("-", "").upper()
         if clean_symbol.endswith("USDT"):
             fsym = clean_symbol[:-4]
@@ -117,28 +118,23 @@ def fetch_cryptocompare_fallback_kline(symbol: str, limit: int = 50) -> List[Dic
             tsym = "USDT"
 
         url = "https://min-api.cryptocompare.com/data/v2/histominute"
-        params = {
-            "fsym": fsym,
-            "tsym": tsym,
-            "limit": limit,
-            "e": "CCCAGG"
-        }
+        params = {"fsym": fsym, "tsym": tsym, "limit": limit, "e": "CCCAGG"}
         res = requests.get(url, params=params, timeout=10)
         data = res.json()
         
         if data.get("Response") == "Success":
             raw_candles = data.get("Data", {}).get("Data", [])
-            formatted = []
-            for c in raw_candles:
-                formatted.append({
+            return [
+                {
                     "timestamp": c.get("time") * 1000,
                     "open": float(c.get("open", 0.0)),
                     "high": float(c.get("high", 0.0)),
                     "low": float(c.get("low", 0.0)),
                     "close": float(c.get("close", 0.0)),
                     "volume": float(c.get("volumeto", 0.0))
-                })
-            return formatted
+                }
+                for c in raw_candles
+            ]
         else:
             logger.error(f"[{symbol}] CryptoCompare fallback error: {data.get('Message')}")
             return []
@@ -168,17 +164,32 @@ class BybitFuturesLiveExecutor:
             }
         })
 
-        # Apply Fix 2: Force ALL CCXT sub-endpoints through Cloudflare Worker
+        # Apply Fix 1: Force sandbox mode and explicitly set worker URLs
+        if BYBIT_TESTNET:
+            self.exchange.set_sandbox_mode(True)
+            self.public_exchange.set_sandbox_mode(True)
+
         if CLOUDFLARE_WORKER_URL:
             logger.info(f"Routing CCXT Execution through Worker: {CLOUDFLARE_WORKER_URL}")
             force_ccxt_worker_urls(self.exchange, CLOUDFLARE_WORKER_URL)
             force_ccxt_worker_urls(self.public_exchange, CLOUDFLARE_WORKER_URL)
+            
+            # Explicit URL override for sandbox & private REST calls
+            clean_worker = CLOUDFLARE_WORKER_URL.rstrip('/')
+            self.exchange.urls['api']['public'] = clean_worker
+            self.exchange.urls['api']['private'] = clean_worker
+            self.exchange.urls['test'] = {
+                'public': clean_worker,
+                'private': clean_worker,
+            }
+            self.public_exchange.urls['api']['public'] = clean_worker
+            self.public_exchange.urls['api']['private'] = clean_worker
+            self.public_exchange.urls['test'] = {
+                'public': clean_worker,
+                'private': clean_worker,
+            }
         else:
             logger.warning("No CLOUDFLARE_WORKER_URL specified. Operating on direct connection.")
-
-        if BYBIT_TESTNET:
-            self.exchange.set_sandbox_mode(True)
-            self.public_exchange.set_sandbox_mode(True)
 
         try:
             self.public_exchange.load_markets()
@@ -655,5 +666,6 @@ class BybitFuturesLiveExecutor:
         except Exception as close_err:
             logger.error(f"[{symbol}] Error executing market close on Bybit: {close_err}")
             return {"status": "FAILED", "error": str(close_err)}
+
 
 LiveExecutionEngine = BybitFuturesLiveExecutor

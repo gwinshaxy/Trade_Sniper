@@ -112,16 +112,14 @@ def reconcile_open_trades(executor: BybitFuturesLiveExecutor) -> int:
         tracked_ccxt_symbols.add(ccxt_symbol)
 
         try:
-            # Check using CCXT Symbol
             pos_info = executor.get_futures_position(ccxt_symbol)
 
-            # Fallback check using raw pair if CCXT returned 0 contracts without error
             if not pos_info.get("error") and pos_info.get("contracts", 0.0) < DUST_THRESHOLD:
                 pos_info_fallback = executor.get_futures_position(pair)
                 if pos_info_fallback.get("contracts", 0.0) > DUST_THRESHOLD:
                     pos_info = pos_info_fallback
 
-            # STRICT GATE: Skip evaluation entirely if network/API error is flagged or response invalid
+            # Skip cycle if network error occurs
             if not pos_info or pos_info.get("error", True) or "contracts" not in pos_info:
                 logger.warning(f"[{pair}] API or connectivity glitch detected during check. Preserving state & skipping cycle.")
                 continue
@@ -175,7 +173,7 @@ def reconcile_open_trades(executor: BybitFuturesLiveExecutor) -> int:
             else:
                 consecutive_zero_counts[trade_id] = 0
 
-                # SYNC SL/TP TO DB IF POSITIONS EXIST ON BYBIT BUT DB HAS NONE/0
+                # Sync SL/TP parameters to DB if missing
                 ex_pos = live_exchange_positions.get(ccxt_symbol)
                 if ex_pos:
                     live_sl = ex_pos.get('stop_loss', 0.0)
@@ -205,7 +203,7 @@ def reconcile_open_trades(executor: BybitFuturesLiveExecutor) -> int:
         except Exception as err:
             logger.error(f"Error reconciling trade ID #{trade_id}: {err}")
 
-    # Auto-adopt un-tracked exchange positions into DB with ON CONFLICT resolution
+    # Auto-adopt un-tracked exchange positions into DB (SAFE UPSERT FIX)
     if live_exchange_positions:
         for ex_symbol, ex_pos in live_exchange_positions.items():
             if ex_symbol not in tracked_ccxt_symbols:
@@ -220,42 +218,52 @@ def reconcile_open_trades(executor: BybitFuturesLiveExecutor) -> int:
                             entry_price = float(ex_pos.get('entry_price', 0.0))
                             position_size = float(ex_pos.get('contracts', 0.0))
                             
-                            cursor.execute("""
-                                INSERT INTO trade_setups (
-                                    pair, direction, entry_price, position_size, 
-                                    stop_loss, take_profit, status, trade_state, created_at
-                                ) VALUES (%s, %s, %s, %s, %s, %s, 'EXECUTED', 'OPEN', NOW())
-                                ON CONFLICT ON CONSTRAINT idx_unique_open_pair
-                                DO UPDATE SET
-                                    position_size = EXCLUDED.position_size,
-                                    entry_price = EXCLUDED.entry_price,
-                                    stop_loss = COALESCE(NULLIF(EXCLUDED.stop_loss, 0.0), trade_setups.stop_loss),
-                                    take_profit = COALESCE(NULLIF(EXCLUDED.take_profit, 0.0), trade_setups.take_profit),
-                                    updated_at = CURRENT_TIMESTAMP
-                                RETURNING id;
-                            """, (
-                                db_pair, 
-                                direction, 
-                                entry_price, 
-                                position_size,
-                                ex_pos.get('stop_loss', 0.0),
-                                ex_pos.get('take_profit', 0.0)
-                            ))
+                            # Standard SELECT check to bypass constraint dependency bugs
+                            cursor.execute(
+                                "SELECT id FROM trade_setups WHERE pair = %s AND trade_state IN ('OPEN', 'EXECUTED', 'BE_LOCKED', 'TRAILING') LIMIT 1;",
+                                (db_pair,)
+                            )
+                            existing = cursor.fetchone()
+
+                            if existing:
+                                new_id = existing[0]
+                                cursor.execute("""
+                                    UPDATE trade_setups SET
+                                        position_size = %s,
+                                        entry_price = %s,
+                                        stop_loss = COALESCE(NULLIF(%s, 0.0), stop_loss),
+                                        take_profit = COALESCE(NULLIF(%s, 0.0), take_profit),
+                                        updated_at = CURRENT_TIMESTAMP
+                                    WHERE id = %s;
+                                """, (position_size, entry_price, ex_pos.get('stop_loss', 0.0), ex_pos.get('take_profit', 0.0), new_id))
+                            else:
+                                cursor.execute("""
+                                    INSERT INTO trade_setups (
+                                        pair, direction, entry_price, position_size, 
+                                        stop_loss, take_profit, status, trade_state, created_at
+                                    ) VALUES (%s, %s, %s, %s, %s, %s, 'EXECUTED', 'OPEN', NOW())
+                                    RETURNING id;
+                                """, (
+                                    db_pair, 
+                                    direction, 
+                                    entry_price, 
+                                    position_size,
+                                    ex_pos.get('stop_loss', 0.0),
+                                    ex_pos.get('take_profit', 0.0)
+                                ))
+                                new_id = cursor.fetchone()[0]
+
+                            conn_adopt.commit()
+                            reconciled_count += 1
                             
-                            fetched = cursor.fetchone()
-                            if fetched:
-                                new_id = fetched[0]
-                                conn_adopt.commit()
-                                reconciled_count += 1
-                                
-                                send_telegram_notification(
-                                    f"<b>✅ AUTO-ADOPTED EXCHANGE POSITION</b>\n\n"
-                                    f"<b>Trade ID:</b> <code>#{new_id}</code>\n"
-                                    f"<b>Pair:</b> <code>{db_pair}</code>\n"
-                                    f"<b>Side:</b> <code>{direction}</code>\n"
-                                    f"<b>Contracts:</b> <code>{position_size}</code>\n"
-                                    f"<b>SL:</b> <code>${ex_pos.get('stop_loss', 0.0)}</code> | <b>TP:</b> <code>${ex_pos.get('take_profit', 0.0)}</code>"
-                                )
+                            send_telegram_notification(
+                                f"<b>✅ AUTO-ADOPTED EXCHANGE POSITION</b>\n\n"
+                                f"<b>Trade ID:</b> <code>#{new_id}</code>\n"
+                                f"<b>Pair:</b> <code>{db_pair}</code>\n"
+                                f"<b>Side:</b> <code>{direction}</code>\n"
+                                f"<b>Contracts:</b> <code>{position_size}</code>\n"
+                                f"<b>SL:</b> <code>${ex_pos.get('stop_loss', 0.0)}</code> | <b>TP:</b> <code>${ex_pos.get('take_profit', 0.0)}</code>"
+                            )
                     except Exception as db_err:
                         logger.error(f"Failed to auto-insert orphan position for {ex_symbol}: {db_err}")
                     finally:
