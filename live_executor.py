@@ -21,7 +21,7 @@ from event_bus import event_bus
 for proxy_var in ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"]:
     os.environ.pop(proxy_var, None)
 
-# Configure Cloudflare Worker URL
+# Set your Cloudflare Worker Proxy URL
 CLOUDFLARE_WORKER_URL = (
     os.getenv("CLOUDFLARE_WORKER_URL")
     or os.getenv("WORKER_URL")
@@ -69,48 +69,41 @@ def format_ccxt_futures_symbol(symbol: str) -> str:
 
 class BybitFuturesLiveExecutor:
     def __init__(self):
-        # Route CCXT requests globally through Cloudflare Worker to avoid 403 Forbidden
-        private_exchange_config = {
+        # Initialize CCXT Bybit instance with options
+        self.exchange = ccxt.bybit({
             'apiKey': BYBIT_API_KEY,
             'secret': BYBIT_SECRET_KEY,
             'enableRateLimit': True,
             'options': {
-                'defaultType': 'linear',
+                'defaultType': 'linear',  # 'linear' for USDT Futures
                 'recvWindow': 20000,
                 'adjustForTimeDifference': True
             }
-        }
+        })
 
+        # Route CCXT REST requests through your Worker proxy
         if CLOUDFLARE_WORKER_URL:
             logger.info(f"Routing CCXT Private Execution through Cloudflare Worker: {CLOUDFLARE_WORKER_URL}")
-            private_exchange_config['urls'] = {
-                'api': {
-                    'public': CLOUDFLARE_WORKER_URL,
-                    'private': CLOUDFLARE_WORKER_URL,
-                }
+            self.exchange.urls['api'] = {
+                'public': CLOUDFLARE_WORKER_URL,
+                'private': CLOUDFLARE_WORKER_URL,
             }
         else:
             logger.warning("No CLOUDFLARE_WORKER_URL specified. Operating on direct connection.")
 
-        self.exchange = ccxt.bybit(private_exchange_config)
-
         # Public Exchange Config routed through Cloudflare Worker
-        public_exchange_config = {
+        self.public_exchange = ccxt.bybit({
             'enableRateLimit': True,
             'options': {
                 'defaultType': 'linear'
             }
-        }
+        })
 
         if CLOUDFLARE_WORKER_URL:
-            public_exchange_config['urls'] = {
-                'api': {
-                    'public': CLOUDFLARE_WORKER_URL,
-                    'private': CLOUDFLARE_WORKER_URL,
-                }
+            self.public_exchange.urls['api'] = {
+                'public': CLOUDFLARE_WORKER_URL,
+                'private': CLOUDFLARE_WORKER_URL,
             }
-
-        self.public_exchange = ccxt.bybit(public_exchange_config)
 
         if BYBIT_TESTNET:
             self.exchange.set_sandbox_mode(True)
