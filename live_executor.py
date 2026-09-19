@@ -22,7 +22,7 @@ from event_bus import event_bus
 for proxy_var in ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"]:
     os.environ.pop(proxy_var, None)
 
-# Set Cloudflare Worker Proxy URL
+# REST API routing via Cloudflare Worker Proxy
 CLOUDFLARE_WORKER_URL = (
     os.getenv("CLOUDFLARE_WORKER_URL")
     or os.getenv("WORKER_URL")
@@ -31,6 +31,13 @@ CLOUDFLARE_WORKER_URL = (
 
 if CLOUDFLARE_WORKER_URL:
     CLOUDFLARE_WORKER_URL = CLOUDFLARE_WORKER_URL.strip('"').strip("'").rstrip('/')
+
+# WebSockets should connect directly to stream-testnet.bybit.com (or stream.bybit.com)
+BYBIT_WS_URL = (
+    "wss://stream-testnet.bybit.com/v5/public/linear"
+    if BYBIT_TESTNET
+    else "wss://stream.bybit.com/v5/public/linear"
+)
 
 POLL_INTERVAL_SECONDS = 10  # Preserve Cloudflare Worker free tier limits
 MIN_DUST_THRESHOLD = 0.001
@@ -69,24 +76,19 @@ def format_ccxt_futures_symbol(symbol: str) -> str:
 
 
 def force_ccxt_worker_urls(exchange_instance, worker_url: str):
-    """
-    Recursively overrides all REST API subdomains in a CCXT exchange instance 
-    to route entirely through the Cloudflare Worker proxy.
-    """
+    """Overrides all REST API subdomains in CCXT to route through Cloudflare Worker."""
     if not worker_url:
         return
     
     clean_url = worker_url.rstrip('/')
     
-    if not hasattr(exchange_instance, 'urls') or 'api' not in exchange_instance.urls:
-        exchange_instance.urls['api'] = {
-            'public': clean_url,
-            'private': clean_url,
-        }
-        return
-
-    # Direct dictionary assignments
     exchange_instance.urls['api'] = {
+        'public': clean_url,
+        'private': clean_url,
+    }
+    
+    # Force testnet sandbox override explicitly
+    exchange_instance.urls['test'] = {
         'public': clean_url,
         'private': clean_url,
     }
@@ -105,20 +107,16 @@ def force_ccxt_worker_urls(exchange_instance, worker_url: str):
 def fetch_cryptocompare_fallback_kline(symbol: str, limit: int = 50) -> List[Dict[str, Any]]:
     """Fallback market data engine routing requests correctly to CryptoCompare API v2."""
     try:
-        # Strip CCXT contract formatting and slashes completely
-        clean_symbol = symbol.split(":")[0].replace("/", "").replace("_", "").replace("-", "").upper()
-        if clean_symbol.endswith("USDT"):
-            fsym = clean_symbol[:-4]
-            tsym = "USDT"
-        elif clean_symbol.endswith("USD"):
-            fsym = clean_symbol[:-3]
-            tsym = "USD"
+        # Extract base symbol properly (e.g., 'XRP/USDT:USDT' -> fsym='XRP', tsym='USDT')
+        raw = symbol.split(":")[0]  # Strip CCXT contract formatting
+        if "/" in raw:
+            fsym, tsym = raw.split("/")
         else:
-            fsym = clean_symbol
+            fsym = raw.replace("USDT", "").replace("USD", "")
             tsym = "USDT"
 
         url = "https://min-api.cryptocompare.com/data/v2/histominute"
-        params = {"fsym": fsym, "tsym": tsym, "limit": limit, "e": "CCCAGG"}
+        params = {"fsym": fsym.upper(), "tsym": tsym.upper(), "limit": limit, "e": "CCCAGG"}
         res = requests.get(url, params=params, timeout=10)
         data = res.json()
         
@@ -164,7 +162,7 @@ class BybitFuturesLiveExecutor:
             }
         })
 
-        # Apply Fix 1: Force sandbox mode and explicitly set worker URLs
+        # Force sandbox mode and explicitly set worker URLs
         if BYBIT_TESTNET:
             self.exchange.set_sandbox_mode(True)
             self.public_exchange.set_sandbox_mode(True)
