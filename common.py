@@ -177,7 +177,7 @@ def check_asset_cooldown(symbol: str) -> bool:
         cursor = conn.cursor()
         cursor.execute("""
             SELECT cooldown_until FROM strategy_parameters 
-            WHERE UPPER(TRIM(REPLACE(REPLACE(REPLACE(symbol, '"', ''), '''', ''), '_', ''))) = %s;
+            WHERE UPPER(REPLACE(REPLACE(REPLACE(symbol, '/', ''), ':', ''), '_', '')) = %s;
         """, (clean_symbol,))
         row = cursor.fetchone()
         cursor.close()

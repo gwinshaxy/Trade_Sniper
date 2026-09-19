@@ -32,7 +32,9 @@ from common import (
     send_telegram_notification,
     check_daily_circuit_breaker,
     ensure_schema_updated,
-    finalize_trade_in_db
+    finalize_trade_in_db,
+    check_asset_cooldown,
+    set_asset_cooldown
 )
 from event_bus import event_bus
 from live_executor import LiveExecutionEngine
@@ -141,7 +143,12 @@ async def dynamic_trade_management_loop():
                             acct_bal
                         )
 
+                        # Finalize trade state
                         finalize_trade_in_db(trade_id, exit_price, pnl_usd, pnl_pct, outcome)
+                        
+                        # FIX: Trigger asset cooldown on automated SL/TP closure
+                        set_asset_cooldown(pair, hours=2)
+                        
                         send_telegram_notification(result.get("msg", f"Trade #{trade_id} closed at {exit_price}"))
 
             finally:
@@ -188,6 +195,12 @@ async def strategy_evaluation_loop():
             allocated_margin_per_trade = active_usdt_balance / MAX_CONCURRENT_POSITIONS
 
             for symbol in WATCHLIST:
+                # 1. Check if asset is currently in cooldown
+                if check_asset_cooldown(symbol):
+                    logger.info(f"[{symbol}] Asset is in active cooldown. Skipping evaluation.")
+                    continue
+
+                # 2. Check active trade count in DB
                 conn = await asyncio.to_thread(get_db_connection)
                 if conn:
                     try:

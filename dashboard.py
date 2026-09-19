@@ -451,7 +451,7 @@ if df_ohlc is not None and not df_ohlc.empty:
 
         df_chart = df_chart.drop_duplicates(subset=['time']).sort_values('time', ascending=True).reset_index(drop=True)
 
-        chart = StreamlitChart(width=None, height=600)
+        chart = StreamlitChart(width=None, height=650)
         chart.layout(background_color='#131722', text_color='#d1d4dc')
         chart.volume_config(scale_margin_top=0.85, scale_margin_bottom=0.0, up_color='#26a69a', down_color='#ef5350')
         
