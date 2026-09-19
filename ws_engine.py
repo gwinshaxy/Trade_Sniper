@@ -28,10 +28,9 @@ class UnifiedWebSocketEngine:
         
         if is_testnet:
             self.ws_endpoints = [
-                "wss://stream-testnet.bybit.com/v5/public/linear",
-                "wss://stream-testnet.bybitglobal.com/v5/public/linear"
+                "wss://bybit-proxy.gspark4u.workers.dev/v5/public/linear"
             ]
-            self.private_ws_endpoint = "wss://stream-testnet.bybit.com/v5/private"
+            self.private_ws_endpoint = "wss://bybit-proxy.gspark4u.workers.dev/v5/private"
         else:
             self.ws_endpoints = [
                 "wss://stream.bybit.com/v5/public/linear",
