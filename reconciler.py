@@ -17,6 +17,30 @@ RETRY_THRESHOLD = 3
 
 consecutive_zero_counts: Dict[int, int] = {}
 
+# Architectural Fix 1: Memory lock / Grace period cache for recently touched or opened pairs
+RECENTLY_OPENED_CACHE: Dict[str, float] = {}
+GRACE_PERIOD_SECONDS = 15.0
+
+
+def mark_symbol_recently_opened(ccxt_symbol: str) -> None:
+    """Registers a symbol in the memory lock cache to prevent race condition false-positive orphan detection."""
+    formatted = format_ccxt_futures_symbol(ccxt_symbol)
+    RECENTLY_OPENED_CACHE[formatted] = time.time()
+    logger.debug(f"[{formatted}] Added to RECENTLY_OPENED_CACHE with grace period of {GRACE_PERIOD_SECONDS}s.")
+
+
+def is_symbol_under_grace_period(ccxt_symbol: str) -> bool:
+    """Checks whether a symbol is currently within the grace period window."""
+    formatted = format_ccxt_futures_symbol(ccxt_symbol)
+    if formatted in RECENTLY_OPENED_CACHE:
+        elapsed = time.time() - RECENTLY_OPENED_CACHE[formatted]
+        if elapsed < GRACE_PERIOD_SECONDS:
+            return True
+        else:
+            # Expired, clean it up
+            del RECENTLY_OPENED_CACHE[formatted]
+    return False
+
 
 def check_active_or_pending_orders(executor: BybitFuturesLiveExecutor, ccxt_symbol: str) -> bool:
     try:
@@ -203,11 +227,16 @@ def reconcile_open_trades(executor: BybitFuturesLiveExecutor) -> int:
         except Exception as err:
             logger.error(f"Error reconciling trade ID #{trade_id}: {err}")
 
-    # Auto-adopt un-tracked exchange positions into DB (SAFE UPSERT FIX)
+    # Auto-adopt un-tracked exchange positions into DB (SAFE UPSERT & ARCHITECTURAL LOCK FIX)
     if live_exchange_positions:
         for ex_symbol, ex_pos in live_exchange_positions.items():
             if ex_symbol not in tracked_ccxt_symbols:
-                logger.warning(f"🚨 ORPHAN POSITION DETECTED: {ex_symbol}. Inserting/updating position in DB...")
+                # Architectural Fix 1: Skip if under memory lock/grace period window
+                if is_symbol_under_grace_period(ex_symbol):
+                    logger.info(f"[{ex_symbol}] Orphan check bypassed: Symbol is within recent order execution grace period window.")
+                    continue
+
+                logger.warning(f"🚨 ORPHAN POSITION DETECTED: {ex_symbol}. Safely inserting/updating position in DB...")
                 
                 conn_adopt = get_db_connection()
                 if conn_adopt:
@@ -218,54 +247,46 @@ def reconcile_open_trades(executor: BybitFuturesLiveExecutor) -> int:
                             entry_price = float(ex_pos.get('entry_price', 0.0))
                             position_size = float(ex_pos.get('contracts', 0.0))
                             
-                            # Standard SELECT check to bypass constraint dependency bugs
-                            cursor.execute(
-                                "SELECT id FROM trade_setups WHERE pair = %s AND trade_state IN ('OPEN', 'EXECUTED', 'BE_LOCKED', 'TRAILING') LIMIT 1;",
-                                (db_pair,)
-                            )
-                            existing = cursor.fetchone()
-
-                            if existing:
-                                new_id = existing[0]
-                                cursor.execute("""
-                                    UPDATE trade_setups SET
-                                        position_size = %s,
-                                        entry_price = %s,
-                                        stop_loss = COALESCE(NULLIF(%s, 0.0), stop_loss),
-                                        take_profit = COALESCE(NULLIF(%s, 0.0), take_profit),
-                                        updated_at = CURRENT_TIMESTAMP
-                                    WHERE id = %s;
-                                """, (position_size, entry_price, ex_pos.get('stop_loss', 0.0), ex_pos.get('take_profit', 0.0), new_id))
-                            else:
-                                cursor.execute("""
-                                    INSERT INTO trade_setups (
-                                        pair, direction, entry_price, position_size, 
-                                        stop_loss, take_profit, status, trade_state, created_at
-                                    ) VALUES (%s, %s, %s, %s, %s, %s, 'EXECUTED', 'OPEN', NOW())
-                                    RETURNING id;
-                                """, (
-                                    db_pair, 
-                                    direction, 
-                                    entry_price, 
-                                    position_size,
-                                    ex_pos.get('stop_loss', 0.0),
-                                    ex_pos.get('take_profit', 0.0)
-                                ))
-                                new_id = cursor.fetchone()[0]
-
-                            conn_adopt.commit()
-                            reconciled_count += 1
+                            # Architectural Fix 2: Safe Idempotent UPSERT strategy tied to unique constraint indices / fallback checks
+                            cursor.execute("""
+                                INSERT INTO trade_setups (
+                                    pair, direction, entry_price, position_size, 
+                                    stop_loss, take_profit, status, trade_state, created_at
+                                ) VALUES (%s, %s, %s, %s, %s, %s, 'EXECUTED', 'OPEN', NOW())
+                                ON CONFLICT (pair) WHERE trade_state IN ('OPEN', 'EXECUTED', 'BE_LOCKED', 'TRAILING')
+                                DO UPDATE SET
+                                    position_size = EXCLUDED.position_size,
+                                    entry_price = EXCLUDED.entry_price,
+                                    stop_loss = COALESCE(NULLIF(EXCLUDED.stop_loss, 0.0), trade_setups.stop_loss),
+                                    take_profit = COALESCE(NULLIF(EXCLUDED.take_profit, 0.0), trade_setups.take_profit),
+                                    updated_at = CURRENT_TIMESTAMP
+                                RETURNING id;
+                            """, (
+                                db_pair, 
+                                direction, 
+                                entry_price, 
+                                position_size,
+                                ex_pos.get('stop_loss', 0.0),
+                                ex_pos.get('take_profit', 0.0)
+                            ))
                             
-                            send_telegram_notification(
-                                f"<b>✅ AUTO-ADOPTED EXCHANGE POSITION</b>\n\n"
-                                f"<b>Trade ID:</b> <code>#{new_id}</code>\n"
-                                f"<b>Pair:</b> <code>{db_pair}</code>\n"
-                                f"<b>Side:</b> <code>{direction}</code>\n"
-                                f"<b>Contracts:</b> <code>{position_size}</code>\n"
-                                f"<b>SL:</b> <code>${ex_pos.get('stop_loss', 0.0)}</code> | <b>TP:</b> <code>${ex_pos.get('take_profit', 0.0)}</code>"
-                            )
+                            row = cursor.fetchone()
+                            if row:
+                                new_id = row[0]
+                                conn_adopt.commit()
+                                reconciled_count += 1
+                                
+                                send_telegram_notification(
+                                    f"<b>✅ AUTO-ADOPTED EXCHANGE POSITION</b>\n\n"
+                                    f"<b>Trade ID:</b> <code>#{new_id}</code>\n"
+                                    f"<b>Pair:</b> <code>{db_pair}</code>\n"
+                                    f"<b>Side:</b> <code>{direction}</code>\n"
+                                    f"<b>Contracts:</b> <code>{position_size}</code>\n"
+                                    f"<b>SL:</b> <code>${ex_pos.get('stop_loss', 0.0)}</code> | <b>TP:</b> <code>${ex_pos.get('take_profit', 0.0)}</code>"
+                                )
                     except Exception as db_err:
-                        logger.error(f"Failed to auto-insert orphan position for {ex_symbol}: {db_err}")
+                        logger.error(f"Failed to auto-insert/upsert orphan position for {ex_symbol}: {db_err}")
+                        conn_adopt.rollback()
                     finally:
                         release_db_connection(conn_adopt)
 
