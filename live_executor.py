@@ -134,7 +134,7 @@ class BybitFuturesLiveExecutor:
             }
         })
 
-        # Route ALL CCXT REST requests through Worker proxy
+        # Route ALL CCXT REST requests through Worker proxy across all API subdomains
         if CLOUDFLARE_WORKER_URL:
             logger.info(f"Routing CCXT Private Execution through Cloudflare Worker: {CLOUDFLARE_WORKER_URL}")
             endpoints = {
@@ -331,13 +331,25 @@ class BybitFuturesLiveExecutor:
             }
 
     def fetch_available_usdt_balance(self) -> float:
-        """Fetch balance routed through Cloudflare Worker proxy."""
+        """Fetch wallet balance directly via proxied V5 account endpoint or CCXT balance query."""
         try:
+            # First attempt: standard CCXT fetch_balance routed through Worker
             balance = self.exchange.fetch_balance({'type': 'linear'})
             usdt_free = safe_float(balance.get('USDT', {}).get('free', 0.0))
             if usdt_free == 0.0:
                 usdt_free = safe_float(balance.get('free', {}).get('USDT', 0.0))
-            return usdt_free
+            if usdt_free > 0.0:
+                return usdt_free
+                
+            # Fallback attempt: Query V5 UNIFIED account endpoint explicitly via private CCXT method
+            res = self.exchange.privateGetV5AccountWalletBalance({'accountType': 'UNIFIED', 'coin': 'USDT'})
+            list_data = res.get('result', {}).get('list', [])
+            if list_data:
+                coins = list_data[0].get('coin', [])
+                for c in coins:
+                    if c.get('coin') == 'USDT':
+                        return safe_float(c.get('walletBalance') or c.get('equity') or 0.0)
+            return 0.0
         except Exception as e:
             logger.error(f"Failed to fetch live USDT Futures balance: {e}")
             return 0.0

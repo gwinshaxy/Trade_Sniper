@@ -13,6 +13,9 @@ from common import get_db_connection, release_db_connection, finalize_trade_in_d
 
 logger = logging.getLogger("ws_engine")
 
+# Cloudflare Worker domain for WebSocket proxying to bypass Bybit/AWS CloudFront region blocks
+WORKER_DOMAIN = "bybit-proxy.gspark4u.workers.dev"
+
 
 class UnifiedWebSocketEngine:
     def __init__(self, symbols: List[str], is_testnet: bool = True, api_key: str = None, api_secret: str = None):
@@ -26,18 +29,17 @@ class UnifiedWebSocketEngine:
         self.api_key = api_key
         self.api_secret = api_secret
         
-        # Route WebSockets directly to standard endpoints (bypassing worker HTTP proxy limits) or via direct SOCKS/HTTP proxy
+        # Route WebSockets directly to Cloudflare Worker domain (using wss:// protocol)
         if is_testnet:
             self.ws_endpoints = [
-                "wss://stream-testnet.bybit.com/v5/public/linear"
+                f"wss://{WORKER_DOMAIN}/v5/public/linear"
             ]
-            self.private_ws_endpoint = "wss://stream-testnet.bybit.com/v5/private"
+            self.private_ws_endpoint = f"wss://{WORKER_DOMAIN}/v5/private"
         else:
             self.ws_endpoints = [
-                "wss://stream.bybit.com/v5/public/linear",
-                "wss://stream-m7.bybit.com/v5/public/linear"
+                f"wss://{WORKER_DOMAIN}/v5/public/linear"
             ]
-            self.private_ws_endpoint = "wss://stream.bybit.com/v5/private"
+            self.private_ws_endpoint = f"wss://{WORKER_DOMAIN}/v5/private"
             
         self.current_ep_idx = 0
 
