@@ -13,8 +13,15 @@ from common import get_db_connection, release_db_connection, finalize_trade_in_d
 
 logger = logging.getLogger("ws_engine")
 
-# Cloudflare Worker domain for WebSocket proxying to bypass Bybit/AWS CloudFront region blocks
-WORKER_DOMAIN = "bybit-proxy.gspark4u.workers.dev"
+# Retrieve Cloudflare Worker domain dynamically from environment, defaulting to your active worker endpoint
+WORKER_URL_RAW = (
+    os.getenv("CLOUDFLARE_WORKER_URL")
+    or os.getenv("WORKER_URL")
+    or "bybit-proxy.gspark4u.workers.dev"
+)
+
+# Extract host domain without scheme prefix
+WORKER_DOMAIN = WORKER_URL_RAW.replace("https://", "").replace("http://", "").strip('"').strip("'").rstrip('/')
 
 
 class UnifiedWebSocketEngine:
@@ -29,17 +36,11 @@ class UnifiedWebSocketEngine:
         self.api_key = api_key
         self.api_secret = api_secret
         
-        # Route WebSockets directly to Cloudflare Worker domain (using wss:// protocol)
-        if is_testnet:
-            self.ws_endpoints = [
-                f"wss://{WORKER_DOMAIN}/v5/public/linear"
-            ]
-            self.private_ws_endpoint = f"wss://{WORKER_DOMAIN}/v5/private"
-        else:
-            self.ws_endpoints = [
-                f"wss://{WORKER_DOMAIN}/v5/public/linear"
-            ]
-            self.private_ws_endpoint = f"wss://{WORKER_DOMAIN}/v5/private"
+        # Apply Fix 3: Route WebSocket streams explicitly through Cloudflare Worker proxy
+        self.ws_endpoints = [
+            f"wss://{WORKER_DOMAIN}/v5/public/linear"
+        ]
+        self.private_ws_endpoint = f"wss://{WORKER_DOMAIN}/v5/private"
             
         self.current_ep_idx = 0
 
@@ -79,7 +80,7 @@ class UnifiedWebSocketEngine:
         response = await ws.recv()
         data = json.loads(response)
         if data.get("success"):
-            logger.info("Bybit Private WebSocket Authenticated Successfully.")
+            logger.info("Bybit Private WebSocket Authenticated Successfully via Proxy.")
             return True
         else:
             logger.error(f"Bybit Private WebSocket Authentication Failed: {data}")
@@ -151,7 +152,7 @@ class UnifiedWebSocketEngine:
         while True:
             try:
                 async with websockets.connect(self.private_ws_endpoint, ssl=ssl_context, open_timeout=20, close_timeout=5) as ws:
-                    logger.info(f"Connected to Bybit Private Feed: {self.private_ws_endpoint}")
+                    logger.info(f"Connected to Bybit Private Feed via Proxy: {self.private_ws_endpoint}")
                     retry_delay = 5
                     
                     if not await self._authenticate_private_ws(ws):
@@ -184,11 +185,11 @@ class UnifiedWebSocketEngine:
 
         while True:
             endpoint = self._get_active_endpoint()
-            logger.info(f"Connecting to Bybit WebSocket: {endpoint}...")
+            logger.info(f"Connecting to Bybit WebSocket via Proxy: {endpoint}...")
 
             try:
                 async with websockets.connect(endpoint, ssl=ssl_context, open_timeout=20, close_timeout=5) as ws:
-                    logger.info(f"Connected to Bybit Feed: {endpoint}")
+                    logger.info(f"Connected to Bybit Feed via Proxy: {endpoint}")
                     retry_delay = 3
 
                     asyncio.create_task(self._ping_loop(ws))

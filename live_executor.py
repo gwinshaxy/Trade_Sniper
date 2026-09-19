@@ -68,6 +68,40 @@ def format_ccxt_futures_symbol(symbol: str) -> str:
     return f"{raw}/USDT:USDT"
 
 
+def force_ccxt_worker_urls(exchange_instance, worker_url: str):
+    """
+    Recursively overrides all REST API subdomains in a CCXT exchange instance 
+    to route entirely through the Cloudflare Worker proxy.
+    """
+    if not worker_url:
+        return
+    
+    clean_url = worker_url.rstrip('/')
+    
+    if not hasattr(exchange_instance, 'urls') or 'api' not in exchange_instance.urls:
+        exchange_instance.urls['api'] = {
+            'public': clean_url,
+            'private': clean_url,
+        }
+        return
+
+    # Direct dictionary assignments
+    exchange_instance.urls['api'] = {
+        'public': clean_url,
+        'private': clean_url,
+    }
+
+    # Recursive check across nested sub-endpoint trees (e.g., v5 linear, spot, etc.)
+    api_map = exchange_instance.urls.get('api', {})
+    if isinstance(api_map, dict):
+        for key in list(api_map.keys()):
+            if isinstance(api_map[key], dict):
+                for subkey in api_map[key]:
+                    api_map[key][subkey] = clean_url
+            else:
+                api_map[key] = clean_url
+
+
 def fetch_cryptocompare_fallback_kline(symbol: str, limit: int = 50) -> List[Dict[str, Any]]:
     """Fallback market data engine routing requests correctly to CryptoCompare API v2."""
     try:
@@ -134,15 +168,11 @@ class BybitFuturesLiveExecutor:
             }
         })
 
-        # Route ALL CCXT REST requests through Worker proxy across all API subdomains
+        # Apply Fix 2: Force ALL CCXT sub-endpoints through Cloudflare Worker
         if CLOUDFLARE_WORKER_URL:
-            logger.info(f"Routing CCXT Private Execution through Cloudflare Worker: {CLOUDFLARE_WORKER_URL}")
-            endpoints = {
-                'public': CLOUDFLARE_WORKER_URL,
-                'private': CLOUDFLARE_WORKER_URL,
-            }
-            self.exchange.urls['api'] = endpoints
-            self.public_exchange.urls['api'] = endpoints
+            logger.info(f"Routing CCXT Execution through Worker: {CLOUDFLARE_WORKER_URL}")
+            force_ccxt_worker_urls(self.exchange, CLOUDFLARE_WORKER_URL)
+            force_ccxt_worker_urls(self.public_exchange, CLOUDFLARE_WORKER_URL)
         else:
             logger.warning("No CLOUDFLARE_WORKER_URL specified. Operating on direct connection.")
 
@@ -163,14 +193,9 @@ class BybitFuturesLiveExecutor:
         ccxt_symbol = format_ccxt_futures_symbol(symbol)
         try:
             async_config = {'enableRateLimit': True, 'options': {'defaultType': 'linear'}}
-            if CLOUDFLARE_WORKER_URL:
-                async_config['urls'] = {
-                    'api': {
-                        'public': CLOUDFLARE_WORKER_URL,
-                        'private': CLOUDFLARE_WORKER_URL,
-                    }
-                }
             async_public = ccxt_async.bybit(async_config)
+            if CLOUDFLARE_WORKER_URL:
+                force_ccxt_worker_urls(async_public, CLOUDFLARE_WORKER_URL)
             if BYBIT_TESTNET:
                 async_public.set_sandbox_mode(True)
             ticker = await async_public.fetch_ticker(ccxt_symbol)
@@ -186,14 +211,9 @@ class BybitFuturesLiveExecutor:
         price_map = {}
         try:
             async_config = {'enableRateLimit': True, 'options': {'defaultType': 'linear'}}
-            if CLOUDFLARE_WORKER_URL:
-                async_config['urls'] = {
-                    'api': {
-                        'public': CLOUDFLARE_WORKER_URL,
-                        'private': CLOUDFLARE_WORKER_URL,
-                    }
-                }
             async_public = ccxt_async.bybit(async_config)
+            if CLOUDFLARE_WORKER_URL:
+                force_ccxt_worker_urls(async_public, CLOUDFLARE_WORKER_URL)
             if BYBIT_TESTNET:
                 async_public.set_sandbox_mode(True)
             
