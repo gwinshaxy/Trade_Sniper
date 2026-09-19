@@ -14,6 +14,10 @@ from dotenv import load_dotenv
 
 load_dotenv(override=True)
 
+# Explicitly assign and enforce the Cloudflare Proxy Worker URL to route API requests
+os.environ["CLOUDFLARE_WORKER_URL"] = "https://bybit-proxy.gspark4u.workers.dev"
+CLOUDFLARE_WORKER_URL = os.environ["CLOUDFLARE_WORKER_URL"]
+
 # Step 1: Clear environment proxy settings causing 407 Proxy Auth errors
 #for proxy_var in ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"]:
     #os.environ.pop(proxy_var, None)
@@ -193,8 +197,7 @@ for default_pair in [normalize_symbol("XRP/USDT")]:
 
 st.sidebar.subheader("🎛️ Terminal Controls & Tuning")
 
-#worker_status = os.getenv("CLOUDFLARE_WORKER_URL", "https://bybit-proxy.gspark4u.workers.dev")
-#st.sidebar.text(f"Proxy Worker: Configured")
+st.sidebar.text(f"Proxy Worker: Configured")
 
 selected_pair = st.sidebar.selectbox("Active Execution / Config Pair", available_pairs, index=0)
 config_target_pair = selected_pair
