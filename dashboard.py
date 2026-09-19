@@ -15,11 +15,11 @@ from dotenv import load_dotenv
 load_dotenv(override=True)
 
 # Step 1: Clear environment proxy settings causing 407 Proxy Auth errors
-for proxy_var in ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"]:
-    os.environ.pop(proxy_var, None)
+#for proxy_var in ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"]:
+    #os.environ.pop(proxy_var, None)
 
-os.environ["NO_PROXY"] = "localhost,127.0.0.1,.supabase.co,api.binance.com,api.mexc.com,api.telegram.org"
-os.environ["no_proxy"] = os.environ["NO_PROXY"]
+#os.environ["NO_PROXY"] = "localhost,127.0.0.1,.supabase.co,api.binance.com,api.mexc.com,api.telegram.org"
+#os.environ["no_proxy"] = os.environ["NO_PROXY"]
 
 query_params = st.query_params
 if "assetlinks" in query_params or st.context.headers.get("Path") == "/.well-known/assetlinks.json":
@@ -193,8 +193,8 @@ for default_pair in [normalize_symbol("XRP/USDT")]:
 
 st.sidebar.subheader("🎛️ Terminal Controls & Tuning")
 
-worker_status = os.getenv("CLOUDFLARE_WORKER_URL", "https://bybit-proxy.gspark4u.workers.dev")
-st.sidebar.text(f"Proxy Worker: Configured")
+#worker_status = os.getenv("CLOUDFLARE_WORKER_URL", "https://bybit-proxy.gspark4u.workers.dev")
+#st.sidebar.text(f"Proxy Worker: Configured")
 
 selected_pair = st.sidebar.selectbox("Active Execution / Config Pair", available_pairs, index=0)
 config_target_pair = selected_pair

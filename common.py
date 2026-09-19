@@ -6,8 +6,8 @@ import requests
 from dotenv import load_dotenv
 
 # Unset environment proxies early to avoid 407 Proxy Authentication Required issues
-for proxy_var in ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"]:
-    os.environ.pop(proxy_var, None)
+#for proxy_var in ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"]:
+    #os.environ.pop(proxy_var, None)
 
 base_dir = os.path.dirname(os.path.abspath(__file__))
 env_path = os.path.join(base_dir, ".env")

@@ -18,28 +18,14 @@ from common import (
 )
 from event_bus import event_bus
 
-# Clear environment proxy flags preventing 407 WebSocket & HTTP Auth errors
-for proxy_var in ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"]:
-    os.environ.pop(proxy_var, None)
-
-# REST API routing via Cloudflare Worker Proxy
-CLOUDFLARE_WORKER_URL = (
-    os.getenv("CLOUDFLARE_WORKER_URL")
-    or os.getenv("WORKER_URL")
-    or "https://bybit-proxy.gspark4u.workers.dev"
-)
-
-if CLOUDFLARE_WORKER_URL:
-    CLOUDFLARE_WORKER_URL = CLOUDFLARE_WORKER_URL.strip('"').strip("'").rstrip('/')
-
-# WebSockets should connect directly to stream-testnet.bybit.com (or stream.bybit.com)
+# WebSockets connect directly to Bybit linear streams
 BYBIT_WS_URL = (
     "wss://stream-testnet.bybit.com/v5/public/linear"
     if BYBIT_TESTNET
     else "wss://stream.bybit.com/v5/public/linear"
 )
 
-POLL_INTERVAL_SECONDS = 10  # Preserve Cloudflare Worker free tier limits
+POLL_INTERVAL_SECONDS = 10
 MIN_DUST_THRESHOLD = 0.001
 MAX_SLIPPAGE_PCT = 0.002       # 0.2% max execution limit offset
 MAX_ALLOWED_SPREAD_PCT = 0.003 # 0.3% max spread threshold
@@ -73,35 +59,6 @@ def format_ccxt_futures_symbol(symbol: str) -> str:
         base = raw[:-4]
         return f"{base}/USDC:USDC"
     return f"{raw}/USDT:USDT"
-
-
-def force_ccxt_worker_urls(exchange_instance, worker_url: str):
-    """Overrides all REST API subdomains in CCXT to route through Cloudflare Worker."""
-    if not worker_url:
-        return
-    
-    clean_url = worker_url.rstrip('/')
-    
-    exchange_instance.urls['api'] = {
-        'public': clean_url,
-        'private': clean_url,
-    }
-    
-    # Force testnet sandbox override explicitly
-    exchange_instance.urls['test'] = {
-        'public': clean_url,
-        'private': clean_url,
-    }
-
-    # Recursive check across nested sub-endpoint trees (e.g., v5 linear, spot, etc.)
-    api_map = exchange_instance.urls.get('api', {})
-    if isinstance(api_map, dict):
-        for key in list(api_map.keys()):
-            if isinstance(api_map[key], dict):
-                for subkey in api_map[key]:
-                    api_map[key][subkey] = clean_url
-            else:
-                api_map[key] = clean_url
 
 
 def fetch_cryptocompare_fallback_kline(symbol: str, limit: int = 50) -> List[Dict[str, Any]]:
@@ -143,13 +100,13 @@ def fetch_cryptocompare_fallback_kline(symbol: str, limit: int = 50) -> List[Dic
 
 class BybitFuturesLiveExecutor:
     def __init__(self):
-        # Initialize CCXT Bybit instance with options
+        # Direct connection to Bybit Linear Futures
         self.exchange = ccxt.bybit({
             'apiKey': BYBIT_API_KEY,
             'secret': BYBIT_SECRET_KEY,
             'enableRateLimit': True,
             'options': {
-                'defaultType': 'linear',  # 'linear' for USDT Futures
+                'defaultType': 'linear',
                 'recvWindow': 20000,
                 'adjustForTimeDifference': True
             }
@@ -162,51 +119,29 @@ class BybitFuturesLiveExecutor:
             }
         })
 
-        # Force sandbox mode and explicitly set worker URLs
+        # Apply standard testnet sandbox mode if configured
         if BYBIT_TESTNET:
             self.exchange.set_sandbox_mode(True)
             self.public_exchange.set_sandbox_mode(True)
 
-        if CLOUDFLARE_WORKER_URL:
-            logger.info(f"Routing CCXT Execution through Worker: {CLOUDFLARE_WORKER_URL}")
-            force_ccxt_worker_urls(self.exchange, CLOUDFLARE_WORKER_URL)
-            force_ccxt_worker_urls(self.public_exchange, CLOUDFLARE_WORKER_URL)
-            
-            # Explicit URL override for sandbox & private REST calls
-            clean_worker = CLOUDFLARE_WORKER_URL.rstrip('/')
-            self.exchange.urls['api']['public'] = clean_worker
-            self.exchange.urls['api']['private'] = clean_worker
-            self.exchange.urls['test'] = {
-                'public': clean_worker,
-                'private': clean_worker,
-            }
-            self.public_exchange.urls['api']['public'] = clean_worker
-            self.public_exchange.urls['api']['private'] = clean_worker
-            self.public_exchange.urls['test'] = {
-                'public': clean_worker,
-                'private': clean_worker,
-            }
-        else:
-            logger.warning("No CLOUDFLARE_WORKER_URL specified. Operating on direct connection.")
-
         try:
             self.public_exchange.load_markets()
         except Exception as e:
-            logger.warning(f"Could not refresh public market structures on init via proxy: {e}")
+            logger.warning(f"Could not load public market structures: {e}")
 
     def format_ccxt_futures_symbol(self, raw_symbol: str) -> str:
         return format_ccxt_futures_symbol(raw_symbol)
 
     async def fetch_ticker_direct_async(self, symbol: str) -> float:
-        """Asynchronously fetches current ticker price via Cloudflare Worker."""
+        """Asynchronously fetches current ticker price directly via CCXT."""
         ccxt_symbol = format_ccxt_futures_symbol(symbol)
         try:
             async_config = {'enableRateLimit': True, 'options': {'defaultType': 'linear'}}
             async_public = ccxt_async.bybit(async_config)
-            if CLOUDFLARE_WORKER_URL:
-                force_ccxt_worker_urls(async_public, CLOUDFLARE_WORKER_URL)
+            
             if BYBIT_TESTNET:
                 async_public.set_sandbox_mode(True)
+
             ticker = await async_public.fetch_ticker(ccxt_symbol)
             await async_public.close()
             return safe_float(ticker.get('last') or ticker.get('close'))
@@ -215,14 +150,13 @@ class BybitFuturesLiveExecutor:
             return 0.0
 
     async def fetch_tickers_batch_async(self, symbols: List[str]) -> Dict[str, float]:
-        """Asynchronously fetches multiple tickers via Worker proxy."""
+        """Asynchronously fetches multiple tickers directly via CCXT."""
         formatted_symbols = [format_ccxt_futures_symbol(s) for s in symbols]
         price_map = {}
         try:
             async_config = {'enableRateLimit': True, 'options': {'defaultType': 'linear'}}
             async_public = ccxt_async.bybit(async_config)
-            if CLOUDFLARE_WORKER_URL:
-                force_ccxt_worker_urls(async_public, CLOUDFLARE_WORKER_URL)
+            
             if BYBIT_TESTNET:
                 async_public.set_sandbox_mode(True)
             
@@ -360,9 +294,9 @@ class BybitFuturesLiveExecutor:
             }
 
     def fetch_available_usdt_balance(self) -> float:
-        """Fetch wallet balance directly via proxied V5 account endpoint or CCXT balance query."""
+        """Fetch wallet balance directly via standard CCXT balance queries or V5 account fallback."""
         try:
-            # First attempt: standard CCXT fetch_balance routed through Worker
+            # First attempt: standard CCXT fetch_balance
             balance = self.exchange.fetch_balance({'type': 'linear'})
             usdt_free = safe_float(balance.get('USDT', {}).get('free', 0.0))
             if usdt_free == 0.0:
@@ -387,8 +321,8 @@ class BybitFuturesLiveExecutor:
         return self.fetch_available_usdt_balance()
 
     async def poll_market_and_positions(self, symbols: list):
-        """Asynchronous REST HTTP Polling loop routed through Worker."""
-        logger.info(f"Starting REST HTTP Polling loop via Cloudflare Worker (Interval: {POLL_INTERVAL_SECONDS}s)...")
+        """Asynchronous REST HTTP Polling loop direct to Bybit."""
+        logger.info(f"Starting REST HTTP Polling loop (Interval: {POLL_INTERVAL_SECONDS}s)...")
         while True:
             try:
                 if not symbols:
