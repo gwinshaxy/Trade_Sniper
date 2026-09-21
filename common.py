@@ -129,12 +129,18 @@ def release_db_connection(conn):
 
 
 def finalize_trade_in_db(trade_id: int, exit_price: float, pnl_usd: float, pnl_pct: float, outcome: str):
-    """Centralized database update wrapper to record trade state upon closure."""
+    """Centralized database update wrapper to record trade state upon closure and set asset cooldown."""
     conn = get_db_connection()
     if not conn:
         return
     try:
+        pair = None
         with conn.cursor() as cur:
+            cur.execute("SELECT pair FROM trade_setups WHERE id = %s;", (trade_id,))
+            row = cur.fetchone()
+            if row:
+                pair = row[0]
+
             cur.execute("""
                 UPDATE trade_setups 
                 SET trade_state = 'CLOSED', 
@@ -148,6 +154,9 @@ def finalize_trade_in_db(trade_id: int, exit_price: float, pnl_usd: float, pnl_p
             """, (round(exit_price, 5), pnl_usd, pnl_pct, outcome, trade_id))
             conn.commit()
             logger.info(f"Database Record #{trade_id} successfully finalized with state CLOSED (PnL: ${pnl_usd:.2f}).")
+
+        if pair:
+            set_asset_cooldown(pair, hours=2)
     except Exception as e:
         logger.error(f"Failed to finalize trade record #{trade_id} in database: {e}")
     finally:
@@ -155,45 +164,28 @@ def finalize_trade_in_db(trade_id: int, exit_price: float, pnl_usd: float, pnl_p
 
 
 def normalize_symbol(symbol: str) -> str:
-    """
-    Normalizes any input symbol format to clean uppercase pair.
-    Strips CCXT exchange contract parameters (e.g. SOL/USDT:USDT -> SOLUSDT or SOL/USDT).
-    """
+    """Normalizes any input symbol to a uniform clean string (e.g. SOLUSDT)."""
     if not symbol:
         return ""
-    
-    symbol_base = symbol.split(":")[0].strip()
-    clean = symbol_base.replace("/", "").replace("_", "").replace("-", "").strip().upper()
-    return clean
+    base = symbol.split(":")[0].strip()
+    return base.replace("/", "").replace("_", "").replace("-", "").strip().upper()
 
 
 def check_asset_cooldown(symbol: str) -> bool:
-    """Returns True if the asset is currently in a cooldown period."""
+    """Returns True if the asset is currently in a active cooldown period."""
     conn = get_db_connection()
     if not conn:
         return False
     try:
         clean_symbol = normalize_symbol(symbol)
-        cursor = conn.cursor()
-        cursor.execute("""
-            SELECT cooldown_until FROM strategy_parameters 
-            WHERE UPPER(REPLACE(REPLACE(REPLACE(symbol, '/', ''), ':', ''), '_', '')) = %s;
-        """, (clean_symbol,))
-        row = cursor.fetchone()
-        cursor.close()
-
-        if row and row[0] is not None:
-            from datetime import datetime, timezone
-            cooldown_until = row[0]
-            if isinstance(cooldown_until, str):
-                cooldown_until = datetime.fromisoformat(cooldown_until)
-            if cooldown_until.tzinfo is None:
-                cooldown_until = cooldown_until.replace(tzinfo=timezone.utc)
-            
-            now = datetime.now(timezone.utc)
-            if now < cooldown_until:
-                return True
-        return False
+        with conn.cursor() as cursor:
+            cursor.execute("""
+                SELECT 1 FROM strategy_parameters 
+                WHERE UPPER(REPLACE(REPLACE(REPLACE(symbol, '/', ''), ':', ''), '_', '')) = %s
+                  AND cooldown_until > CURRENT_TIMESTAMP
+                LIMIT 1;
+            """, (clean_symbol,))
+            return cursor.fetchone() is not None
     except Exception as e:
         logger.error(f"[{symbol}] Error checking asset cooldown: {e}")
         return False
@@ -202,25 +194,22 @@ def check_asset_cooldown(symbol: str) -> bool:
 
 
 def set_asset_cooldown(symbol: str, hours: int = 2):
-    """Sets a cooldown timer for an asset starting from the current timestamp."""
+    """Sets a cooldown timer for an asset starting from current timestamp."""
     conn = get_db_connection()
     if not conn:
         return
     try:
         clean_symbol = normalize_symbol(symbol)
-        cursor = conn.cursor()
-        cursor.execute("""
-            INSERT INTO strategy_parameters (
-                symbol, tema_period, rsi_period, cooldown_until, updated_at
-            )
-            VALUES (%s, 200, 14, CURRENT_TIMESTAMP + (%s || ' hours')::INTERVAL, CURRENT_TIMESTAMP)
-            ON CONFLICT (symbol) DO UPDATE SET
-                cooldown_until = CURRENT_TIMESTAMP + (%s || ' hours')::INTERVAL,
-                updated_at = CURRENT_TIMESTAMP;
-        """, (clean_symbol, hours, hours))
-        conn.commit()
-        cursor.close()
-        logger.info(f"[{symbol}] Cooldown set for {hours} hour(s).")
+        with conn.cursor() as cursor:
+            cursor.execute("""
+                INSERT INTO strategy_parameters (symbol, tema_period, rsi_period, cooldown_until, updated_at)
+                VALUES (%s, 200, 14, CURRENT_TIMESTAMP + (%s || ' hours')::INTERVAL, CURRENT_TIMESTAMP)
+                ON CONFLICT (symbol) DO UPDATE SET
+                    cooldown_until = CURRENT_TIMESTAMP + (%s || ' hours')::INTERVAL,
+                    updated_at = CURRENT_TIMESTAMP;
+            """, (clean_symbol, hours, hours))
+            conn.commit()
+            logger.info(f"[{symbol}] Cooldown successfully set/updated for {hours} hour(s).")
     except Exception as e:
         logger.error(f"[{symbol}] Error setting asset cooldown: {e}")
     finally:

@@ -352,7 +352,7 @@ class BybitFuturesLiveExecutor:
         stop_loss: float = 0.0, 
         take_profit: float = 0.0,
         amount_usd: float = 25.0,
-        leverage: int = 10,
+        leverage: int = 5.0,
         account_balance: float = 100.0,
         risk_pct: float = 1.0
     ) -> bool:
