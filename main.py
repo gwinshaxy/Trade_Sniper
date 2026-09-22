@@ -306,7 +306,7 @@ async def strategy_evaluation_loop():
                         "take_profit": float(signal.get("take_profit", 0.0)),
                         "amount_usd": allocated_margin_per_trade,
                         "account_balance": active_usdt_balance,
-                        "leverage": cfg.get("leverage", 10)
+                        "leverage": cfg.get("leverage", 5)
                     })
 
         except Exception as e:
