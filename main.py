@@ -125,6 +125,14 @@ async def dynamic_trade_management_loop():
                         new_sl = result["new_sl"]
                         new_state = result["new_state"]
 
+                        # Synchronize updated trailing Stop Loss with Bybit V5 position
+                        sl_updated = await asyncio.to_thread(
+                            executor.set_position_trading_stop,
+                            pair,
+                            new_sl,
+                            0
+                        )
+
                         with conn.cursor() as cur:
                             cur.execute("""
                                 UPDATE trade_setups
@@ -133,7 +141,10 @@ async def dynamic_trade_management_loop():
                             """, (round(new_sl, 5), new_state, trade_id))
                             conn.commit()
 
-                        send_telegram_notification(result["msg"])
+                        msg = result["msg"]
+                        if sl_updated:
+                            msg += " (Bybit Position SL Updated)"
+                        send_telegram_notification(msg)
 
                     elif action in ["EXECUTE_CLOSE_SL", "EXECUTE_CLOSE_TP", "SYNC_CLOSED_FROM_EXCHANGE"]:
                         target_exit = result.get("target_price", float(latest_candle.get("close")))

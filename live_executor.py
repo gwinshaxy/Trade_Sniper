@@ -132,6 +132,37 @@ class BybitFuturesLiveExecutor:
     def format_ccxt_futures_symbol(self, raw_symbol: str) -> str:
         return format_ccxt_futures_symbol(raw_symbol)
 
+    def set_position_trading_stop(self, symbol: str, stop_loss: float, position_idx: int = 0) -> bool:
+        """
+        Calls Bybit V5 API endpoint to explicitly attach/update SL on an active open position.
+        """
+        try:
+            ccxt_symbol = self.format_ccxt_futures_symbol(symbol)
+            formatted_sl = str(self.exchange.price_to_precision(ccxt_symbol, stop_loss))
+            formatted_symbol = symbol.replace("/", "").replace(":USDT", "").replace("-", "").replace("_", "").upper()
+
+            # Using direct Bybit V5 Position Trading Stop endpoint via CCXT
+            params = {
+                "category": "linear",
+                "symbol": formatted_symbol,
+                "stopLoss": formatted_sl,
+                "slTriggerBy": "LastPrice",
+                "positionIdx": position_idx  # 0 for One-Way Mode, 1 for Long, 2 for Short in Hedge Mode
+            }
+            
+            response = self.exchange.private_linear_post_v5_position_trading_stop(params)
+            
+            if response.get("retCode") == 0:
+                logger.info(f"[SL SET SUCCESS] Symbol: {formatted_symbol} | SL Price: {formatted_sl}")
+                return True
+            else:
+                logger.error(f"[SL SET ERROR] Bybit Code {response.get('retCode')}: {response.get('retMsg')}")
+                return False
+
+        except Exception as e:
+            logger.exception(f"[SL SET EXCEPTION] Failed to set Stop Loss for {symbol}: {e}")
+            return False
+
     async def fetch_ticker_direct_async(self, symbol: str) -> float:
         """Asynchronously fetches current ticker price directly via CCXT."""
         ccxt_symbol = format_ccxt_futures_symbol(symbol)
@@ -379,6 +410,34 @@ class BybitFuturesLiveExecutor:
             logger.error(f"[{pair}] Live Bybit futures order execution failed: {res.get('error') or res.get('reason')}")
             return False
 
+    def execute_order_and_attach_sl(self, symbol: str, side: str, amount: float, target_sl: float) -> Dict[str, Any]:
+        """
+        Executes entry order first, then explicitly sets the SL position-wide.
+        """
+        # 1. Place entry order without relying on volatile IOC SL attachments
+        order = self.order_futures_bybit(
+            symbol=symbol,
+            direction=side,
+            amount_usd=amount
+        )
+
+        # 2. Check for fill confirmation
+        if order and order.get("status") == "SUCCESS":
+            logger.info(f"Order filled for {symbol}. Applying explicit post-execution Stop Loss at {target_sl}")
+            
+            # Determine positionIdx based on mode/side
+            pos_idx = 0  # Set to 1 (Long) or 2 (Short) if using Hedge Mode
+            
+            if target_sl > 0:
+                sl_success = self.set_position_trading_stop(
+                    symbol=symbol,
+                    stop_loss=target_sl,
+                    position_idx=pos_idx
+                )
+                order["stop_loss_attached"] = sl_success
+
+        return order
+
     def order_futures_bybit(
         self, 
         symbol: str, 
@@ -461,12 +520,14 @@ class BybitFuturesLiveExecutor:
         if stop_loss > 0:
             if is_long and stop_loss >= ref_price:
                 logger.error(f"[{symbol}] Invalid Long Stop Loss (${stop_loss:.5f}) >= Reference Price (${ref_price:.5f}). Stripping SL parameter.")
-                stop_loss = 0.0
+                target_sl = 0.0
             elif not is_long and stop_loss <= ref_price:
                 logger.error(f"[{symbol}] Invalid Short Stop Loss (${stop_loss:.5f}) <= Reference Price (${ref_price:.5f}). Stripping SL parameter.")
-                stop_loss = 0.0
+                target_sl = 0.0
             else:
-                params['stopLoss'] = safe_float(self.exchange.price_to_precision(ccxt_symbol, stop_loss))
+                target_sl = stop_loss
+        else:
+            target_sl = 0.0
 
         if take_profit > 0:
             params['takeProfit'] = safe_float(self.exchange.price_to_precision(ccxt_symbol, take_profit))
@@ -514,15 +575,24 @@ class BybitFuturesLiveExecutor:
 
             logger.info(f"[{symbol}] Futures Order Executed: Side {side.upper()}, Price ${fill_price:.6f}, Qty {executed_qty}")
 
-            if stop_loss > 0 and 'stopLoss' not in params:
-                event_bus.arm_local_sl_guard(symbol, dir_clean, executed_qty, stop_loss)
-
+            # Apply explicit post-execution Stop Loss via Bybit V5 Position Trading Stop API
+            sl_attached = False
+            if target_sl > 0:
+                sl_attached = self.set_position_trading_stop(
+                    symbol=symbol,
+                    stop_loss=target_sl,
+                    position_idx=0
+                )
+                if not sl_attached:
+                    event_bus.arm_local_sl_guard(symbol, dir_clean, executed_qty, target_sl)
+            
             return {
                 "status": "SUCCESS",
                 "order_id": order_id,
                 "fill_price": fill_price,
                 "executed_qty": executed_qty,
                 "cost_usd": trade_amount_usd,
+                "stop_loss_attached": sl_attached,
                 "raw_order": order
             }
 

@@ -120,7 +120,7 @@ def fetch_klines(symbol: str, interval: str = "15m", limit: int = 400) -> pd.Dat
     try:
         url = "https://api.mexc.com/api/v3/klines"
         params = {"symbol": clean_symbol, "interval": interval, "limit": limit}
-        resp = requests.get(url, params=params, timeout=6)
+        resp = requests.get(url, params=params, timeout=10)
         if resp.status_code == 200:
             data = resp.json()
             if isinstance(data, list) and len(data) > 0:
@@ -142,7 +142,7 @@ def fetch_klines(symbol: str, interval: str = "15m", limit: int = 400) -> pd.Dat
     try:
         url = "https://api.binance.com/api/v3/klines"
         params = {"symbol": clean_symbol, "interval": interval, "limit": limit}
-        resp = requests.get(url, params=params, timeout=6)
+        resp = requests.get(url, params=params, timeout=10)
         if resp.status_code == 200:
             data = resp.json()
             if isinstance(data, list) and len(data) > 0:
@@ -162,7 +162,7 @@ def fetch_klines(symbol: str, interval: str = "15m", limit: int = 400) -> pd.Dat
         bybit_tf = bybit_interval_map.get(interval, "15")
         url = "https://api.bybit.com/v5/market/kline"
         params = {"category": "spot", "symbol": clean_symbol, "interval": bybit_tf, "limit": limit}
-        resp = requests.get(url, params=params, timeout=6)
+        resp = requests.get(url, params=params, timeout=10)
         if resp.status_code == 200:
             res = resp.json()
             raw_list = res.get("result", {}).get("list", [])
@@ -542,6 +542,7 @@ def evaluate_signals(
         "entry_price": 0.0,
         "stop_loss": 0.0,
         "take_profit": 0.0,
+        "atr": 0.0,
         "reason": "No condition met"
     }
 
@@ -674,6 +675,7 @@ def evaluate_signals(
                 "entry_price": float(entry_price),
                 "stop_loss": float(stop_loss),
                 "take_profit": float(take_profit),
+                "atr": float(round(current_atr, 4)),
                 "rr_ratio": float(computed_rr),
                 "reason": f"Long trend confluence confirmed. R:R={computed_rr:.2f}"
             }
@@ -727,9 +729,64 @@ def evaluate_signals(
                     "entry_price": float(entry_price),
                     "stop_loss": float(stop_loss),
                     "take_profit": float(take_profit),
+                    "atr": float(round(current_atr, 4)),
                     "rr_ratio": float(computed_rr),
                     "reason": f"Short trend confluence confirmed. R:R={computed_rr:.2f}"
                 }
 
     no_signal["reason"] = "Market conditions did not meet strategy entry criteria"
     return no_signal
+
+
+# ---------------------------------------------------------------------------
+# 7. EVENT-DRIVEN SIGNAL GENERATION METHOD / CLASS INTERFACE
+# ---------------------------------------------------------------------------
+
+class StrategyEngine:
+    def __init__(self, symbol: str, config: Optional[Any] = None, event_bus: Optional[Any] = None):
+        self.symbol = symbol
+        self.config = config
+        self.event_bus = event_bus
+
+    def generate_signal(self, df: pd.DataFrame, current_price: float, position_side: str = "LONG") -> Dict[str, Any]:
+        """
+        Calculates signal metadata including ATR-based Stop Loss prior to event publishing.
+        """
+        # 1. Calculate ATR (if not already in DataFrame)
+        atr_period = getattr(self.config, "ATR_PERIOD", 14) if self.config else 14
+        atr_multiplier = getattr(self.config, "ATR_MULT", 2.0) if self.config else 2.0
+        
+        if "atr" in df.columns:
+            current_atr = df["atr"].iloc[-1]
+        else:
+            # Calculate ATR on the fly if column missing
+            high_low = df["high"] - df["low"]
+            high_close = (df["high"] - df["close"].shift()).abs()
+            low_close = (df["low"] - df["close"].shift()).abs()
+            tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+            current_atr = tr.rolling(atr_period).mean().iloc[-1]
+
+        # 2. Compute SL level based on ATR and direction
+        if position_side.upper() == "LONG":
+            sl_price = current_price - (current_atr * atr_multiplier)
+        else:
+            sl_price = current_price + (current_atr * atr_multiplier)
+
+        # Sanity safeguard for negative SL
+        sl_price = max(sl_price, 0.0001)
+
+        # 3. Construct signal payload
+        signal_payload = {
+            "symbol": self.symbol,
+            "side": position_side,
+            "entry_price": float(current_price),
+            "stop_loss": float(round(sl_price, 4)),
+            "atr": float(round(current_atr, 4)),
+            "timestamp": int(time.time())
+        }
+
+        # 4. Emit to event_bus
+        if hasattr(self, "event_bus") and self.event_bus and hasattr(self.event_bus, "publish"):
+            self.event_bus.publish("TRADE_SIGNAL", signal_payload)
+            
+        return signal_payload

@@ -96,6 +96,7 @@ class StateMachineEngine:
             if exec_result.get("status") == "SUCCESS":
                 executed_qty = exec_result["executed_qty"]
                 fill_price = exec_result["fill_price"]
+                sl_attached = exec_result.get("stop_loss_attached", False)
                 
                 conn_db = get_db_connection()
                 if conn_db:
@@ -111,13 +112,14 @@ class StateMachineEngine:
                             conn_db.commit()
 
                         emoji = "🟢" if direction in ["BUY", "LONG"] else "🔴"
+                        sl_status = "✅ Attached" if sl_attached else "⚠️ Fallback Active"
                         send_telegram_notification(
                             f"<b>{emoji} LIVE BYBIT FUTURES ORDER EXECUTED ({direction})</b>\n\n"
                             f"<b>Trade ID:</b> <code>#{trade_id}</code>\n"
                             f"<b>Pair:</b> <code>{symbol}</code>\n"
                             f"<b>Entry:</b> ${fill_price:.5f}\n"
                             f"<b>Qty:</b> {executed_qty}\n"
-                            f"<b>SL:</b> ${stop_loss:.5f} | <b>TP:</b> ${take_profit:.5f}"
+                            f"<b>SL:</b> ${stop_loss:.5f} ({sl_status}) | <b>TP:</b> ${take_profit:.5f}"
                         )
                     finally:
                         release_db_connection(conn_db)
