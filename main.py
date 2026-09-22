@@ -96,6 +96,7 @@ async def dynamic_trade_management_loop():
                 for trade in active_trades:
                     trade_id = trade['id']
                     pair = trade['pair']
+                    pos_qty = float(trade.get("position_size", 0.0))
                     
                     df_active = await asyncio.to_thread(
                         fetch_klines,
@@ -114,13 +115,15 @@ async def dynamic_trade_management_loop():
 
                     latest_candle = df_active.iloc[-1].to_dict()
                     
-                    result = trade_manager.process_trade(trade, latest_candle)
+                    # Fetch live position state directly from Bybit
+                    live_pos = await executor.get_futures_position_async(pair)
+                    
+                    result = trade_manager.process_trade(trade, latest_candle, live_pos_info=live_pos)
                     action = result.get("action")
 
                     if action == "UPDATE_SL":
                         new_sl = result["new_sl"]
                         new_state = result["new_state"]
-                        msg = result["msg"]
 
                         with conn.cursor() as cur:
                             cur.execute("""
@@ -130,26 +133,45 @@ async def dynamic_trade_management_loop():
                             """, (round(new_sl, 5), new_state, trade_id))
                             conn.commit()
 
-                        send_telegram_notification(msg)
+                        send_telegram_notification(result["msg"])
 
-                    elif action in ["CLOSE_SL", "CLOSE_TP"]:
-                        exit_price = result["exit_price"]
+                    elif action in ["EXECUTE_CLOSE_SL", "EXECUTE_CLOSE_TP", "SYNC_CLOSED_FROM_EXCHANGE"]:
+                        target_exit = result.get("target_price", float(latest_candle.get("close")))
+                        
+                        # Execute real Market Order on Bybit exchange
+                        close_res = executor.close_live_position_bybit(
+                            symbol=pair,
+                            position_size=pos_qty,
+                            current_price=target_exit,
+                            outcome=action
+                        )
+                        
+                        actual_exit_price = float(close_res.get("exit_price", target_exit))
+                        
+                        # Estimate total maker/taker fee (~0.055% standard Bybit taker fee per leg)
+                        est_fees = (float(trade["entry_price"]) * pos_qty * 0.00055) + (actual_exit_price * pos_qty * 0.00055)
+                        
                         acct_bal = float(trade.get("account_balance") or FALLBACK_BALANCE)
                         pnl_usd, pnl_pct, outcome = calculate_pnl(
                             trade["direction"], 
                             float(trade["entry_price"]), 
-                            exit_price, 
-                            float(trade.get("position_size", 1.0)), 
-                            acct_bal
+                            actual_exit_price, 
+                            pos_qty, 
+                            acct_bal,
+                            total_fees=est_fees
                         )
 
-                        # Finalize trade state
-                        finalize_trade_in_db(trade_id, exit_price, pnl_usd, pnl_pct, outcome)
+                        # Record trade outcome using actual execution price and fee deduction
+                        finalize_trade_in_db(trade_id, actual_exit_price, pnl_usd, pnl_pct, outcome, fee_usd=est_fees)
+                        set_asset_cooldown(pair, hours=4)
                         
-                        # FIX: Trigger asset cooldown on automated SL/TP closure
-                        set_asset_cooldown(pair, hours=2)
-                        
-                        send_telegram_notification(result.get("msg", f"Trade #{trade_id} closed at {exit_price}"))
+                        send_telegram_notification(
+                            f"<b>🔴 POSITION CLOSED ({action})</b>\n\n"
+                            f"<b>Trade ID:</b> <code>#{trade_id}</code>\n"
+                            f"<b>Symbol:</b> <code>{pair}</code>\n"
+                            f"<b>Actual Fill Exit:</b> ${actual_exit_price:.5f}\n"
+                            f"<b>Net PnL:</b> ${pnl_usd:.2f} ({pnl_pct:.2f}%) [Fees: ${est_fees:.2f}]"
+                        )
 
             finally:
                 release_db_connection(conn)

@@ -243,7 +243,7 @@ adx_threshold = st.sidebar.slider(
     "ADX Threshold", 
     min_value=10.0, 
     max_value=50.0, 
-    value=float(dyn_cfg.get("adx_threshold", 20.0)), 
+    value=float(dyn_cfg.get("adx_threshold", 25.0)), 
     step=1.0, 
     key=f"adx_t_{pair_key}"
 )
@@ -260,7 +260,7 @@ atr_mult = st.sidebar.slider(
     "ATR Multiplier", 
     min_value=0.5, 
     max_value=5.0, 
-    value=float(dyn_cfg.get("atr_mult", 2.0)), 
+    value=float(dyn_cfg.get("atr_mult", 2.5)), 
     step=0.1, 
     key=f"atr_m_{pair_key}"
 )
@@ -315,7 +315,7 @@ disable_htf = st.sidebar.checkbox(
 
 st.sidebar.markdown("---")
 direction = st.sidebar.selectbox("Order Direction", ["BUY", "SELL"])
-leverage = st.sidebar.number_input("Leverage", min_value=1, max_value=100, value=10)
+leverage = st.sidebar.number_input("Leverage", min_value=1, max_value=100, value=5)
 overlay_chart = st.sidebar.checkbox("Overlay Trade Positions on Chart", value=True)
 overlay_gaps = st.sidebar.checkbox("Overlay Volume Profile Gaps", value=True)
 

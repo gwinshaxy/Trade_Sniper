@@ -4,10 +4,11 @@ from common import get_db_connection, release_db_connection
 
 logger = logging.getLogger("dynamic_trade_manager")
 
+
 class DynamicTradeManager:
     """
     Handles dynamic active position management, trailing stops,
-    and breakeven locking based on real-time price updates.
+    and breakeven locking based on real-time price updates and exchange state.
     """
     def __init__(self, trailing_mult: float = 1.5, be_rr_trigger: float = 1.0):
         self.trailing_mult = trailing_mult
@@ -43,10 +44,9 @@ class DynamicTradeManager:
             finally:
                 release_db_connection(conn)
 
-    def process_trade(self, trade: Dict[str, Any], latest_candle: Dict[str, Any]) -> Dict[str, Any]:
+    def process_trade(self, trade: Dict[str, Any], latest_candle: Dict[str, Any], live_pos_info: Dict[str, Any] = None) -> Dict[str, Any]:
         """
-        Evaluates a single open trade against the latest candle data to check
-        for trailing stop updates, breakeven moves, or exit conditions.
+        Evaluates an open trade against market candle data and Bybit exchange state.
         """
         if not trade or not latest_candle:
             return {"action": "HOLD"}
@@ -77,41 +77,48 @@ class DynamicTradeManager:
 
         if current_tp == 0.0 and entry_price > 0:
             risk = abs(entry_price - current_sl)
-            current_tp = entry_price + (risk * 2.0) if is_long else entry_price - (risk * 2.0)
+            current_tp = entry_price + (risk * 2.5) if is_long else entry_price - (risk * 2.5)
             db_needs_update = True
 
         if db_needs_update and trade_id is not None:
             self._update_db_sl_tp(trade_id, current_sl, current_tp)
 
-        # Check Hard TP / SL Hit Conditions
+        # 1. Exchange Position Closure Check (Detects if Bybit already closed via Market SL/TP)
+        if live_pos_info and not live_pos_info.get("error") and live_pos_info.get("contracts", 0.0) <= 0.001:
+            return {
+                "action": "SYNC_CLOSED_FROM_EXCHANGE",
+                "msg": f"⚠️ Trade #{trade_id} closed on Bybit exchange. Syncing DB state..."
+            }
+
+        # 2. Hard Trigger Checks: Send Market Order to Exchange instead of assuming hypothetical fill
         if is_long:
             if current_tp > 0 and high_price >= current_tp:
                 return {
-                    "action": "CLOSE_TP",
-                    "exit_price": current_tp,
-                    "msg": f"🎯 Take Profit Hit for Trade #{trade_id} @ ${current_tp:.5f}"
+                    "action": "EXECUTE_CLOSE_TP",
+                    "target_price": current_tp,
+                    "msg": f"🎯 Target TP hit for #{trade_id}. Executing market close on Bybit..."
                 }
             if current_sl > 0 and low_price <= current_sl:
                 return {
-                    "action": "CLOSE_SL",
-                    "exit_price": current_sl,
-                    "msg": f"🛑 Stop Loss Hit for Trade #{trade_id} @ ${current_sl:.5f}"
+                    "action": "EXECUTE_CLOSE_SL",
+                    "target_price": current_sl,
+                    "msg": f"🛑 Target SL hit for #{trade_id}. Executing market close on Bybit..."
                 }
         else:  # SHORT
             if current_tp > 0 and low_price <= current_tp:
                 return {
-                    "action": "CLOSE_TP",
-                    "exit_price": current_tp,
-                    "msg": f"🎯 Take Profit Hit for Trade #{trade_id} @ ${current_tp:.5f}"
+                    "action": "EXECUTE_CLOSE_TP",
+                    "target_price": current_tp,
+                    "msg": f"🎯 Target TP hit for #{trade_id}. Executing market close on Bybit..."
                 }
             if current_sl > 0 and high_price >= current_sl:
                 return {
-                    "action": "CLOSE_SL",
-                    "exit_price": current_sl,
-                    "msg": f"🛑 Stop Loss Hit for Trade #{trade_id} @ ${current_sl:.5f}"
+                    "action": "EXECUTE_CLOSE_SL",
+                    "target_price": current_sl,
+                    "msg": f"🛑 Target SL hit for #{trade_id}. Executing market close on Bybit..."
                 }
 
-        # Dynamic Trailing Stop & Breakeven Management
+        # 3. Dynamic Trailing Stop & Breakeven Adjustments
         if atr > 0:
             risk_dist = abs(entry_price - current_sl) if current_sl > 0 else (entry_price * 0.02)
 
@@ -160,7 +167,7 @@ class DynamicTradeManager:
                     if current_sl == 0 or trail_sl < current_sl:
                         return {
                             "action": "UPDATE_SL",
-                            "new_sl": new_sl,
+                            "new_sl": trail_sl,
                             "new_state": "TRAILING",
                             "msg": f"📉 Trailing Stop updated for Trade #{trade_id} to ${trail_sl:.5f}"
                         }

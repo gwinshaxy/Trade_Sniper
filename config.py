@@ -20,9 +20,9 @@ else:
 
 # Unpack key settings for easy import across modules
 ACCOUNT_BALANCE = STRATEGY_CONFIG.get("account_balance", 100.0)
-RISK_PCT = STRATEGY_CONFIG.get("risk_pct", 0.5)
-LEVERAGE = STRATEGY_CONFIG.get("leverage", 100)
-ENABLE_LIVE_TRADING = STRATEGY_CONFIG.get("enable_live_trading", False)
+RISK_PCT = STRATEGY_CONFIG.get("risk_pct", 1.0)
+LEVERAGE = STRATEGY_CONFIG.get("leverage", 5)
+ENABLE_LIVE_TRADING = STRATEGY_CONFIG.get("enable_live_trading", true)
 WATCHLIST = STRATEGY_CONFIG.get("watchlist", [])
 
 def format_ccxt_symbol(symbol: str) -> str:

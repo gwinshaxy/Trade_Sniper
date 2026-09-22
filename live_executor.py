@@ -559,7 +559,7 @@ class BybitFuturesLiveExecutor:
                 release_db_connection(conn)
 
         if contracts < MIN_DUST_THRESHOLD:
-            set_asset_cooldown(symbol, hours=2)
+            set_asset_cooldown(symbol, hours=4)
             event_bus.disarm_local_sl_guard(symbol)
 
             if trade_id:

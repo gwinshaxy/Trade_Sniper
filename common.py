@@ -128,8 +128,8 @@ def release_db_connection(conn):
                 pass
 
 
-def finalize_trade_in_db(trade_id: int, exit_price: float, pnl_usd: float, pnl_pct: float, outcome: str):
-    """Centralized database update wrapper to record trade state upon closure and set asset cooldown."""
+def finalize_trade_in_db(trade_id: int, exit_price: float, pnl_usd: float, pnl_pct: float, outcome: str, fee_usd: float = 0.0):
+    """Centralized database update wrapper to record trade state upon closure."""
     conn = get_db_connection()
     if not conn:
         return
@@ -148,15 +148,16 @@ def finalize_trade_in_db(trade_id: int, exit_price: float, pnl_usd: float, pnl_p
                     exit_price = %s, 
                     pnl_usd = %s, 
                     pnl_pct = %s, 
+                    fee_usd = %s,
                     outcome = %s, 
                     closed_at = CURRENT_TIMESTAMP 
                 WHERE id = %s;
-            """, (round(exit_price, 5), pnl_usd, pnl_pct, outcome, trade_id))
+            """, (round(exit_price, 5), pnl_usd, pnl_pct, fee_usd, outcome, trade_id))
             conn.commit()
-            logger.info(f"Database Record #{trade_id} successfully finalized with state CLOSED (PnL: ${pnl_usd:.2f}).")
+            logger.info(f"Database Record #{trade_id} successfully finalized with state CLOSED (PnL: ${pnl_usd:.2f}, Fees: ${fee_usd:.2f}).")
 
         if pair:
-            set_asset_cooldown(pair, hours=2)
+            set_asset_cooldown(pair, hours=4)
     except Exception as e:
         logger.error(f"Failed to finalize trade record #{trade_id} in database: {e}")
     finally:
@@ -193,7 +194,7 @@ def check_asset_cooldown(symbol: str) -> bool:
         release_db_connection(conn)
 
 
-def set_asset_cooldown(symbol: str, hours: int = 2):
+def set_asset_cooldown(symbol: str, hours: int = 4):
     """Sets a cooldown timer for an asset starting from current timestamp."""
     conn = get_db_connection()
     if not conn:
@@ -243,6 +244,7 @@ def verify_base_schema():
                 exit_price NUMERIC(18, 8),
                 pnl_usd NUMERIC(18, 8),
                 pnl_pct NUMERIC(18, 8),
+                fee_usd NUMERIC(18, 8) DEFAULT 0.0,
                 outcome VARCHAR(20),
                 highest_price NUMERIC(18, 8),
                 trailing_stop_price NUMERIC(18, 8),
@@ -260,6 +262,7 @@ def verify_base_schema():
             "exit_price NUMERIC(18, 8)",
             "pnl_usd NUMERIC(18, 8)",
             "pnl_pct NUMERIC(18, 8)",
+            "fee_usd NUMERIC(18, 8) DEFAULT 0.0",
             "outcome VARCHAR(20)",
             "highest_price NUMERIC(18, 8)",
             "trailing_stop_price NUMERIC(18, 8)",
@@ -276,18 +279,18 @@ def verify_base_schema():
                 rsi_period INT NOT NULL DEFAULT 14,
                 rsi_thresh FLOAT DEFAULT 42.0,
                 adx_period INT DEFAULT 14,
-                adx_threshold FLOAT DEFAULT 20.0,
+                adx_threshold FLOAT DEFAULT 25.0,
                 use_adx_filter BOOLEAN DEFAULT TRUE,
                 max_sl_pct FLOAT DEFAULT 0.02,
                 zone_tolerance NUMERIC NOT NULL DEFAULT 0.0075,
                 min_sentiment NUMERIC NOT NULL DEFAULT 0.0,
                 risk_pct NUMERIC NOT NULL DEFAULT 1.0,
-                min_rr NUMERIC NOT NULL DEFAULT 2.0,
+                min_rr NUMERIC NOT NULL DEFAULT 2.5,
                 vp_detection_pct NUMERIC NOT NULL DEFAULT 0.07,
                 use_rsi_filter BOOLEAN DEFAULT TRUE,
                 use_candlestick_confirm BOOLEAN DEFAULT TRUE,
                 atr_period INT DEFAULT 14,
-                atr_mult FLOAT DEFAULT 2.0,
+                atr_mult FLOAT DEFAULT 2.5,
                 use_atr_sl BOOLEAN DEFAULT TRUE,
                 disable_htf BOOLEAN DEFAULT FALSE,
                 fitness_score NUMERIC DEFAULT 0.0,
@@ -316,7 +319,7 @@ def verify_base_schema():
         ]
         for col in param_columns:
             cursor.execute(f"ALTER TABLE strategy_parameters ADD COLUMN IF NOT EXISTS {col};")
-            
+
         conn.commit()
         cursor.close()
         logger.info("Database base schema verified successfully.")
@@ -326,18 +329,21 @@ def verify_base_schema():
         release_db_connection(conn)
 
 
-def calculate_pnl(direction: str, entry_price: float, current_price: float, quantity: float, account_balance: float = 100.0) -> tuple:
+def calculate_pnl(direction: str, entry_price: float, current_price: float, quantity: float, account_balance: float = 100.0, total_fees: float = 0.0) -> tuple:
+    """Calculates Net PnL taking actual exchange fill price and trading fees into account."""
     dir_clean = str(direction).strip().upper()
     
     if dir_clean in ["BUY", "LONG"]:
-        pnl_usd = (current_price - entry_price) * quantity
+        gross_pnl = (current_price - entry_price) * quantity
     elif dir_clean in ["SELL", "SHORT"]:
-        pnl_usd = (entry_price - current_price) * quantity
+        gross_pnl = (entry_price - current_price) * quantity
     else:
-        pnl_usd = 0.0
+        gross_pnl = 0.0
 
+    pnl_usd = gross_pnl - abs(total_fees)
     pnl_pct = (pnl_usd / account_balance) * 100.0 if account_balance > 0 else 0.0
     outcome = "WIN" if pnl_usd > 0 else ("LOSS" if pnl_usd < 0 else "BREAKEVEN")
+    
     return round(pnl_usd, 4), round(pnl_pct, 4), outcome
 
 
@@ -385,7 +391,7 @@ def close_trade_manually(trade_id: int, exit_price: float, reason: str = "MANUAL
         )
 
         finalize_trade_in_db(trade_id, exit_price, pnl_usd, pnl_pct, outcome)
-        set_asset_cooldown(pair, hours=2)
+        set_asset_cooldown(pair, hours=4)
 
         emoji = "🔴" if pnl_usd < 0 else "🟢"
         send_telegram_notification(
