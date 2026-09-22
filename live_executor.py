@@ -539,7 +539,7 @@ class BybitFuturesLiveExecutor:
             return {"status": "FAILED", "error": "Network/API glitch preventing close verification"}
 
         contracts = pos_info["contracts"]
-        current_side = pos_info["side"]
+        current_side = str(pos_info["side"]).upper()
 
         conn = get_db_connection()
         trade_id = None
@@ -572,7 +572,8 @@ class BybitFuturesLiveExecutor:
                 "executed_qty": position_size
             }
 
-        close_side = 'sell' if current_side == 'BUY' else 'buy'
+        # Check for both 'BUY' and 'LONG'
+        close_side = 'sell' if current_side in ['BUY', 'LONG'] else 'buy'
         try:
             order = self.exchange.create_order(
                 symbol=ccxt_symbol,
