@@ -1,10 +1,6 @@
 import os
 import sys
 
-# =====================================================================
-# PROXY BYPASS FOR WEBSOCKETS & REST APIs AT APPLICATION ENTRY POINT
-# Define explicit domain bypasses BEFORE any HTTP/network clients initialize
-# =====================================================================
 NO_PROXY_DOMAINS = (
     "api.binance.com,api.mexc.com,api.telegram.org,.supabase.co,"
     "stream.bybit.com,stream-testnet.bybit.com,localhost,127.0.0.1"
@@ -12,7 +8,6 @@ NO_PROXY_DOMAINS = (
 os.environ["NO_PROXY"] = NO_PROXY_DOMAINS
 os.environ["no_proxy"] = NO_PROXY_DOMAINS
 
-# Ensure global proxy environment variables are wiped to prevent ambient proxy leakage
 os.environ.pop("HTTP_PROXY", None)
 os.environ.pop("HTTPS_PROXY", None)
 os.environ.pop("http_proxy", None)
@@ -37,11 +32,10 @@ from common import (
     set_asset_cooldown
 )
 from event_bus import event_bus
-from live_executor import LiveExecutionEngine
+from live_executor import LiveExecutionEngine, fetch_klines
 from reconciler import reconcile_open_trades
 from state_machine import StateMachineEngine
 from strategy import (
-    fetch_klines,
     evaluate_signals,
     load_symbol_config,
     calculate_tema as calc_tema,
@@ -65,7 +59,9 @@ TIMEFRAME = os.getenv("TIMEFRAME", "1h")
 POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", "60"))
 ACCOUNT_RISK_PCT = float(os.getenv("ACCOUNT_RISK_PCT", "1.0"))
 FALLBACK_BALANCE = float(os.getenv("ACCOUNT_BALANCE", "100.0"))
-MAX_CONCURRENT_POSITIONS = 4  # Locked max concurrent position threshold
+
+# FIX #8: Reduced from 4 to 2 to halve trade frequency (fee drag reduction)
+MAX_CONCURRENT_POSITIONS = int(os.getenv("MAX_CONCURRENT_POSITIONS", "2"))
 
 logger = logging.getLogger("main_orchestrator")
 
@@ -97,14 +93,9 @@ async def dynamic_trade_management_loop():
                     trade_id = trade['id']
                     pair = trade['pair']
                     pos_qty = float(trade.get("position_size", 0.0))
-                    
-                    df_active = await asyncio.to_thread(
-                        fetch_klines,
-                        symbol=pair,
-                        interval="1h",
-                        limit=300
-                    )
-                    
+
+                    df_active = await asyncio.to_thread(fetch_klines, symbol=pair, interval="1h", limit=300)
+
                     if df_active is None or df_active.empty or len(df_active) < 200:
                         logger.warning(f"[{pair}] K-line data insufficient/empty for active trade #{trade_id}. Skipping iteration.")
                         continue
@@ -114,10 +105,9 @@ async def dynamic_trade_management_loop():
                     df_active['atr'] = calc_atr(df_active, period=int(cfg.get("atr_period", 14)))
 
                     latest_candle = df_active.iloc[-1].to_dict()
-                    
-                    # Fetch live position state directly from Bybit
+
                     live_pos = await executor.get_futures_position_async(pair)
-                    
+
                     result = trade_manager.process_trade(trade, latest_candle, live_pos_info=live_pos)
                     action = result.get("action")
 
@@ -125,18 +115,14 @@ async def dynamic_trade_management_loop():
                         new_sl = result["new_sl"]
                         new_state = result["new_state"]
 
-                        # Synchronize updated trailing Stop Loss with Bybit V5 position
                         sl_updated = await asyncio.to_thread(
-                            executor.set_position_trading_stop,
-                            pair,
-                            new_sl,
-                            0
+                            executor.set_position_trading_stop, pair, new_sl, 0
                         )
 
                         with conn.cursor() as cur:
                             cur.execute("""
                                 UPDATE trade_setups
-                                SET stop_loss = %s, trade_state = %s
+                                SET stop_loss = %s, trade_state = %s, updated_at = CURRENT_TIMESTAMP
                                 WHERE id = %s AND status = 'EXECUTED';
                             """, (round(new_sl, 5), new_state, trade_id))
                             conn.commit()
@@ -148,34 +134,25 @@ async def dynamic_trade_management_loop():
 
                     elif action in ["EXECUTE_CLOSE_SL", "EXECUTE_CLOSE_TP", "SYNC_CLOSED_FROM_EXCHANGE"]:
                         target_exit = result.get("target_price", float(latest_candle.get("close")))
-                        
-                        # Execute real Market Order on Bybit exchange
+
                         close_res = executor.close_live_position_bybit(
-                            symbol=pair,
-                            position_size=pos_qty,
-                            current_price=target_exit,
-                            outcome=action
-                        )
-                        
-                        actual_exit_price = float(close_res.get("exit_price", target_exit))
-                        
-                        # Estimate total maker/taker fee (~0.055% standard Bybit taker fee per leg)
-                        est_fees = (float(trade["entry_price"]) * pos_qty * 0.00055) + (actual_exit_price * pos_qty * 0.00055)
-                        
-                        acct_bal = float(trade.get("account_balance") or FALLBACK_BALANCE)
-                        pnl_usd, pnl_pct, outcome = calculate_pnl(
-                            trade["direction"], 
-                            float(trade["entry_price"]), 
-                            actual_exit_price, 
-                            pos_qty, 
-                            acct_bal,
-                            total_fees=est_fees
+                            symbol=pair, position_size=pos_qty,
+                            current_price=target_exit, outcome=action
                         )
 
-                        # Record trade outcome using actual execution price and fee deduction
+                        actual_exit_price = float(close_res.get("exit_price", target_exit))
+
+                        est_fees = (float(trade["entry_price"]) * pos_qty * 0.00055) + (actual_exit_price * pos_qty * 0.00055)
+
+                        acct_bal = float(trade.get("account_balance") or FALLBACK_BALANCE)
+                        pnl_usd, pnl_pct, outcome = calculate_pnl(
+                            trade["direction"], float(trade["entry_price"]),
+                            actual_exit_price, pos_qty, acct_bal, total_fees=est_fees
+                        )
+
                         finalize_trade_in_db(trade_id, actual_exit_price, pnl_usd, pnl_pct, outcome, fee_usd=est_fees)
                         set_asset_cooldown(pair, hours=4)
-                        
+
                         send_telegram_notification(
                             f"<b>🔴 POSITION CLOSED ({action})</b>\n\n"
                             f"<b>Trade ID:</b> <code>#{trade_id}</code>\n"
@@ -205,7 +182,6 @@ async def strategy_evaluation_loop():
                 await asyncio.sleep(POLL_INTERVAL_SECONDS)
                 continue
 
-            # --- GLOBAL EQUAL-WEIGHT FRACTIONAL LOCK ---
             conn_global = await asyncio.to_thread(get_db_connection)
             global_active_count = 0
             if conn_global:
@@ -224,16 +200,13 @@ async def strategy_evaluation_loop():
                 await asyncio.sleep(POLL_INTERVAL_SECONDS)
                 continue
 
-            # Calculate Equal-Weight Allocated Margin per Trade
             allocated_margin_per_trade = active_usdt_balance / MAX_CONCURRENT_POSITIONS
 
             for symbol in WATCHLIST:
-                # 1. Check if asset is currently in cooldown
                 if check_asset_cooldown(symbol):
                     logger.info(f"[{symbol}] Asset is in active cooldown. Skipping evaluation.")
                     continue
 
-                # 2. Check active trade count in DB
                 conn = await asyncio.to_thread(get_db_connection)
                 if conn:
                     try:
@@ -252,21 +225,15 @@ async def strategy_evaluation_loop():
                     finally:
                         release_db_connection(conn)
 
-                df_klines = await asyncio.to_thread(
-                    fetch_klines,
-                    symbol=symbol,
-                    interval=TIMEFRAME,
-                    limit=300
-                )
-                
+                df_klines = await asyncio.to_thread(fetch_klines, symbol=symbol, interval=TIMEFRAME, limit=300)
+
                 if df_klines is None or df_klines.empty:
                     logger.warning(f"[{symbol}] Kline data empty. Skipping evaluation.")
                     continue
 
                 cfg = load_symbol_config(symbol)
                 signal = evaluate_signals(
-                    df=df_klines,
-                    symbol=symbol,
+                    df=df_klines, symbol=symbol,
                     account_balance=active_usdt_balance,
                     risk_pct=cfg.get("risk_pct", ACCOUNT_RISK_PCT),
                     tema_period=cfg.get("tema_period", 200),
@@ -297,16 +264,25 @@ async def strategy_evaluation_loop():
                 )
 
                 if action in ["BUY", "LONG", "SELL", "SHORT"]:
+                    raw_sl = signal.get("stop_loss") or signal.get("sl_price") or 0.0
+                    raw_tp = signal.get("take_profit") or signal.get("tp_price") or 0.0
+                    raw_symbol = signal.get("pair") or signal.get("symbol") or symbol
+
+                    # FIX #6: Propagate risk_pct through the signal payload
                     await event_bus.publish("TRADE_SIGNAL", {
-                        "pair": symbol,
-                        "symbol": symbol,
+                        "pair": raw_symbol,
+                        "symbol": raw_symbol,
                         "direction": action,
+                        "side": action,
                         "entry_price": float(signal.get("entry_price", 0.0)),
-                        "stop_loss": float(signal.get("stop_loss", 0.0)),
-                        "take_profit": float(signal.get("take_profit", 0.0)),
+                        "stop_loss": float(raw_sl),
+                        "sl_price": float(raw_sl),
+                        "take_profit": float(raw_tp),
+                        "tp_price": float(raw_tp),
                         "amount_usd": allocated_margin_per_trade,
                         "account_balance": active_usdt_balance,
-                        "leverage": cfg.get("leverage", 5)
+                        "leverage": cfg.get("leverage", 5),
+                        "risk_pct": float(cfg.get("risk_pct", ACCOUNT_RISK_PCT)),
                     })
 
         except Exception as e:
@@ -316,43 +292,35 @@ async def strategy_evaluation_loop():
 
 
 async def reconciler_background_task(executor):
-    """
-    Event-driven position reconciliation loop.
-    Triggers instantly on WS execution events or runs every 1 hour (3600s) as a safety net.
-    """
     exec_queue = asyncio.Queue()
 
     async def on_execution_event(payload):
         await exec_queue.put(payload)
 
-    # Subscribe queue listener to execution events
     event_bus.subscribe("EXECUTION_EVENT", on_execution_event)
 
-    # Fallback polling interval in seconds (1 hour)
     SAFETY_INTERVAL = 3600
 
     while True:
         try:
-            # Wait for either an incoming WS execution event or the safety timer expiry
             try:
                 event_payload = await asyncio.wait_for(exec_queue.get(), timeout=SAFETY_INTERVAL)
                 logger.info(f"⚡ [Event-Driven] Triggering reconciliation via WS execution event ({event_payload.get('symbol')}).")
             except asyncio.TimeoutError:
                 logger.info("⏰ [Safety Check] Running scheduled background position reconciliation...")
 
-            # Execute position reconciliation in a thread to keep async loop non-blocking
             reconciled_count = await asyncio.to_thread(reconcile_open_trades, executor)
             if reconciled_count > 0:
                 logger.info(f"Reconciliation finished: {reconciled_count} record(s) healed/updated.")
 
         except Exception as rec_err:
             logger.error(f"Reconciler task error: {rec_err}")
-            await asyncio.sleep(10)  # Brief delay before retrying on loop errors
+            await asyncio.sleep(10)
 
 
 async def main():
     logger.info("Starting Centralized Bybit Futures Event-Driven Architecture...")
-    
+
     ensure_schema_updated()
 
     from ws_engine import UnifiedWebSocketEngine

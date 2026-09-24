@@ -1,20 +1,20 @@
 import os
 import time
 import math
+import asyncio
 import logging
 import requests
+import ccxt
 import numpy as np
 import pandas as pd
 from typing import Dict, Any, Optional, Tuple, List
 
-# AI Financial Sentiment Dependencies
 try:
     from google import genai
     HAS_GENAI = True
 except ImportError:
     HAS_GENAI = False
 
-# Database Connection Pool Dependencies
 try:
     from common import get_db_connection, release_db_connection
     HAS_DB = True
@@ -33,10 +33,6 @@ EXPECTED_MEXC_COLUMNS = [
 # ---------------------------------------------------------------------------
 
 def get_ai_sentiment_score(text: str, api_key: Optional[str] = None) -> float:
-    """
-    Evaluates financial news or textual context using Google GenAI (gemini-2.5-flash).
-    Returns a normalized float score between 0.0 (bearish) and 1.0 (bullish).
-    """
     if not HAS_GENAI:
         logger.warning("Google GenAI SDK not installed. Defaulting sentiment to neutral (0.5).")
         return 0.5
@@ -53,10 +49,7 @@ def get_ai_sentiment_score(text: str, api_key: Optional[str] = None) -> float:
             "to 1.0 (extremely bullish). Return ONLY a single numeric value float between 0.0 and 1.0.\n\n"
             f"Text: {text}"
         )
-        response = client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=prompt
-        )
+        response = client.models.generate_content(model="gemini-2.5-flash", contents=prompt)
         score_text = response.text.strip()
         score = float(score_text)
         return max(0.0, min(1.0, score))
@@ -69,8 +62,15 @@ def get_ai_sentiment_score(text: str, api_key: Optional[str] = None) -> float:
 # 2. MULTI-EXCHANGE KLINE DATA FETCHING & FALLBACKS
 # ---------------------------------------------------------------------------
 
+def format_ccxt_futures_symbol(symbol: str) -> str:
+    """Formats raw symbols to CCXT unified futures symbol format."""
+    clean = symbol.replace("/", "").replace("_", "").replace("-", "").upper()
+    if not clean.endswith(":USDT"):
+        return f"{clean[:-4]}/USDT:USDT" if clean.endswith("USDT") else symbol
+    return symbol
+
+
 def fetch_cryptocompare_klines(symbol: str, interval: str = "15m", limit: int = 400) -> pd.DataFrame:
-    """Fallback fetcher querying CryptoCompare REST API."""
     try:
         clean_sym = symbol.replace("/", "").replace("_", "").upper()
         if clean_sym.endswith("USDT"):
@@ -86,112 +86,69 @@ def fetch_cryptocompare_klines(symbol: str, interval: str = "15m", limit: int = 
         endpoint = "histohour" if "h" in interval.lower() else "histominute"
         url = f"https://min-api.cryptocompare.com/data/v2/{endpoint}"
         params = {"fsym": fsym, "tsym": tsym, "limit": limit}
-        
+
         resp = requests.get(url, params=params, timeout=8)
         data = resp.json()
-        
+
         if data.get("Response") == "Success":
             raw_candles = data["Data"]["Data"]
             df = pd.DataFrame(raw_candles)
             df = df.rename(columns={
-                "time": "timestamp",
-                "open": "open",
-                "high": "high",
-                "low": "low",
-                "close": "close",
-                "volumeto": "volume"
+                "time": "timestamp", "open": "open", "high": "high",
+                "low": "low", "close": "close", "volumeto": "volume"
             })
             df["timestamp"] = pd.to_datetime(df["timestamp"], unit="s")
             return df[["timestamp", "open", "high", "low", "close", "volume"]]
     except Exception as e:
         logger.error(f"[{symbol}] CryptoCompare fetch failed: {e}")
-    
+
     return pd.DataFrame()
 
 
 def fetch_klines(symbol: str, interval: str = "15m", limit: int = 400) -> pd.DataFrame:
-    base_symbol = symbol.split(":")[0]
-    clean_symbol = base_symbol.replace("/", "").replace("_", "").replace("-", "").upper()
-    
-    if clean_symbol.endswith("USDTUSDT"):
-        clean_symbol = clean_symbol[:-4]
+    """
+    FIX #4: Bybit Linear Futures is now Tier 1 to eliminate basis risk between
+    signal generation and execution venue.
+    """
+    ccxt_symbol = format_ccxt_futures_symbol(symbol)
 
-    # Tier 1: MEXC REST API
     try:
-        url = "https://api.mexc.com/api/v3/klines"
-        params = {"symbol": clean_symbol, "interval": interval, "limit": limit}
-        resp = requests.get(url, params=params, timeout=10)
-        if resp.status_code == 200:
-            data = resp.json()
-            if isinstance(data, list) and len(data) > 0:
-                df = pd.DataFrame(data)
-                if df.shape[1] >= 8:
-                    df = df.iloc[:, :8]
-                    df.columns = EXPECTED_MEXC_COLUMNS
-                else:
-                    raise ValueError(f"Unexpected MEXC kline column dimensions: {df.shape[1]}")
-
-                for col in ["open", "high", "low", "close", "volume"]:
-                    df[col] = df[col].astype(float)
-                df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
-                return df[["timestamp", "open", "high", "low", "close", "volume"]]
+        bybit_ex = ccxt.bybit({'enableRateLimit': True, 'options': {'defaultType': 'linear'}})
+        ohlcv = bybit_ex.fetch_ohlcv(ccxt_symbol, timeframe=interval, limit=limit)
+        if ohlcv:
+            df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+            return df
     except Exception as e:
-        logger.warning(f"[{symbol}] Tier 1 (MEXC) kline fetch failed: {e}")
+        logger.warning(f"[{symbol}] Tier 1 (Bybit) kline fetch failed: {e}")
 
-    # Tier 2: Binance Primary REST API
     try:
-        url = "https://api.binance.com/api/v3/klines"
-        params = {"symbol": clean_symbol, "interval": interval, "limit": limit}
-        resp = requests.get(url, params=params, timeout=10)
-        if resp.status_code == 200:
-            data = resp.json()
-            if isinstance(data, list) and len(data) > 0:
-                df = pd.DataFrame(data)
-                df = df.iloc[:, :6]
-                df.columns = ["timestamp", "open", "high", "low", "close", "volume"]
-                for col in ["open", "high", "low", "close", "volume"]:
-                    df[col] = df[col].astype(float)
-                df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
-                return df[["timestamp", "open", "high", "low", "close", "volume"]]
+        binance_ex = ccxt.binanceusdm()
+        ohlcv = binance_ex.fetch_ohlcv(symbol.split(':')[0], timeframe=interval, limit=limit)
+        if ohlcv:
+            df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+            return df
     except Exception as e:
         logger.warning(f"[{symbol}] Tier 2 (Binance) kline fetch failed: {e}")
 
-    # Tier 3: Bybit Spot REST API
-    try:
-        bybit_interval_map = {"1m": "1", "5m": "5", "15m": "15", "1h": "60", "4h": "240", "1d": "D"}
-        bybit_tf = bybit_interval_map.get(interval, "15")
-        url = "https://api.bybit.com/v5/market/kline"
-        params = {"category": "spot", "symbol": clean_symbol, "interval": bybit_tf, "limit": limit}
-        resp = requests.get(url, params=params, timeout=10)
-        if resp.status_code == 200:
-            res = resp.json()
-            raw_list = res.get("result", {}).get("list", [])
-            if raw_list:
-                df = pd.DataFrame(raw_list, columns=["timestamp", "open", "high", "low", "close", "volume", "turnover"])
-                df = df.iloc[::-1].reset_index(drop=True)
-                for col in ["open", "high", "low", "close", "volume"]:
-                    df[col] = df[col].astype(float)
-                df["timestamp"] = pd.to_datetime(df["timestamp"].astype(int), unit="ms")
-                return df[["timestamp", "open", "high", "low", "close", "volume"]]
-    except Exception as e:
-        logger.warning(f"[{symbol}] Tier 3 (Bybit) kline fetch failed: {e}")
+    logger.info(f"[{symbol}] Tier 3 (CryptoCompare) fallback engaged.")
+    raw = fetch_cryptocompare_klines(symbol, interval, limit)
+    if isinstance(raw, pd.DataFrame) and not raw.empty:
+        return raw
 
-    # Tier 4: Fallback to CryptoCompare
-    logger.info(f"[{symbol}] Triggering Tier 4 (CryptoCompare) fallback engine...")
-    return fetch_cryptocompare_klines(symbol, interval, limit)
+    return pd.DataFrame()
 
 
 # ---------------------------------------------------------------------------
-# 3. TECHNICAL INDICATORS & TECHNICAL UTILITIES
+# 3. TECHNICAL INDICATORS
 # ---------------------------------------------------------------------------
 
 def calculate_ema(series: pd.Series, period: int) -> pd.Series:
-    """Calculates Exponential Moving Average."""
     return series.ewm(span=period, adjust=False).mean()
 
 
 def calculate_tema(series: pd.Series, period: int) -> pd.Series:
-    """Calculates Triple Exponential Moving Average (TEMA)."""
     ema1 = calculate_ema(series, period)
     ema2 = calculate_ema(ema1, period)
     ema3 = calculate_ema(ema2, period)
@@ -199,7 +156,6 @@ def calculate_tema(series: pd.Series, period: int) -> pd.Series:
 
 
 def calculate_rsi(series: pd.Series, period: int = 14) -> pd.Series:
-    """Calculates Relative Strength Index."""
     delta = series.diff()
     gain = (delta.where(delta > 0, 0.0)).rolling(window=period).mean()
     loss = (-delta.where(delta < 0, 0.0)).rolling(window=period).mean()
@@ -209,7 +165,6 @@ def calculate_rsi(series: pd.Series, period: int = 14) -> pd.Series:
 
 
 def calculate_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
-    """Calculates Average True Range."""
     high_low = df["high"] - df["low"]
     high_close = (df["high"] - df["close"].shift()).abs()
     low_close = (df["low"] - df["close"].shift()).abs()
@@ -218,20 +173,17 @@ def calculate_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
 
 
 def calculate_adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
-    """Calculates Average Directional Index (ADX)."""
     df_copy = df.copy()
     df_copy["up_move"] = df_copy["high"] - df_copy["high"].shift(1)
     df_copy["down_move"] = df_copy["low"].shift(1) - df_copy["low"]
 
     df_copy["plus_dm"] = np.where(
         (df_copy["up_move"] > df_copy["down_move"]) & (df_copy["up_move"] > 0),
-        df_copy["up_move"],
-        0.0
+        df_copy["up_move"], 0.0
     )
     df_copy["minus_dm"] = np.where(
         (df_copy["down_move"] > df_copy["up_move"]) & (df_copy["down_move"] > 0),
-        df_copy["down_move"],
-        0.0
+        df_copy["down_move"], 0.0
     )
 
     tr = calculate_atr(df_copy, period=1)
@@ -246,14 +198,10 @@ def calculate_adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
 
 
 # ---------------------------------------------------------------------------
-# 4. GRANULAR VOLUME PROFILE & LIQUIDITY GAP ALGORITHM
+# 4. VOLUME PROFILE & LIQUIDITY GAPS
 # ---------------------------------------------------------------------------
 
 def compute_volume_profile(df: pd.DataFrame, num_bins: int = 100, lookback_bars: int = 1200, va_pct: float = 0.70):
-    """
-    Computes exact Volume Profile levels (POC, VAH, VAL) using granular price-bin distribution.
-    Updated default lookback_bars to 1200 (~12.5 days on 15m).
-    """
     if df.empty or "volume" not in df.columns or "high" not in df.columns or "low" not in df.columns:
         return np.nan, np.nan, np.nan
 
@@ -291,11 +239,9 @@ def compute_volume_profile(df: pd.DataFrame, num_bins: int = 100, lookback_bars:
 
             vD_vt[pLI] += lV * max(vPOR, 0.0)
 
-    # Point of Control (POC)
     pcL = int(np.argmax(vD_vt))
     poc = round(pLST + (pcL + 0.5) * pSTP, 2)
 
-    # Value Area (VAH & VAL)
     ttV = max(np.sum(vD_vt), 1e-10) * va_pct
     va = vD_vt[pcL]
     laP, lbP = pcL, pcL
@@ -305,10 +251,8 @@ def compute_volume_profile(df: pd.DataFrame, num_bins: int = 100, lookback_bars:
         iter_count += 1
         if lbP == 0 and laP == num_bins - 1:
             break
-
         vaP = vD_vt[laP + 1] if laP < num_bins - 1 else 0.0
         vbP = vD_vt[lbP - 1] if lbP > 0 else 0.0
-
         if vaP >= vbP:
             va += vaP
             laP += 1
@@ -323,10 +267,6 @@ def compute_volume_profile(df: pd.DataFrame, num_bins: int = 100, lookback_bars:
 
 
 def calculate_volume_profile_gaps(df: pd.DataFrame, num_bins: int = 100, lookback_bars: int = 1200, detection_pct: float = 0.07) -> Dict[str, Any]:
-    """
-    Identifies Low Volume Nodes (Liquidity Gaps) across the specified lookback range.
-    Returns gap categories alongside VAH/VAL/POC levels.
-    """
     empty_res = {"poc": np.nan, "vah": np.nan, "val": np.nan, "overhead_gaps": [], "underneath_gaps": []}
     if df.empty or "volume" not in df.columns or "high" not in df.columns or "low" not in df.columns:
         return empty_res
@@ -376,7 +316,6 @@ def calculate_volume_profile_gaps(df: pd.DataFrame, num_bins: int = 100, lookbac
         tVT.append(max_val)
 
     gap_prices = []
-
     for vn in range(2 * noN, num_bins + 2 * noN):
         uNth = all(tVT[vn - noN] < tVT[cVN] for cVN in range(vn - 2 * noN, vn - noN))
         lNth = all(tVT[vn - noN] < tVT[cVN] for cVN in range(vn - noN + 1, vn + 1))
@@ -407,7 +346,6 @@ def calculate_volume_profile_gaps(df: pd.DataFrame, num_bins: int = 100, lookbac
 # ---------------------------------------------------------------------------
 
 def normalize_symbol(symbol: str) -> str:
-    """Normalizes symbol formatting safely."""
     if not symbol:
         return ""
     s = str(symbol).replace('"', "").replace("'", "").strip().upper()
@@ -419,32 +357,27 @@ def normalize_symbol(symbol: str) -> str:
 
 
 def load_symbol_config(symbol: str) -> Dict[str, Any]:
-    """Loads optimized strategy parameters using the connection pool safely."""
     formatted_symbol = normalize_symbol(symbol)
     raw_symbol = formatted_symbol.replace("/", "").upper()
-    
+
     if HAS_DB:
         conn = get_db_connection()
         if conn:
             try:
                 cursor = conn.cursor()
-                cursor.execute(
-                    """
+                cursor.execute("""
                     SELECT * 
                     FROM strategy_parameters 
                     WHERE UPPER(TRIM(REPLACE(REPLACE(symbol, '"', ''), '''', ''))) IN (%s, %s)
                     ORDER BY updated_at DESC LIMIT 1;
-                    """,
-                    (formatted_symbol, raw_symbol),
-                )
+                """, (formatted_symbol, raw_symbol))
                 row = cursor.fetchone()
-                
+
                 if row:
                     colnames = [desc[0] for desc in cursor.description] if cursor.description else []
                     cursor.close()
                     config = dict(zip(colnames, row)) if isinstance(row, tuple) else dict(row)
-                    
-                    # Explicit type conversion to avoid Decimal / Float mismatch bugs
+
                     config["tema_period"] = int(config.get("tema_period", 200))
                     config["rsi_period"] = int(config.get("rsi_period", 14))
                     config["rsi_thresh"] = float(config.get("rsi_thresh", 42.0))
@@ -474,29 +407,14 @@ def load_symbol_config(symbol: str) -> Dict[str, Any]:
             finally:
                 release_db_connection(conn)
 
-    # 15-Minute Fallback Defaults
     return {
-        "tema_period": 200,
-        "rsi_period": 14,
-        "rsi_thresh": 42.0,
-        "adx_period": 14,
-        "adx_threshold": 22.0,
-        "use_adx_filter": True,
-        "use_rsi_filter": True,
-        "use_candlestick_confirm": True,
-        "zone_tolerance": 0.005,
-        "max_sl_pct": 0.015,
-        "min_sentiment": 0.0,
-        "min_rr": 2.0,
-        "risk_pct": 0.5,
-        "vp_detection_pct": 0.07,
-        "lookback_bars": 1200,
-        "vp_va_pct": 0.70,
-        "atr_period": 14,
-        "atr_mult": 1.5,
-        "use_atr_sl": True,
-        "disable_htf": False,
-        "spot_only": False
+        "tema_period": 200, "rsi_period": 14, "rsi_thresh": 42.0,
+        "adx_period": 14, "adx_threshold": 22.0,
+        "use_adx_filter": True, "use_rsi_filter": True, "use_candlestick_confirm": True,
+        "zone_tolerance": 0.005, "max_sl_pct": 0.015, "min_sentiment": 0.0,
+        "min_rr": 2.0, "risk_pct": 0.5, "vp_detection_pct": 0.07, "lookback_bars": 1200,
+        "vp_va_pct": 0.70, "atr_period": 14, "atr_mult": 1.5,
+        "use_atr_sl": True, "disable_htf": False, "spot_only": False
     }
 
 
@@ -528,28 +446,14 @@ def evaluate_signals(
     spot_only: Optional[bool] = None,
     sentiment_score: Optional[float] = None
 ) -> Dict[str, Any]:
-    """
-    Harmonized Core Strategy Evaluator (Optimized for 15m Execution):
-    - Safely resolves missing runtime parameters by querying database config via `load_symbol_config(symbol)`.
-    - Explicitly casts all numeric configuration values to float/int to prevent Decimal arithmetic errors.
-    - Evaluates LONG and SHORT entry signals with High-Timeframe (1H) confluence.
-    - Utilizes dynamic Volume Profile levels for Take-Profit targeting.
-    """
     no_signal = {
-        "action": "HOLD",
-        "symbol": symbol,
-        "direction": "NONE",
-        "entry_price": 0.0,
-        "stop_loss": 0.0,
-        "take_profit": 0.0,
-        "atr": 0.0,
-        "reason": "No condition met"
+        "action": "HOLD", "symbol": symbol, "direction": "NONE",
+        "entry_price": 0.0, "stop_loss": 0.0, "take_profit": 0.0,
+        "atr": 0.0, "reason": "No condition met"
     }
 
-    # Dynamically load symbol database parameters as baseline defaults
     sym_cfg = load_symbol_config(symbol)
 
-    # Cast to float/int explicitly before arithmetic operations
     tema_period = int(tema_period) if tema_period is not None else int(sym_cfg["tema_period"])
     rsi_period = int(rsi_period) if rsi_period is not None else int(sym_cfg["rsi_period"])
     rsi_thresh = float(rsi_thresh) if rsi_thresh is not None else float(sym_cfg["rsi_thresh"])
@@ -562,7 +466,7 @@ def evaluate_signals(
     risk_pct = float(risk_pct) if risk_pct is not None else float(sym_cfg["risk_pct"])
     atr_period = int(atr_period) if atr_period is not None else int(sym_cfg["atr_period"])
     atr_mult = float(atr_mult) if atr_mult is not None else float(sym_cfg["atr_mult"])
-    
+
     use_adx_filter = use_adx_filter if use_adx_filter is not None else sym_cfg["use_adx_filter"]
     use_rsi_filter = use_rsi_filter if use_rsi_filter is not None else sym_cfg["use_rsi_filter"]
     use_candlestick_confirm = use_candlestick_confirm if use_candlestick_confirm is not None else sym_cfg["use_candlestick_confirm"]
@@ -577,7 +481,6 @@ def evaluate_signals(
         no_signal["reason"] = "Insufficient data rows"
         return no_signal
 
-    # Calculate Technical Indicators
     df = df.copy()
     df["tema"] = calculate_tema(df["close"], tema_period)
     df["rsi"] = calculate_rsi(df["close"], rsi_period)
@@ -592,13 +495,11 @@ def evaluate_signals(
     current_adx = float(last_row["adx"])
     current_atr = float(last_row["atr"])
 
-    # Resolve AI Sentiment Score
     final_sentiment = float(sentiment_score) if sentiment_score is not None else 0.5
     if final_sentiment < min_sentiment:
         no_signal["reason"] = f"Sentiment score ({final_sentiment:.2f}) below threshold ({min_sentiment:.2f})"
         return no_signal
 
-    # Evaluate High Timeframe (1H) Trend Confluence
     macro_trend_long = True
     macro_trend_short = True
 
@@ -616,7 +517,6 @@ def evaluate_signals(
         except Exception as e:
             logger.warning(f"[{symbol}] Could not calculate HTF 1H confluence: {e}")
 
-    # Volume Profile Analysis using loaded DB lookback parameters
     vp_data = calculate_volume_profile_gaps(df, num_bins=100, lookback_bars=lookback_bars, detection_pct=vp_detection_pct)
     poc = vp_data["poc"]
     vah = vp_data["vah"]
@@ -625,11 +525,9 @@ def evaluate_signals(
     underneath_gaps = vp_data["underneath_gaps"]
 
     adx_valid = (not use_adx_filter) or (current_adx >= adx_threshold)
-    MIN_SL_PCT = 0.002  # Lowered to 0.20% for 15-minute execution sensitivity
+    MIN_SL_PCT = 0.002
 
-    # ---------------------------------------------------------------------------
-    # EVALUATE LONG (BUY) PATH
-    # ---------------------------------------------------------------------------
+    # LONG path
     long_candlestick = True
     if use_candlestick_confirm:
         long_candlestick = float(last_row["close"]) > float(last_row["open"]) or float(last_row["close"]) > float(prev_row["high"])
@@ -669,20 +567,14 @@ def evaluate_signals(
         computed_rr = (take_profit - entry_price) / sl_distance
         if computed_rr >= min_rr:
             return {
-                "action": "BUY",
-                "symbol": symbol,
-                "direction": "LONG",
-                "entry_price": float(entry_price),
-                "stop_loss": float(stop_loss),
-                "take_profit": float(take_profit),
-                "atr": float(round(current_atr, 4)),
+                "action": "BUY", "symbol": symbol, "direction": "LONG",
+                "entry_price": float(entry_price), "stop_loss": float(stop_loss),
+                "take_profit": float(take_profit), "atr": float(round(current_atr, 4)),
                 "rr_ratio": float(computed_rr),
                 "reason": f"Long trend confluence confirmed. R:R={computed_rr:.2f}"
             }
 
-    # ---------------------------------------------------------------------------
-    # EVALUATE SHORT (SELL) PATH
-    # ---------------------------------------------------------------------------
+    # SHORT path
     if not spot_only:
         short_candlestick = True
         if use_candlestick_confirm:
@@ -723,13 +615,9 @@ def evaluate_signals(
             computed_rr = (entry_price - take_profit) / sl_distance
             if computed_rr >= min_rr:
                 return {
-                    "action": "SELL",
-                    "symbol": symbol,
-                    "direction": "SHORT",
-                    "entry_price": float(entry_price),
-                    "stop_loss": float(stop_loss),
-                    "take_profit": float(take_profit),
-                    "atr": float(round(current_atr, 4)),
+                    "action": "SELL", "symbol": symbol, "direction": "SHORT",
+                    "entry_price": float(entry_price), "stop_loss": float(stop_loss),
+                    "take_profit": float(take_profit), "atr": float(round(current_atr, 4)),
                     "rr_ratio": float(computed_rr),
                     "reason": f"Short trend confluence confirmed. R:R={computed_rr:.2f}"
                 }
@@ -739,7 +627,7 @@ def evaluate_signals(
 
 
 # ---------------------------------------------------------------------------
-# 7. EVENT-DRIVEN SIGNAL GENERATION METHOD / CLASS INTERFACE
+# 7. EVENT-DRIVEN SIGNAL GENERATION CLASS
 # ---------------------------------------------------------------------------
 
 class StrategyEngine:
@@ -748,45 +636,77 @@ class StrategyEngine:
         self.config = config
         self.event_bus = event_bus
 
-    def generate_signal(self, df: pd.DataFrame, current_price: float, position_side: str = "LONG") -> Dict[str, Any]:
+    def generate_signal(self, df: pd.DataFrame, current_price: float = None,
+                        position_side: str = "LONG", params: dict = None) -> Dict[str, Any]:
         """
-        Calculates signal metadata including ATR-based Stop Loss prior to event publishing.
+        FIX #7: Always computes take_profit locally to prevent NameError.
         """
-        # 1. Calculate ATR (if not already in DataFrame)
-        atr_period = getattr(self.config, "ATR_PERIOD", 14) if self.config else 14
-        atr_multiplier = getattr(self.config, "ATR_MULT", 2.0) if self.config else 2.0
-        
+        if df.empty or len(df) < 50:
+            return {"signal": "HOLD", "action": "HOLD"}
+
+        if current_price is None:
+            current_price = float(df.iloc[-1]["close"])
+
+        params = params or {}
+        min_rr = float(params.get("min_rr", getattr(self.config, "MIN_RR", 2.5) if self.config else 2.5))
+        atr_multiplier = float(params.get("atr_mult", getattr(self.config, "ATR_MULT", 2.5) if self.config else 2.5))
+        atr_period = int(params.get("atr_period", getattr(self.config, "ATR_PERIOD", 14) if self.config else 14))
+
         if "atr" in df.columns:
-            current_atr = df["atr"].iloc[-1]
+            current_atr = float(df["atr"].iloc[-1])
         else:
-            # Calculate ATR on the fly if column missing
             high_low = df["high"] - df["low"]
             high_close = (df["high"] - df["close"].shift()).abs()
             low_close = (df["low"] - df["close"].shift()).abs()
             tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
-            current_atr = tr.rolling(atr_period).mean().iloc[-1]
+            current_atr = float(tr.rolling(atr_period).mean().iloc[-1])
 
-        # 2. Compute SL level based on ATR and direction
-        if position_side.upper() == "LONG":
-            sl_price = current_price - (current_atr * atr_multiplier)
+        latest = df.iloc[-1]
+        rsi_thresh = float(params.get("rsi_thresh", 42.0))
+        direction = position_side.upper()
+
+        if "tema" in df.columns and "rsi" in df.columns:
+            if latest["close"] > latest["tema"] and latest["rsi"] > rsi_thresh:
+                direction = "BUY"
+            elif latest["close"] < latest["tema"] and latest["rsi"] < (100.0 - rsi_thresh):
+                direction = "SELL"
+            else:
+                return {"signal": "HOLD", "action": "HOLD"}
+
+        sl_dist = max(current_atr * atr_multiplier, current_price * 0.002)
+        if direction in ["BUY", "LONG"]:
+            stop_loss = current_price - sl_dist
+            take_profit = current_price + (sl_dist * min_rr)
         else:
-            sl_price = current_price + (current_atr * atr_multiplier)
+            stop_loss = current_price + sl_dist
+            take_profit = current_price - (sl_dist * min_rr)
 
-        # Sanity safeguard for negative SL
-        sl_price = max(sl_price, 0.0001)
+        sl_val = float(round(stop_loss, 5))
+        tp_val = float(round(take_profit, 5))
 
-        # 3. Construct signal payload
         signal_payload = {
+            "signal": direction,
+            "action": direction,
+            "pair": self.symbol,
             "symbol": self.symbol,
-            "side": position_side,
+            "side": direction,
+            "direction": direction,
             "entry_price": float(current_price),
-            "stop_loss": float(round(sl_price, 4)),
+            "stop_loss": sl_val,
+            "sl_price": sl_val,
+            "take_profit": tp_val,
+            "tp_price": tp_val,
+            "risk_reward": min_rr,
             "atr": float(round(current_atr, 4)),
-            "timestamp": int(time.time())
+            "timestamp": int(time.time()),
         }
 
-        # 4. Emit to event_bus
-        if hasattr(self, "event_bus") and self.event_bus and hasattr(self.event_bus, "publish"):
-            self.event_bus.publish("TRADE_SIGNAL", signal_payload)
-            
+        if getattr(self, "event_bus", None) and hasattr(self.event_bus, "publish"):
+            try:
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    loop.create_task(self.event_bus.publish("TRADE_SIGNAL", signal_payload))
+            except Exception:
+                pass
+
         return signal_payload

@@ -12,7 +12,7 @@
   "max_sl_pct": 0.015,
   "min_atr_pct": 0.2,
   "atr_mult_sl": 2.5,
-  "min_rr": 2.5,
+  "min_rr": 3.0,
   "scan_interval_minutes": 60,
   "alert_cooldown_hours": 4,
   "enable_live_trading": true,
@@ -27,5 +27,6 @@
   "atr_trail_mult": 2.0,
   "use_equity_curve_filter": true,
   "eq_ma_period": 10,
-  "reduced_risk_factor": 0.3
+  "reduced_risk_factor": 0.3,
+  "max_concurrent_positions": 2
 }

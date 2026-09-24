@@ -5,6 +5,7 @@ import time
 from typing import Dict, Any, Optional, Tuple, List
 import ccxt.async_support as ccxt_async
 import ccxt
+import pandas as pd
 import requests
 
 from config import BYBIT_API_KEY, BYBIT_SECRET_KEY, BYBIT_TESTNET
@@ -14,11 +15,11 @@ from common import (
     send_telegram_notification,
     set_asset_cooldown,
     finalize_trade_in_db,
+    calculate_pnl,
     logger
 )
 from event_bus import event_bus
 
-# WebSockets connect directly to Bybit linear streams
 BYBIT_WS_URL = (
     "wss://stream-testnet.bybit.com/v5/public/linear"
     if BYBIT_TESTNET
@@ -27,11 +28,14 @@ BYBIT_WS_URL = (
 
 POLL_INTERVAL_SECONDS = 10
 MIN_DUST_THRESHOLD = 0.001
-MAX_SLIPPAGE_PCT = 0.002       # 0.2% max execution limit offset
-MAX_ALLOWED_SPREAD_PCT = 0.003 # 0.3% max spread threshold
+MAX_SLIPPAGE_PCT = 0.002
+MAX_ALLOWED_SPREAD_PCT = 0.003
 
-ENTRY_TOLERANCE_PCT_LIVE = 0.005    # 0.5% tolerance
-ENTRY_TOLERANCE_PCT_TESTNET = 0.05  # 5.0% tolerance for testnet drift
+ENTRY_TOLERANCE_PCT_LIVE = 0.005
+ENTRY_TOLERANCE_PCT_TESTNET = 0.05
+
+# FIX #8: Toggle maker orders to reduce fee drag
+USE_MAKER_ORDERS = os.getenv("USE_MAKER_ORDERS", "true").lower() == "true"
 
 
 def safe_float(val: Any, default: float = 0.0) -> float:
@@ -44,7 +48,7 @@ def safe_float(val: Any, default: float = 0.0) -> float:
 
 
 def format_ccxt_futures_symbol(symbol: str) -> str:
-    """Consistently converts raw/dirty symbols to CCXT Bybit Linear Futures format (e.g., 'XRP/USDT:USDT')."""
+    """Consistently converts raw/dirty symbols to CCXT Bybit Linear Futures format."""
     if not symbol:
         return ""
     if ":" in symbol:
@@ -61,11 +65,47 @@ def format_ccxt_futures_symbol(symbol: str) -> str:
     return f"{raw}/USDT:USDT"
 
 
-def fetch_cryptocompare_fallback_kline(symbol: str, limit: int = 50) -> List[Dict[str, Any]]:
-    """Fallback market data engine routing requests correctly to CryptoCompare API v2."""
+def fetch_klines(symbol: str, interval: str = "1h", limit: int = 200) -> pd.DataFrame:
+    """Primary kline fetcher prioritizing Bybit directly to eliminate basis risk."""
+    ccxt_symbol = format_ccxt_futures_symbol(symbol)
+    
+    # 1. Tier 1 (Primary): Bybit Linear Futures REST
     try:
-        # Extract base symbol properly (e.g., 'XRP/USDT:USDT' -> fsym='XRP', tsym='USDT')
-        raw = symbol.split(":")[0]  # Strip CCXT contract formatting
+        public_ex = ccxt.bybit({'options': {'defaultType': 'linear'}})
+        if BYBIT_TESTNET:
+            public_ex.set_sandbox_mode(True)
+        ohlcv = public_ex.fetch_ohlcv(ccxt_symbol, timeframe=interval, limit=limit)
+        if ohlcv:
+            df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+            df['time'] = pd.to_datetime(df['timestamp'], unit='ms')
+            return df
+    except Exception as e:
+        logger.warning(f"[{symbol}] Primary Bybit kline fetch failed ({e}). Falling back to Binance...")
+
+    # 2. Tier 2 Fallback: Binance Futures
+    try:
+        binance_ex = ccxt.binanceusdm()
+        ohlcv = binance_ex.fetch_ohlcv(symbol.split(':')[0], timeframe=interval, limit=limit)
+        if ohlcv:
+            df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+            df['time'] = pd.to_datetime(df['timestamp'], unit='ms')
+            return df
+    except Exception as e:
+        logger.warning(f"[{symbol}] Secondary Binance kline fetch failed ({e}). Falling back to CryptoCompare...")
+
+    # 3. Tier 3 Fallback: CryptoCompare
+    raw_candles = fetch_cryptocompare_fallback_kline(symbol, limit=limit)
+    if raw_candles:
+        df = pd.DataFrame(raw_candles)
+        df['time'] = pd.to_datetime(df['timestamp'], unit='ms')
+        return df
+
+    return pd.DataFrame()
+
+
+def fetch_cryptocompare_fallback_kline(symbol: str, limit: int = 50) -> List[Dict[str, Any]]:
+    try:
+        raw = symbol.split(":")[0]
         if "/" in raw:
             fsym, tsym = raw.split("/")
         else:
@@ -76,7 +116,7 @@ def fetch_cryptocompare_fallback_kline(symbol: str, limit: int = 50) -> List[Dic
         params = {"fsym": fsym.upper(), "tsym": tsym.upper(), "limit": limit, "e": "CCCAGG"}
         res = requests.get(url, params=params, timeout=10)
         data = res.json()
-        
+
         if data.get("Response") == "Success":
             raw_candles = data.get("Data", {}).get("Data", [])
             return [
@@ -100,7 +140,6 @@ def fetch_cryptocompare_fallback_kline(symbol: str, limit: int = 50) -> List[Dic
 
 class BybitFuturesLiveExecutor:
     def __init__(self):
-        # Direct connection to Bybit Linear Futures
         self.exchange = ccxt.bybit({
             'apiKey': BYBIT_API_KEY,
             'secret': BYBIT_SECRET_KEY,
@@ -119,7 +158,6 @@ class BybitFuturesLiveExecutor:
             }
         })
 
-        # Apply standard testnet sandbox mode if configured
         if BYBIT_TESTNET:
             self.exchange.set_sandbox_mode(True)
             self.public_exchange.set_sandbox_mode(True)
@@ -134,42 +172,80 @@ class BybitFuturesLiveExecutor:
 
     def set_position_trading_stop(self, symbol: str, stop_loss: float, position_idx: int = 0) -> bool:
         """
-        Calls Bybit V5 API endpoint to explicitly attach/update SL on an active open position.
+        FIX #2: Auto-discovers the correct CCXT method name and verifies the SL is actually
+        visible on the exchange after the update.
         """
         try:
             ccxt_symbol = self.format_ccxt_futures_symbol(symbol)
-            formatted_sl = str(self.exchange.price_to_precision(ccxt_symbol, stop_loss))
+            formatted_sl = float(self.exchange.price_to_precision(ccxt_symbol, stop_loss))
             formatted_symbol = symbol.replace("/", "").replace(":USDT", "").replace("-", "").replace("_", "").upper()
 
-            # Using direct Bybit V5 Position Trading Stop endpoint via CCXT
             params = {
                 "category": "linear",
                 "symbol": formatted_symbol,
-                "stopLoss": formatted_sl,
+                "stopLoss": str(formatted_sl),
                 "slTriggerBy": "LastPrice",
-                "positionIdx": position_idx  # 0 for One-Way Mode, 1 for Long, 2 for Short in Hedge Mode
+                "positionIdx": position_idx,
             }
-            
-            response = self.exchange.private_linear_post_v5_position_trading_stop(params)
-            
-            if response.get("retCode") == 0:
-                logger.info(f"[SL SET SUCCESS] Symbol: {formatted_symbol} | SL Price: {formatted_sl}")
-                return True
-            else:
-                logger.error(f"[SL SET ERROR] Bybit Code {response.get('retCode')}: {response.get('retMsg')}")
+
+            candidates = [
+                "private_post_v5_position_trading_stop",
+                "private_linear_post_v5_position_trading_stop",
+                "privatePostV5PositionTradingStop",
+            ]
+            method = None
+            for name in candidates:
+                if hasattr(self.exchange, name):
+                    method = getattr(self.exchange, name)
+                    logger.info(f"[{symbol}] Using CCXT method '{name}' for trading_stop.")
+                    break
+
+            if method is None:
+                logger.critical(
+                    f"[{symbol}] FATAL: No CCXT trading_stop method found. "
+                    f"Available: {[m for m in dir(self.exchange) if 'trading_stop' in m.lower()]}"
+                )
                 return False
 
+            response = method(params)
+
+            if not isinstance(response, dict) or response.get("retCode") != 0:
+                logger.error(
+                    f"[SL SET ERROR] Symbol: {formatted_symbol} | "
+                    f"retCode: {response.get('retCode')} | retMsg: {response.get('retMsg')}"
+                )
+                return False
+
+            time.sleep(0.3)
+            try:
+                positions = self.exchange.fetch_positions([ccxt_symbol])
+                for pos in positions:
+                    if safe_float(pos.get("contracts", 0)) > MIN_DUST_THRESHOLD:
+                        live_sl = safe_float(pos.get("stopLoss", 0))
+                        if live_sl > 0 and abs(live_sl - formatted_sl) / formatted_sl < 0.005:
+                            logger.info(f"[SL VERIFIED] {formatted_symbol} SL=${live_sl} confirmed on exchange.")
+                            return True
+                        else:
+                            logger.error(
+                                f"[SL VERIFY FAILED] {formatted_symbol} expected ${formatted_sl}, "
+                                f"exchange reports ${live_sl}"
+                            )
+                            return False
+            except Exception as verify_err:
+                logger.warning(f"[{symbol}] Post-SL verification fetch failed (treating as success): {verify_err}")
+
+            logger.info(f"[SL SET SUCCESS] Symbol: {formatted_symbol} | SL Price: {formatted_sl}")
+            return True
         except Exception as e:
             logger.exception(f"[SL SET EXCEPTION] Failed to set Stop Loss for {symbol}: {e}")
             return False
 
     async def fetch_ticker_direct_async(self, symbol: str) -> float:
-        """Asynchronously fetches current ticker price directly via CCXT."""
         ccxt_symbol = format_ccxt_futures_symbol(symbol)
         try:
             async_config = {'enableRateLimit': True, 'options': {'defaultType': 'linear'}}
             async_public = ccxt_async.bybit(async_config)
-            
+
             if BYBIT_TESTNET:
                 async_public.set_sandbox_mode(True)
 
@@ -181,16 +257,15 @@ class BybitFuturesLiveExecutor:
             return 0.0
 
     async def fetch_tickers_batch_async(self, symbols: List[str]) -> Dict[str, float]:
-        """Asynchronously fetches multiple tickers directly via CCXT."""
         formatted_symbols = [format_ccxt_futures_symbol(s) for s in symbols]
         price_map = {}
         try:
             async_config = {'enableRateLimit': True, 'options': {'defaultType': 'linear'}}
             async_public = ccxt_async.bybit(async_config)
-            
+
             if BYBIT_TESTNET:
                 async_public.set_sandbox_mode(True)
-            
+
             tickers = await async_public.fetch_tickers(formatted_symbols)
             await async_public.close()
 
@@ -211,7 +286,7 @@ class BybitFuturesLiveExecutor:
             ask = safe_float(ticker.get('ask'))
             last = safe_float(ticker.get('last'))
             info = ticker.get('info', {})
-            
+
             mark_price = safe_float(ticker.get('markPrice') or info.get('markPrice') or info.get('indexPrice'))
 
             if last > 0:
@@ -234,12 +309,8 @@ class BybitFuturesLiveExecutor:
         except Exception as e:
             logger.error(f"[{ccxt_symbol}] Failed to fetch direct public ticker data: {e}")
             return {
-                "exec_price": 0.0,
-                "bid": 0.0,
-                "ask": 0.0,
-                "last": 0.0,
-                "mark_price": 0.0,
-                "spread_pct": 0.0
+                "exec_price": 0.0, "bid": 0.0, "ask": 0.0,
+                "last": 0.0, "mark_price": 0.0, "spread_pct": 0.0
             }
 
     def fetch_ticker_price(self, symbol: str) -> float:
@@ -285,7 +356,7 @@ class BybitFuturesLiveExecutor:
             for pos in positions:
                 pos_symbol = str(pos.get('symbol', '')).replace("/", "").replace(":", "").replace("_", "").replace("-", "").upper()
                 contracts = safe_float(pos.get('contracts', 0.0))
-                
+
                 if clean_target in pos_symbol or pos_symbol in clean_target:
                     if contracts > 0:
                         return {
@@ -300,42 +371,27 @@ class BybitFuturesLiveExecutor:
                             "error": False
                         }
             return {
-                "symbol": symbol,
-                "side": "NONE",
-                "contracts": 0.0,
-                "entry_price": 0.0,
-                "stop_loss": 0.0,
-                "take_profit": 0.0,
-                "leverage": 1.0,
-                "unrealized_pnl": 0.0,
-                "error": False
+                "symbol": symbol, "side": "NONE", "contracts": 0.0,
+                "entry_price": 0.0, "stop_loss": 0.0, "take_profit": 0.0,
+                "leverage": 1.0, "unrealized_pnl": 0.0, "error": False
             }
         except (ccxt.NetworkError, ccxt.ExchangeError, Exception) as e:
             logger.error(f"Failed to fetch futures position for {ccxt_symbol}: {e}")
             return {
-                "symbol": symbol,
-                "side": "NONE",
-                "contracts": 0.0,
-                "entry_price": 0.0,
-                "stop_loss": 0.0,
-                "take_profit": 0.0,
-                "leverage": 1.0,
-                "unrealized_pnl": 0.0,
-                "error": True
+                "symbol": symbol, "side": "NONE", "contracts": 0.0,
+                "entry_price": 0.0, "stop_loss": 0.0, "take_profit": 0.0,
+                "leverage": 1.0, "unrealized_pnl": 0.0, "error": True
             }
 
     def fetch_available_usdt_balance(self) -> float:
-        """Fetch wallet balance directly via standard CCXT balance queries or V5 account fallback."""
         try:
-            # First attempt: standard CCXT fetch_balance
             balance = self.exchange.fetch_balance({'type': 'linear'})
             usdt_free = safe_float(balance.get('USDT', {}).get('free', 0.0))
             if usdt_free == 0.0:
                 usdt_free = safe_float(balance.get('free', {}).get('USDT', 0.0))
             if usdt_free > 0.0:
                 return usdt_free
-                
-            # Fallback attempt: Query V5 UNIFIED account endpoint explicitly via private CCXT method
+
             res = self.exchange.privateGetV5AccountWalletBalance({'accountType': 'UNIFIED', 'coin': 'USDT'})
             list_data = res.get('result', {}).get('list', [])
             if list_data:
@@ -352,7 +408,6 @@ class BybitFuturesLiveExecutor:
         return self.fetch_available_usdt_balance()
 
     async def poll_market_and_positions(self, symbols: list):
-        """Asynchronous REST HTTP Polling loop direct to Bybit."""
         logger.info(f"Starting REST HTTP Polling loop (Interval: {POLL_INTERVAL_SECONDS}s)...")
         while True:
             try:
@@ -361,7 +416,7 @@ class BybitFuturesLiveExecutor:
                     continue
 
                 prices = await self.fetch_tickers_batch_async(symbols)
-                
+
                 for symbol in symbols:
                     current_price = prices.get(symbol, 0.0)
                     logger.debug(f"[{symbol}] Polled Market Price: ${current_price:.5f}")
@@ -369,40 +424,24 @@ class BybitFuturesLiveExecutor:
                     position = await self.get_futures_position_async(symbol)
                     if position["contracts"] > MIN_DUST_THRESHOLD:
                         logger.info(f"[{symbol}] Polled Active Position: {position['contracts']} contracts {position['side']}")
-
             except Exception as e:
                 logger.error(f"Error in REST market polling loop: {e}")
 
             await asyncio.sleep(POLL_INTERVAL_SECONDS)
 
-    def execute_live_order(
-        self, 
-        pair: str, 
-        direction: str = "BUY", 
-        entry_price: float = 0.0, 
-        stop_loss: float = 0.0, 
-        take_profit: float = 0.0,
-        amount_usd: float = 25.0,
-        leverage: int = 5.0,
-        account_balance: float = 100.0,
-        risk_pct: float = 1.0
-    ) -> bool:
+    def execute_live_order(self, pair: str, direction: str = "BUY", entry_price: float = 0.0,
+                           stop_loss: float = 0.0, take_profit: float = 0.0, amount_usd: float = 25.0,
+                           leverage: int = 5.0, account_balance: float = 100.0, risk_pct: float = 1.0) -> bool:
         clean_direction = direction.upper().strip()
-        
+
         if clean_direction not in ["BUY", "LONG", "SELL", "SHORT"]:
             logger.warning(f"[{pair}] Invalid order direction: {clean_direction}")
             return False
 
         res = self.order_futures_bybit(
-            symbol=pair, 
-            direction=clean_direction, 
-            amount_usd=amount_usd, 
-            entry_price=entry_price,
-            stop_loss=stop_loss, 
-            take_profit=take_profit,
-            leverage=leverage,
-            account_balance=account_balance,
-            risk_pct=risk_pct
+            symbol=pair, direction=clean_direction, amount_usd=amount_usd,
+            entry_price=entry_price, stop_loss=stop_loss, take_profit=take_profit,
+            leverage=leverage, account_balance=account_balance, risk_pct=risk_pct
         )
         if res.get("status") == "SUCCESS":
             return True
@@ -411,45 +450,48 @@ class BybitFuturesLiveExecutor:
             return False
 
     def execute_order_and_attach_sl(self, symbol: str, side: str, amount: float, target_sl: float) -> Dict[str, Any]:
-        """
-        Executes entry order first, then explicitly sets the SL position-wide.
-        """
-        # 1. Place entry order without relying on volatile IOC SL attachments
         order = self.order_futures_bybit(
-            symbol=symbol,
-            direction=side,
-            amount_usd=amount
+            symbol=symbol, direction=side, amount_usd=amount, stop_loss=target_sl
         )
 
-        # 2. Check for fill confirmation
         if order and order.get("status") == "SUCCESS":
-            logger.info(f"Order filled for {symbol}. Applying explicit post-execution Stop Loss at {target_sl}")
-            
-            # Determine positionIdx based on mode/side
-            pos_idx = 0  # Set to 1 (Long) or 2 (Short) if using Hedge Mode
-            
+            logger.info(f"Order filled for {symbol}. Verifying explicit post-execution Stop Loss at {target_sl}")
+
+            pos_idx = 0
+
             if target_sl > 0:
                 sl_success = self.set_position_trading_stop(
-                    symbol=symbol,
-                    stop_loss=target_sl,
-                    position_idx=pos_idx
+                    symbol=symbol, stop_loss=target_sl, position_idx=pos_idx
                 )
                 order["stop_loss_attached"] = sl_success
 
+                if not sl_success:
+                    logger.critical(
+                        f"🚨 [EMERGENCY GUARD] Failed to set exchange Stop Loss for {symbol} at ${target_sl}. "
+                        f"Closing position immediately to prevent naked risk exposure."
+                    )
+                    exec_qty = order.get("executed_qty", 0.0)
+                    fill_price = order.get("fill_price", 0.0)
+                    close_res = self.close_live_position_bybit(
+                        symbol=symbol, position_size=exec_qty, current_price=fill_price,
+                        outcome="EMERGENCY_SL_ATTACH_FAILURE"
+                    )
+                    send_telegram_notification(
+                        f"🚨 <b>EMERGENCY POSITION CLOSE</b>\n\n"
+                        f"<b>Symbol:</b> <code>{symbol}</code>\n"
+                        f"<b>Reason:</b> Failed to attach Exchange Stop Loss ({target_sl})\n"
+                        f"<b>Close Status:</b> {close_res.get('status')}"
+                    )
+                    return {
+                        "status": "FAILED",
+                        "error": "Emergency close triggered: exchange stop loss failed to attach."
+                    }
+
         return order
 
-    def order_futures_bybit(
-        self, 
-        symbol: str, 
-        direction: str, 
-        amount_usd: float, 
-        entry_price: float = 0.0,
-        stop_loss: float = 0.0, 
-        take_profit: float = 0.0,
-        leverage: float = 5.0,
-        account_balance: float = 100.0,
-        risk_pct: float = 1.0
-    ) -> Dict[str, Any]:
+    def order_futures_bybit(self, symbol: str, direction: str, amount_usd: float,
+                            entry_price: float = 0.0, stop_loss: float = 0.0, take_profit: float = 0.0,
+                            leverage: float = 5.0, account_balance: float = 100.0, risk_pct: float = 1.0) -> Dict[str, Any]:
         ccxt_symbol = format_ccxt_futures_symbol(symbol)
         dir_clean = direction.upper().strip()
         is_long = dir_clean in ["BUY", "LONG"]
@@ -480,7 +522,7 @@ class BybitFuturesLiveExecutor:
             return {"status": "FAILED", "error": dev_reason}
 
         if spread_pct > MAX_ALLOWED_SPREAD_PCT and not BYBIT_TESTNET:
-            logger.warning(f"[{symbol}] Order Rejected: High Spread detected ({spread_pct * 100:.3f}% > Max allowed {MAX_ALLOWED_SPREAD_PCT * 100:.2f}%).")
+            logger.warning(f"[{symbol}] Order Rejected: High Spread detected ({spread_pct * 100:.3f}%).")
             return {"status": "FAILED", "error": f"Spread too high ({spread_pct * 100:.3f}%)"}
 
         try:
@@ -492,13 +534,13 @@ class BybitFuturesLiveExecutor:
             risk_amount_usd = account_balance * (risk_pct / 100.0)
             sl_distance = abs(ref_price - stop_loss)
             target_contracts = risk_amount_usd / sl_distance
-            
+
             required_margin = (target_contracts * ref_price) / leverage
             if required_margin > amount_usd:
                 logger.info(f"[{symbol}] Fixed-Risk margin (${required_margin:.2f}) capped by Equal-Weight cap (${amount_usd:.2f}).")
                 required_margin = amount_usd
                 target_contracts = (required_margin * leverage) / ref_price
-            
+
             raw_qty = target_contracts
             trade_amount_usd = required_margin
         else:
@@ -506,7 +548,19 @@ class BybitFuturesLiveExecutor:
             notional_value = trade_amount_usd * leverage
             raw_qty = notional_value / ref_price
 
-        limit_price = ref_price * (1.0 + MAX_SLIPPAGE_PCT) if is_long else ref_price * (1.0 - MAX_SLIPPAGE_PCT)
+        # FIX #8: Maker (PostOnly) preferred; fallback to IOC if disabled
+        if USE_MAKER_ORDERS:
+            book = self.fetch_ticker_data(ccxt_symbol)
+            if is_long and book["bid"] > 0:
+                limit_price = book["bid"]
+            elif not is_long and book["ask"] > 0:
+                limit_price = book["ask"]
+            else:
+                limit_price = ref_price
+            params = {'timeInForce': 'PostOnly', 'reduceOnly': False}
+        else:
+            limit_price = ref_price * (1.0 + MAX_SLIPPAGE_PCT) if is_long else ref_price * (1.0 - MAX_SLIPPAGE_PCT)
+            params = {'timeInForce': 'IOC'}
 
         try:
             formatted_qty = safe_float(self.exchange.amount_to_precision(ccxt_symbol, raw_qty))
@@ -514,8 +568,6 @@ class BybitFuturesLiveExecutor:
         except Exception:
             formatted_qty = round(raw_qty, 4)
             formatted_limit_price = round(limit_price, 6)
-
-        params = {'timeInForce': 'IOC'}
 
         if stop_loss > 0:
             if is_long and stop_loss >= ref_price:
@@ -526,6 +578,7 @@ class BybitFuturesLiveExecutor:
                 target_sl = 0.0
             else:
                 target_sl = stop_loss
+                params['stopLoss'] = safe_float(self.exchange.price_to_precision(ccxt_symbol, target_sl))
         else:
             target_sl = 0.0
 
@@ -533,19 +586,23 @@ class BybitFuturesLiveExecutor:
             params['takeProfit'] = safe_float(self.exchange.price_to_precision(ccxt_symbol, take_profit))
 
         logger.info(
-            f"[{symbol}] Initiating Futures Limit {side.upper()} (IOC): Margin=${trade_amount_usd:.2f} @ {leverage}x "
+            f"[{symbol}] Initiating Futures {side.upper()} (TIF={params.get('timeInForce', 'IOC')}): Margin=${trade_amount_usd:.2f} @ {leverage}x "
             f"({formatted_qty} contracts @ Limit: ${formatted_limit_price:.6f})"
         )
 
         try:
-            order = self.exchange.create_order(
-                symbol=ccxt_symbol,
-                type='limit',
-                side=side,
-                amount=formatted_qty,
-                price=formatted_limit_price,
-                params=params
-            )
+            try:
+                order = self.exchange.create_order(
+                    symbol=ccxt_symbol, type='limit', side=side,
+                    amount=formatted_qty, price=formatted_limit_price, params=params
+                )
+            except ccxt.OrderImmediatelyFillable:
+                logger.warning(f"[{symbol}] PostOnly crossed spread. Retrying as GTC limit.")
+                params['timeInForce'] = 'GTC'
+                order = self.exchange.create_order(
+                    symbol=ccxt_symbol, type='limit', side=side,
+                    amount=formatted_qty, price=formatted_limit_price, params=params
+                )
 
             order_id = order.get("id")
             fill_price = safe_float(order.get("average") or order.get("price"))
@@ -567,25 +624,40 @@ class BybitFuturesLiveExecutor:
                         fill_price = pos_check["entry_price"] if pos_check["entry_price"] > 0 else ref_price
 
             if executed_qty <= 0:
-                logger.warning(f"[{symbol}] IOC order unfilled/cancelled due to slippage ceiling.")
-                return {"status": "FAILED", "error": "Limit IOC order unfilled due to slippage guard."}
+                logger.warning(f"[{symbol}] Order unfilled/cancelled due to slippage ceiling.")
+                return {"status": "FAILED", "error": "Limit order unfilled due to slippage guard."}
 
             if fill_price <= 0:
                 fill_price = ref_price
 
             logger.info(f"[{symbol}] Futures Order Executed: Side {side.upper()}, Price ${fill_price:.6f}, Qty {executed_qty}")
 
-            # Apply explicit post-execution Stop Loss via Bybit V5 Position Trading Stop API
+            # FIX #2: Emergency close on SL attach failure
             sl_attached = False
             if target_sl > 0:
                 sl_attached = self.set_position_trading_stop(
-                    symbol=symbol,
-                    stop_loss=target_sl,
-                    position_idx=0
+                    symbol=symbol, stop_loss=target_sl, position_idx=0
                 )
                 if not sl_attached:
-                    event_bus.arm_local_sl_guard(symbol, dir_clean, executed_qty, target_sl)
-            
+                    logger.critical(
+                        f"🚨 [EMERGENCY GUARD] Exchange SL attachment FAILED for {symbol} @ ${target_sl}. "
+                        f"Closing position immediately to prevent naked risk."
+                    )
+                    close_res = self.close_live_position_bybit(
+                        symbol=symbol, position_size=executed_qty, current_price=fill_price,
+                        outcome="EMERGENCY_SL_ATTACH_FAILURE"
+                    )
+                    send_telegram_notification(
+                        f"🚨 <b>EMERGENCY POSITION CLOSE</b>\n\n"
+                        f"<b>Symbol:</b> <code>{symbol}</code>\n"
+                        f"<b>Reason:</b> Exchange SL failed to attach\n"
+                        f"<b>Close Status:</b> {close_res.get('status')}"
+                    )
+                    return {
+                        "status": "FAILED",
+                        "error": "Emergency close triggered: exchange SL failed to attach."
+                    }
+
             return {
                 "status": "SUCCESS",
                 "order_id": order_id,
@@ -603,7 +675,7 @@ class BybitFuturesLiveExecutor:
     def close_live_position_bybit(self, symbol: str, position_size: float, current_price: float, outcome: str = "CLOSE") -> Dict[str, Any]:
         ccxt_symbol = format_ccxt_futures_symbol(symbol)
         pos_info = self.get_futures_position(ccxt_symbol)
-        
+
         if pos_info.get("error"):
             logger.error(f"[{symbol}] Cannot attempt position close due to API/network error during verification.")
             return {"status": "FAILED", "error": "Network/API glitch preventing close verification"}
@@ -628,12 +700,54 @@ class BybitFuturesLiveExecutor:
             finally:
                 release_db_connection(conn)
 
+        # FIX #1: Ghost-close branch now pulls real PnL from Bybit
         if contracts < MIN_DUST_THRESHOLD:
             set_asset_cooldown(symbol, hours=4)
             event_bus.disarm_local_sl_guard(symbol)
 
             if trade_id:
-                finalize_trade_in_db(trade_id, current_price, 0.0, 0.0, "BREAKEVEN")
+                real_closed_pnl = None
+                real_fee = 0.0
+                verified_exit = current_price
+                try:
+                    formatted_symbol = symbol.replace("/", "").replace(":USDT", "").replace("_", "").upper()
+                    cpnl_resp = self.exchange.private_get_v5_position_closed_pnl({
+                        "category": "linear",
+                        "symbol": formatted_symbol,
+                        "limit": 1
+                    })
+                    records = cpnl_resp.get("result", {}).get("list", [])
+                    if records:
+                        latest = records[0]
+                        real_closed_pnl = safe_float(latest.get("closedPnl"), 0.0)
+                        real_fee = abs(safe_float(latest.get("openFee"), 0.0)) + abs(safe_float(latest.get("closeFee"), 0.0))
+                        verified_exit = safe_float(latest.get("avgExitPrice"), current_price)
+                except Exception as pnl_err:
+                    logger.warning(f"[{symbol}] Ghost-close PnL lookup failed: {pnl_err}")
+
+                conn = get_db_connection()
+                if conn:
+                    try:
+                        with conn.cursor() as cur:
+                            cur.execute(
+                                "SELECT direction, entry_price, position_size, account_balance FROM trade_setups WHERE id = %s;",
+                                (trade_id,)
+                            )
+                            row = cur.fetchone()
+                            if row:
+                                direction, entry_p, pos_qty, acc_bal = row
+                                pnl_usd, pnl_pct, outcome_verified = calculate_pnl(
+                                    direction=direction,
+                                    entry_price=safe_float(entry_p),
+                                    current_price=verified_exit,
+                                    quantity=safe_float(pos_qty),
+                                    account_balance=safe_float(acc_bal, 100.0),
+                                    total_fees=real_fee,
+                                    exchange_closed_pnl=real_closed_pnl
+                                )
+                                finalize_trade_in_db(trade_id, verified_exit, pnl_usd, pnl_pct, outcome_verified, fee_usd=real_fee)
+                    finally:
+                        release_db_connection(conn)
 
             return {
                 "status": "FORCE_CLOSED_DB_ONLY",
@@ -642,15 +756,11 @@ class BybitFuturesLiveExecutor:
                 "executed_qty": position_size
             }
 
-        # Check for both 'BUY' and 'LONG'
         close_side = 'sell' if current_side in ['BUY', 'LONG'] else 'buy'
         try:
             order = self.exchange.create_order(
-                symbol=ccxt_symbol,
-                type='market',
-                side=close_side,
-                amount=contracts,
-                params={'reduceOnly': True}
+                symbol=ccxt_symbol, type='market', side=close_side,
+                amount=contracts, params={'reduceOnly': True}
             )
 
             fill_price = safe_float(order.get("average") or order.get("price"))

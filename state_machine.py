@@ -10,10 +10,26 @@ from common import (
 from event_bus import event_bus
 from live_executor import LiveExecutionEngine
 
+try:
+    from config import STRATEGY_CONFIG
+except ImportError:
+    STRATEGY_CONFIG = {"risk_pct": 1.0}
+
 logger = logging.getLogger("state_machine")
+
+
+def safe_float(val, default=0.0):
+    if val is None:
+        return default
+    try:
+        return float(val)
+    except (ValueError, TypeError):
+        return default
+
 
 class StateMachineEngine:
     """Single-threaded state machine manager that processes trade signals, syncs state, and dispatches executions."""
+
     def __init__(self, executor: LiveExecutionEngine):
         self.executor = executor
 
@@ -37,12 +53,16 @@ class StateMachineEngine:
     async def _handle_trade_signal(self, payload: dict):
         symbol = payload["symbol"]
         direction = payload["direction"].upper()
-        entry_price = float(payload.get("entry_price", 0.0))
-        stop_loss = float(payload.get("stop_loss", 0.0))
-        take_profit = float(payload.get("take_profit", 0.0))
-        amount_usd = float(payload.get("amount_usd", 25.0))
-        account_balance = float(payload.get("account_balance", 100.0))
-        leverage = int(payload.get("leverage", 10))
+        entry_price = safe_float(payload.get("entry_price"), 0.0)
+        stop_loss = safe_float(payload.get("stop_loss"), 0.0)
+        take_profit = safe_float(payload.get("take_profit"), 0.0)
+        amount_usd = safe_float(payload.get("amount_usd"), 25.0)
+        account_balance = safe_float(payload.get("account_balance"), 100.0)
+        leverage = int(safe_float(payload.get("leverage"), 10))
+
+        # FIX #6: Extract risk_pct dynamically from payload / STRATEGY_CONFIG default
+        default_risk = safe_float(STRATEGY_CONFIG.get("risk_pct"), 1.0) if isinstance(STRATEGY_CONFIG, dict) else 1.0
+        risk_pct_value = safe_float(payload.get("risk_pct"), default=default_risk)
 
         acquired = await event_bus.guard.try_acquire_trade_lock(symbol)
         if not acquired:
@@ -50,7 +70,20 @@ class StateMachineEngine:
             return
 
         try:
-            # Verify global max concurrent open positions before execution
+            conn_check = get_db_connection()
+            if conn_check:
+                try:
+                    with conn_check.cursor() as cur:
+                        cur.execute("""
+                            SELECT COUNT(*) FROM trade_setups 
+                            WHERE pair = %s AND status = 'EXECUTED' AND trade_state = 'OPEN';
+                        """, (symbol,))
+                        if cur.fetchone()[0] > 0:
+                            logger.warning(f"[{symbol}] Trade setup already OPEN in database. Skipping duplicate execution.")
+                            return
+                finally:
+                    release_db_connection(conn_check)
+
             conn = get_db_connection()
             if conn:
                 try:
@@ -67,8 +100,7 @@ class StateMachineEngine:
                     release_db_connection(conn)
 
             loop = asyncio.get_running_loop()
-            
-            # Check active positions directly on exchange prior to placing entry orders
+
             pos_info = await loop.run_in_executor(None, self.executor.get_futures_position, symbol)
             if pos_info.get("contracts", 0.0) > 0.001:
                 logger.warning(
@@ -77,7 +109,10 @@ class StateMachineEngine:
                 )
                 return
 
-            logger.info(f"[{symbol}] Processing {direction} trade signal via State Machine (Ref Entry Price: ${entry_price:.5f})...")
+            logger.info(
+                f"[{symbol}] Processing {direction} trade signal via State Machine "
+                f"(Ref Entry Price: ${entry_price:.5f} | Risk: {risk_pct_value}%)..."
+            )
 
             exec_result = await loop.run_in_executor(
                 None,
@@ -90,24 +125,24 @@ class StateMachineEngine:
                 take_profit,
                 leverage,
                 account_balance,
-                1.0  # Fixed Risk Pct (1%)
+                risk_pct_value  # FIX #6: was hardcoded 1.0
             )
 
             if exec_result.get("status") == "SUCCESS":
                 executed_qty = exec_result["executed_qty"]
                 fill_price = exec_result["fill_price"]
                 sl_attached = exec_result.get("stop_loss_attached", False)
-                
+
                 conn_db = get_db_connection()
                 if conn_db:
                     try:
                         with conn_db.cursor() as cur:
                             cur.execute("""
                                 INSERT INTO trade_setups 
-                                (pair, direction, entry_price, stop_loss, take_profit, position_size, account_balance, status, trade_state)
-                                VALUES (%s, %s, %s, %s, %s, %s, %s, 'EXECUTED', 'OPEN')
+                                (pair, direction, entry_price, stop_loss, take_profit, position_size, account_balance, risk_pct, status, trade_state, updated_at)
+                                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'EXECUTED', 'OPEN', NOW())
                                 RETURNING id;
-                            """, (symbol, direction, fill_price, stop_loss, take_profit, executed_qty, account_balance))
+                            """, (symbol, direction, fill_price, stop_loss, take_profit, executed_qty, account_balance, risk_pct_value))
                             trade_id = cur.fetchone()[0]
                             conn_db.commit()
 
@@ -119,6 +154,7 @@ class StateMachineEngine:
                             f"<b>Pair:</b> <code>{symbol}</code>\n"
                             f"<b>Entry:</b> ${fill_price:.5f}\n"
                             f"<b>Qty:</b> {executed_qty}\n"
+                            f"<b>Risk %:</b> {risk_pct_value}%\n"
                             f"<b>SL:</b> ${stop_loss:.5f} ({sl_status}) | <b>TP:</b> ${take_profit:.5f}"
                         )
                     finally:
@@ -145,7 +181,7 @@ class StateMachineEngine:
             if triggered:
                 logger.critical(f"[{clean_symbol}] EMERGENCY LOCAL SL TRIGGERED ({direction}) @ ${price:.5f}")
                 event_bus.disarm_local_sl_guard(clean_symbol)
-                
+
                 loop = asyncio.get_running_loop()
                 await loop.run_in_executor(
                     None,
@@ -159,7 +195,8 @@ class StateMachineEngine:
     async def _handle_execution_report(self, report: dict):
         symbol = report.get("symbol", "").replace("_", "")
         order_status = report.get("orderStatus")
-        price = float(report.get("avgPrice", 0.0))
-        
+        price = safe_float(report.get("avgPrice"), 0.0)
+
         if order_status in ["Filled", "Cancelled"]:
             logger.info(f"[{symbol}] Bybit execution report event received: Status={order_status}, Price={price}")
+			

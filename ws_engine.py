@@ -1,3 +1,4 @@
+
 import os
 import asyncio
 import json
@@ -13,26 +14,24 @@ from common import get_db_connection, release_db_connection, finalize_trade_in_d
 
 logger = logging.getLogger("ws_engine")
 
+
 class UnifiedWebSocketEngine:
     def __init__(self, symbols: List[str], is_testnet: bool = True, api_key: str = None, api_secret: str = None):
         self.symbols = [
-            s.split(":")[0].replace("/", "").replace("_", "").upper() 
+            s.split(":")[0].replace("/", "").replace("_", "").upper()
             for s in symbols
         ]
-        
+
         self.last_prices: Dict[str, float] = {}
         self.is_testnet = is_testnet
         self.api_key = api_key
         self.api_secret = api_secret
-        
-        # FIX: Point WebSockets directly to Bybit's official stream endpoints (not Cloudflare Worker)
+
         ws_base_domain = "stream-testnet.bybit.com" if is_testnet else "stream.bybit.com"
-        
-        self.ws_endpoints = [
-            f"wss://{ws_base_domain}/v5/public/linear"
-        ]
+
+        self.ws_endpoints = [f"wss://{ws_base_domain}/v5/public/linear"]
         self.private_ws_endpoint = f"wss://{ws_base_domain}/v5/private"
-            
+
         self.current_ep_idx = 0
 
     def _get_active_endpoint(self) -> str:
@@ -51,10 +50,13 @@ class UnifiedWebSocketEngine:
             pass
 
     async def _authenticate_private_ws(self, ws) -> bool:
+        """
+        FIX #10: Loop-reads frames until auth response arrives, ignoring pings/subscriptions.
+        """
         if not self.api_key or not self.api_secret:
             logger.warning("Private WebSocket credentials not provided. Skipping private stream authentication.")
             return False
-        
+
         expires = int((time.time() + 10) * 1000)
         signature_payload = f"GET/realtime{expires}"
         signature = hmac.new(
@@ -63,32 +65,63 @@ class UnifiedWebSocketEngine:
             hashlib.sha256
         ).hexdigest()
 
-        auth_payload = {
-            "op": "auth",
-            "args": [self.api_key, expires, signature]
-        }
+        auth_payload = {"op": "auth", "args": [self.api_key, expires, signature]}
         await ws.send(json.dumps(auth_payload))
-        response = await ws.recv()
-        data = json.loads(response)
-        if data.get("success"):
-            logger.info("Bybit Private WebSocket Authenticated Successfully.")
-            return True
-        else:
-            logger.error(f"Bybit Private WebSocket Authentication Failed: {data}")
-            return False
+
+        deadline = time.time() + 5.0
+        while time.time() < deadline:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                break
+            try:
+                raw = await asyncio.wait_for(ws.recv(), timeout=min(remaining, 1.5))
+            except asyncio.TimeoutError:
+                continue
+            except Exception as e:
+                logger.error(f"WS auth frame read error: {e}")
+                return False
+
+            try:
+                data = json.loads(raw)
+            except Exception:
+                continue
+
+            op = data.get("op")
+            if op == "auth":
+                if data.get("success") is True:
+                    logger.info("Bybit Private WebSocket Authenticated Successfully.")
+                    return True
+                logger.error(f"Bybit Private WebSocket Authentication Failed: {data.get('ret_msg')}")
+                return False
+
+            if data.get("ret_msg") == "pong" or data.get("op") == "pong":
+                continue
+
+        logger.error("WebSocket auth response timed out.")
+        return False
 
     async def _handle_private_execution(self, execution_data: dict):
         try:
             exec_type = execution_data.get("execType")
             order_status = execution_data.get("orderStatus")
-            
+
             if order_status not in ["Filled", "Deactivated", "Cancelled"] and exec_type not in ["Trade"]:
                 return
 
             symbol = execution_data.get("symbol")
             exec_price = float(execution_data.get("execPrice", 0) or 0)
             closed_pnl = float(execution_data.get("closedPnl", 0) or 0)
-            
+
+            # FIX #10: Only finalize trades on true close events; pass through entry fills
+            closed_size = float(execution_data.get("closedSize", 0) or 0)
+            if exec_type == "Trade" and closed_size <= 0:
+                await event_bus.publish("EXECUTION_EVENT", {
+                    "symbol": symbol,
+                    "order_status": order_status,
+                    "exec_type": exec_type
+                })
+                return
+
             if order_status == "Filled" or exec_type == "Trade":
                 conn = get_db_connection()
                 if not conn:
@@ -106,17 +139,14 @@ class UnifiedWebSocketEngine:
                         if row:
                             trade_id, direction, entry_price, position_size, account_balance = row
                             account_balance = float(account_balance or 100.0)
-                            
+
                             pnl_usd = closed_pnl
                             pnl_pct = (pnl_usd / account_balance) * 100.0 if account_balance > 0 else 0.0
                             outcome = "WIN" if pnl_usd > 0 else ("LOSS" if pnl_usd < 0 else "BREAKEVEN")
-                            
+
                             finalize_trade_in_db(
-                                trade_id=trade_id,
-                                exit_price=exec_price,
-                                pnl_usd=pnl_usd,
-                                pnl_pct=pnl_pct,
-                                outcome=outcome
+                                trade_id=trade_id, exit_price=exec_price,
+                                pnl_usd=pnl_usd, pnl_pct=pnl_pct, outcome=outcome
                             )
                             logger.info(f"[Private WS Execution] Trade #{trade_id} ({symbol}) finalized via execution stream. PnL: ${pnl_usd:.2f}")
                 except Exception as db_err:
@@ -145,7 +175,7 @@ class UnifiedWebSocketEngine:
                 async with websockets.connect(self.private_ws_endpoint, ssl=ssl_context, open_timeout=20, close_timeout=5) as ws:
                     logger.info(f"Connected to Bybit Private Feed: {self.private_ws_endpoint}")
                     retry_delay = 5
-                    
+
                     if not await self._authenticate_private_ws(ws):
                         await asyncio.sleep(10)
                         continue

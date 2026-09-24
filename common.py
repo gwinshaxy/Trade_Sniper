@@ -5,15 +5,10 @@ from psycopg2 import pool
 import requests
 from dotenv import load_dotenv
 
-# Unset environment proxies early to avoid 407 Proxy Authentication Required issues
-#for proxy_var in ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"]:
-    #os.environ.pop(proxy_var, None)
-
 base_dir = os.path.dirname(os.path.abspath(__file__))
 env_path = os.path.join(base_dir, ".env")
 load_dotenv(dotenv_path=env_path)
 
-# Initialize single logger instance with handler check guard
 logger = logging.getLogger("trading_agent")
 if not logger.handlers:
     handler = logging.StreamHandler()
@@ -44,28 +39,19 @@ def init_db_pool():
     global _db_pool
     if _db_pool is not None:
         return
-
     try:
         if DB_URL:
             _db_pool = pool.ThreadedConnectionPool(1, 10, DB_URL)
         elif DB_PASS:
             _db_pool = pool.ThreadedConnectionPool(
-                minconn=1,
-                maxconn=10,
-                host=DB_HOST,
-                port=DB_PORT,
-                dbname=DB_NAME,
-                user=DB_USER,
-                password=DB_PASS,
-                sslmode=DB_SSLMODE,
-                keepalives=1,
-                keepalives_idle=30,
-                keepalives_interval=10,
-                keepalives_count=5
+                minconn=1, maxconn=10,
+                host=DB_HOST, port=DB_PORT, dbname=DB_NAME,
+                user=DB_USER, password=DB_PASS, sslmode=DB_SSLMODE,
+                keepalives=1, keepalives_idle=30,
+                keepalives_interval=10, keepalives_count=5
             )
         else:
             raise ValueError("Neither DATABASE_URL/DB_URL nor DB_PASS environment variables are defined!")
-        
         logger.info("Database connection pool initialized successfully.")
     except Exception as e:
         logger.error(f"Failed to initialize DB connection pool: {e}")
@@ -150,9 +136,10 @@ def finalize_trade_in_db(trade_id: int, exit_price: float, pnl_usd: float, pnl_p
                     pnl_pct = %s, 
                     fee_usd = %s,
                     outcome = %s, 
-                    closed_at = CURRENT_TIMESTAMP 
+                    closed_at = CURRENT_TIMESTAMP,
+                    updated_at = CURRENT_TIMESTAMP
                 WHERE id = %s;
-            """, (round(exit_price, 5), pnl_usd, pnl_pct, fee_usd, outcome, trade_id))
+            """, (round(exit_price, 8), round(pnl_usd, 4), round(pnl_pct, 4), round(fee_usd, 4), outcome, trade_id))
             conn.commit()
             logger.info(f"Database Record #{trade_id} successfully finalized with state CLOSED (PnL: ${pnl_usd:.2f}, Fees: ${fee_usd:.2f}).")
 
@@ -165,7 +152,6 @@ def finalize_trade_in_db(trade_id: int, exit_price: float, pnl_usd: float, pnl_p
 
 
 def normalize_symbol(symbol: str) -> str:
-    """Normalizes any input symbol to a uniform clean string (e.g. SOLUSDT)."""
     if not symbol:
         return ""
     base = symbol.split(":")[0].strip()
@@ -173,7 +159,6 @@ def normalize_symbol(symbol: str) -> str:
 
 
 def check_asset_cooldown(symbol: str) -> bool:
-    """Returns True if the asset is currently in a active cooldown period."""
     conn = get_db_connection()
     if not conn:
         return False
@@ -195,7 +180,6 @@ def check_asset_cooldown(symbol: str) -> bool:
 
 
 def set_asset_cooldown(symbol: str, hours: int = 4):
-    """Sets a cooldown timer for an asset starting from current timestamp."""
     conn = get_db_connection()
     if not conn:
         return
@@ -226,7 +210,7 @@ def verify_base_schema():
 
     try:
         cursor = conn.cursor()
-        
+
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS trade_setups (
                 id SERIAL PRIMARY KEY,
@@ -249,10 +233,19 @@ def verify_base_schema():
                 highest_price NUMERIC(18, 8),
                 trailing_stop_price NUMERIC(18, 8),
                 created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
                 closed_at TIMESTAMP WITH TIME ZONE
             );
         """)
-        
+
+        cursor.execute("ALTER TABLE trade_setups ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP;")
+
+        cursor.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_trade_setups_open_pair
+            ON trade_setups (pair)
+            WHERE trade_state IN ('OPEN', 'EXECUTED', 'BE_LOCKED', 'TRAILING');
+        """)
+
         trade_columns = [
             "stop_loss NUMERIC(18, 8)",
             "take_profit NUMERIC(18, 8)",
@@ -266,6 +259,7 @@ def verify_base_schema():
             "outcome VARCHAR(20)",
             "highest_price NUMERIC(18, 8)",
             "trailing_stop_price NUMERIC(18, 8)",
+            "updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP",
             "closed_at TIMESTAMP WITH TIME ZONE"
         ]
         for col in trade_columns:
@@ -329,21 +323,23 @@ def verify_base_schema():
         release_db_connection(conn)
 
 
-def calculate_pnl(direction: str, entry_price: float, current_price: float, quantity: float, account_balance: float = 100.0, total_fees: float = 0.0) -> tuple:
-    """Calculates Net PnL taking actual exchange fill price and trading fees into account."""
-    dir_clean = str(direction).strip().upper()
-    
-    if dir_clean in ["BUY", "LONG"]:
-        gross_pnl = (current_price - entry_price) * quantity
-    elif dir_clean in ["SELL", "SHORT"]:
-        gross_pnl = (entry_price - current_price) * quantity
+def calculate_pnl(direction: str, entry_price: float, current_price: float, quantity: float, account_balance: float = 100.0, total_fees: float = 0.0, exchange_closed_pnl: float = None) -> tuple:
+    """FIX #1: Accepts optional exchange_closed_pnl to write real exchange-reported PnL."""
+    if exchange_closed_pnl is not None:
+        pnl_usd = float(exchange_closed_pnl) - abs(total_fees)
     else:
-        gross_pnl = 0.0
+        dir_clean = str(direction).strip().upper()
+        if dir_clean in ["BUY", "LONG"]:
+            gross_pnl = (current_price - entry_price) * quantity
+        elif dir_clean in ["SELL", "SHORT"]:
+            gross_pnl = (entry_price - current_price) * quantity
+        else:
+            gross_pnl = 0.0
+        pnl_usd = gross_pnl - abs(total_fees)
 
-    pnl_usd = gross_pnl - abs(total_fees)
     pnl_pct = (pnl_usd / account_balance) * 100.0 if account_balance > 0 else 0.0
     outcome = "WIN" if pnl_usd > 0 else ("LOSS" if pnl_usd < 0 else "BREAKEVEN")
-    
+
     return round(pnl_usd, 4), round(pnl_pct, 4), outcome
 
 
@@ -353,7 +349,7 @@ def send_telegram_notification(message: str) -> bool:
 
     if not bot_token or not chat_id:
         return False
-        
+
     url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
     payload = {"chat_id": chat_id, "text": message, "parse_mode": "HTML"}
     try:
@@ -424,7 +420,7 @@ def check_daily_circuit_breaker(max_loss_pct: float = 3.0, account_balance: floa
         """)
         row = cursor.fetchone()
         cursor.close()
-        
+
         daily_pnl = float(row[0]) if row and row[0] is not None else 0.0
         max_loss_usd = -1 * abs(account_balance * (max_loss_pct / 100.0))
         return daily_pnl <= max_loss_usd
@@ -443,13 +439,11 @@ def ensure_schema_updated():
         return
     try:
         with conn.cursor() as cur:
-            cur.execute(
-                """
+            cur.execute("""
                 ALTER TABLE trade_setups 
-                ADD COLUMN IF NOT EXISTS highest_price NUMERIC,
-                ADD COLUMN IF NOT EXISTS trailing_stop_price NUMERIC;
-                """
-            )
+                ADD COLUMN IF NOT EXISTS highest_price NUMERIC(18, 8),
+                ADD COLUMN IF NOT EXISTS trailing_stop_price NUMERIC(18, 8);
+            """)
             conn.commit()
             logger.info("Schema verification: 'highest_price' and 'trailing_stop_price' columns ready.")
     except Exception as e:

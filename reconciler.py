@@ -1,12 +1,14 @@
 import logging
 import time
+import threading
 from typing import Dict, List, Set
 from common import (
     get_db_connection,
     release_db_connection,
     send_telegram_notification,
     set_asset_cooldown,
-    finalize_trade_in_db
+    finalize_trade_in_db,
+    calculate_pnl
 )
 from live_executor import BybitFuturesLiveExecutor, format_ccxt_futures_symbol
 
@@ -15,29 +17,28 @@ logger = logging.getLogger("reconciler")
 DUST_THRESHOLD = 0.001
 RETRY_THRESHOLD = 3
 
+# FIX #9: Thread-safe lock for reconciler shared state
+reconciler_lock = threading.Lock()
 consecutive_zero_counts: Dict[int, int] = {}
 
-# Architectural Fix 1: Memory lock / Grace period cache for recently touched or opened pairs
 RECENTLY_OPENED_CACHE: Dict[str, float] = {}
 GRACE_PERIOD_SECONDS = 15.0
 
 
 def mark_symbol_recently_opened(ccxt_symbol: str) -> None:
-    """Registers a symbol in the memory lock cache to prevent race condition false-positive orphan detection."""
     formatted = format_ccxt_futures_symbol(ccxt_symbol)
-    RECENTLY_OPENED_CACHE[formatted] = time.time()
-    logger.debug(f"[{formatted}] Added to RECENTLY_OPENED_CACHE with grace period of {GRACE_PERIOD_SECONDS}s.")
+    with reconciler_lock:
+        RECENTLY_OPENED_CACHE[formatted] = time.time()
+    logger.debug(f"[{formatted}] Added to RECENTLY_OPENED_CACHE.")
 
 
 def is_symbol_under_grace_period(ccxt_symbol: str) -> bool:
-    """Checks whether a symbol is currently within the grace period window."""
     formatted = format_ccxt_futures_symbol(ccxt_symbol)
-    if formatted in RECENTLY_OPENED_CACHE:
-        elapsed = time.time() - RECENTLY_OPENED_CACHE[formatted]
-        if elapsed < GRACE_PERIOD_SECONDS:
-            return True
-        else:
-            # Expired, clean it up
+    with reconciler_lock:
+        if formatted in RECENTLY_OPENED_CACHE:
+            elapsed = time.time() - RECENTLY_OPENED_CACHE[formatted]
+            if elapsed < GRACE_PERIOD_SECONDS:
+                return True
             del RECENTLY_OPENED_CACHE[formatted]
     return False
 
@@ -61,10 +62,6 @@ def check_active_or_pending_orders(executor: BybitFuturesLiveExecutor, ccxt_symb
 
 
 def fetch_all_live_exchange_positions(executor: BybitFuturesLiveExecutor) -> Dict[str, dict]:
-    """
-    Fetch all active futures positions across the exchange using uniform symbol normalization.
-    Returns empty dict on network error to avoid false ghost triggers.
-    """
     active_positions = {}
     try:
         positions = executor.exchange.fetch_positions()
@@ -105,13 +102,11 @@ def reconcile_open_trades(executor: BybitFuturesLiveExecutor) -> int:
 
     try:
         with conn.cursor() as cursor:
-            cursor.execute(
-                """
+            cursor.execute("""
                 SELECT id, pair, direction, entry_price, position_size, account_balance, stop_loss, take_profit 
                 FROM trade_setups 
                 WHERE trade_state IN ('OPEN', 'EXECUTED', 'BE_LOCKED', 'TRAILING');
-                """
-            )
+            """)
             open_db_trades = cursor.fetchall()
     except Exception as e:
         logger.error(f"Error fetching open trades for reconciliation: {e}")
@@ -122,10 +117,11 @@ def reconcile_open_trades(executor: BybitFuturesLiveExecutor) -> int:
     reconciled_count = 0
     current_trade_ids: Set[int] = {trade[0] for trade in open_db_trades}
 
-    # Clean up tracking cache for trades no longer open in DB
-    for cached_id in list(consecutive_zero_counts.keys()):
-        if cached_id not in current_trade_ids:
-            del consecutive_zero_counts[cached_id]
+    # FIX #9: Thread-safe cache cleanup
+    with reconciler_lock:
+        for cached_id in list(consecutive_zero_counts.keys()):
+            if cached_id not in current_trade_ids:
+                del consecutive_zero_counts[cached_id]
 
     live_exchange_positions = fetch_all_live_exchange_positions(executor)
     tracked_ccxt_symbols: Set[str] = set()
@@ -143,7 +139,6 @@ def reconcile_open_trades(executor: BybitFuturesLiveExecutor) -> int:
                 if pos_info_fallback.get("contracts", 0.0) > DUST_THRESHOLD:
                     pos_info = pos_info_fallback
 
-            # Skip cycle if network error occurs
             if not pos_info or pos_info.get("error", True) or "contracts" not in pos_info:
                 logger.warning(f"[{pair}] API or connectivity glitch detected during check. Preserving state & skipping cycle.")
                 continue
@@ -152,57 +147,85 @@ def reconcile_open_trades(executor: BybitFuturesLiveExecutor) -> int:
 
             if live_contracts < DUST_THRESHOLD:
                 if check_active_or_pending_orders(executor, ccxt_symbol):
-                    consecutive_zero_counts[trade_id] = 0
+                    with reconciler_lock:
+                        consecutive_zero_counts[trade_id] = 0
                     continue
 
-                consecutive_zero_counts[trade_id] = consecutive_zero_counts.get(trade_id, 0) + 1
-                current_zeros = consecutive_zero_counts[trade_id]
+                with reconciler_lock:
+                    consecutive_zero_counts[trade_id] = consecutive_zero_counts.get(trade_id, 0) + 1
+                    current_zeros = consecutive_zero_counts[trade_id]
 
                 if current_zeros < RETRY_THRESHOLD:
                     logger.info(f"[{pair}] Zero contracts detected ({current_zeros}/{RETRY_THRESHOLD}). Waiting for confirmation.")
                     continue
 
                 logger.warning(f"🚨 GHOST DB RECORD CONFIRMED: Trade #{trade_id} ({pair}) reached zero checks limit. Auto-closing...")
-                
+
+                # FIX #1: Query Bybit for verified closed PnL instead of writing 0.0
                 exit_price = float(entry_price)
+                real_closed_pnl = None
+                real_fee = 0.0
                 try:
-                    ticker = executor.exchange.fetch_ticker(ccxt_symbol)
-                    exit_price = float(ticker.get('last') or ticker.get('close') or entry_price)
-                except Exception:
-                    pass
+                    formatted_symbol = pair.replace("/", "").replace(":USDT", "").replace("_", "").upper()
+                    cpnl_resp = executor.exchange.private_get_v5_position_closed_pnl({
+                        "category": "linear",
+                        "symbol": formatted_symbol,
+                        "limit": 1
+                    })
+                    records = cpnl_resp.get("result", {}).get("list", [])
+                    if records:
+                        latest = records[0]
+                        real_closed_pnl = float(latest.get("closedPnl", 0) or 0)
+                        real_fee = abs(float(latest.get("openFee", 0) or 0)) + abs(float(latest.get("closeFee", 0) or 0))
+                        exit_price = float(latest.get("avgExitPrice", 0) or entry_price)
+                    else:
+                        ticker = executor.exchange.fetch_ticker(ccxt_symbol)
+                        exit_price = float(ticker.get("last") or ticker.get("close") or entry_price)
+                except Exception as e:
+                    logger.warning(f"[{pair}] Failed to fetch closed PnL for ghost trade #{trade_id}: {e}")
 
                 bal = float(account_balance or 100.0)
-                from common import calculate_pnl
-                pnl_usd, pnl_pct, outcome = calculate_pnl(direction, float(entry_price), exit_price, float(position_size), bal)
+                pnl_usd, pnl_pct, outcome = calculate_pnl(
+                    direction=direction,
+                    entry_price=float(entry_price),
+                    current_price=exit_price,
+                    quantity=float(position_size),
+                    account_balance=bal,
+                    total_fees=real_fee,
+                    exchange_closed_pnl=real_closed_pnl
+                )
 
                 finalize_trade_in_db(
                     trade_id=trade_id,
                     exit_price=exit_price,
                     pnl_usd=pnl_usd,
                     pnl_pct=pnl_pct,
-                    outcome=outcome
+                    outcome=outcome,
+                    fee_usd=real_fee
                 )
 
                 set_asset_cooldown(pair, hours=2)
                 reconciled_count += 1
-                del consecutive_zero_counts[trade_id]
+
+                with reconciler_lock:
+                    consecutive_zero_counts.pop(trade_id, None)
 
                 send_telegram_notification(
                     f"<b>⚠️ DB RECONCILIATION APPLIED</b>\n\n"
                     f"<b>Trade ID:</b> <code>#{trade_id}</code>\n"
                     f"<b>Pair:</b> <code>{pair}</code>\n"
                     f"<b>Action:</b> <code>AUTO_CLOSED (Ghost Record)</code>\n"
-                    f"<b>Reason:</b> Position closed on exchange over {RETRY_THRESHOLD} checks."
+                    f"<b>Exchange PnL:</b> <code>${real_closed_pnl}</code>"
                 )
             else:
-                consecutive_zero_counts[trade_id] = 0
+                with reconciler_lock:
+                    consecutive_zero_counts[trade_id] = 0
 
-                # Sync SL/TP parameters to DB if missing
                 ex_pos = live_exchange_positions.get(ccxt_symbol)
                 if ex_pos:
                     live_sl = ex_pos.get('stop_loss', 0.0)
                     live_tp = ex_pos.get('take_profit', 0.0)
-                    
+
                     db_sl_val = float(db_sl or 0.0)
                     db_tp_val = float(db_tp or 0.0)
 
@@ -214,7 +237,8 @@ def reconcile_open_trades(executor: BybitFuturesLiveExecutor) -> int:
                                     cursor.execute("""
                                         UPDATE trade_setups 
                                         SET stop_loss = COALESCE(NULLIF(%s, 0.0), stop_loss),
-                                            take_profit = COALESCE(NULLIF(%s, 0.0), take_profit)
+                                            take_profit = COALESCE(NULLIF(%s, 0.0), take_profit),
+                                            updated_at = CURRENT_TIMESTAMP
                                         WHERE id = %s;
                                     """, (live_sl, live_tp, trade_id))
                                     conn_sync.commit()
@@ -227,17 +251,16 @@ def reconcile_open_trades(executor: BybitFuturesLiveExecutor) -> int:
         except Exception as err:
             logger.error(f"Error reconciling trade ID #{trade_id}: {err}")
 
-    # Auto-adopt un-tracked exchange positions into DB (SAFE UPSERT & ARCHITECTURAL LOCK FIX)
+    # FIX #3: Orphan adoption now works with partial unique index
     if live_exchange_positions:
         for ex_symbol, ex_pos in live_exchange_positions.items():
             if ex_symbol not in tracked_ccxt_symbols:
-                # Architectural Fix 1: Skip if under memory lock/grace period window
                 if is_symbol_under_grace_period(ex_symbol):
                     logger.info(f"[{ex_symbol}] Orphan check bypassed: Symbol is within recent order execution grace period window.")
                     continue
 
                 logger.warning(f"🚨 ORPHAN POSITION DETECTED: {ex_symbol}. Safely inserting/updating position in DB...")
-                
+
                 conn_adopt = get_db_connection()
                 if conn_adopt:
                     try:
@@ -246,13 +269,12 @@ def reconcile_open_trades(executor: BybitFuturesLiveExecutor) -> int:
                             direction = "BUY" if ex_pos['side'].lower() in ["long", "buy"] else "SELL"
                             entry_price = float(ex_pos.get('entry_price', 0.0))
                             position_size = float(ex_pos.get('contracts', 0.0))
-                            
-                            # Architectural Fix 2: Safe Idempotent UPSERT strategy tied to unique constraint indices / fallback checks
+
                             cursor.execute("""
                                 INSERT INTO trade_setups (
                                     pair, direction, entry_price, position_size, 
-                                    stop_loss, take_profit, status, trade_state, created_at
-                                ) VALUES (%s, %s, %s, %s, %s, %s, 'EXECUTED', 'OPEN', NOW())
+                                    stop_loss, take_profit, status, trade_state, created_at, updated_at
+                                ) VALUES (%s, %s, %s, %s, %s, %s, 'EXECUTED', 'OPEN', NOW(), NOW())
                                 ON CONFLICT (pair) WHERE trade_state IN ('OPEN', 'EXECUTED', 'BE_LOCKED', 'TRAILING')
                                 DO UPDATE SET
                                     position_size = EXCLUDED.position_size,
@@ -262,20 +284,17 @@ def reconcile_open_trades(executor: BybitFuturesLiveExecutor) -> int:
                                     updated_at = CURRENT_TIMESTAMP
                                 RETURNING id;
                             """, (
-                                db_pair, 
-                                direction, 
-                                entry_price, 
-                                position_size,
+                                db_pair, direction, entry_price, position_size,
                                 ex_pos.get('stop_loss', 0.0),
                                 ex_pos.get('take_profit', 0.0)
                             ))
-                            
+
                             row = cursor.fetchone()
                             if row:
                                 new_id = row[0]
                                 conn_adopt.commit()
                                 reconciled_count += 1
-                                
+
                                 send_telegram_notification(
                                     f"<b>✅ AUTO-ADOPTED EXCHANGE POSITION</b>\n\n"
                                     f"<b>Trade ID:</b> <code>#{new_id}</code>\n"

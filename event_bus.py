@@ -36,18 +36,15 @@ class CentralEventBus:
         self._subscribers: Dict[str, List[Callable]] = {}
 
     def subscribe(self, event_type: str, callback: Callable):
-        """Registers a callback function for a specific event type."""
         if event_type not in self._subscribers:
             self._subscribers[event_type] = []
         self._subscribers[event_type].append(callback)
         logger.info(f"Registered subscriber for event type: {event_type}")
 
     async def publish(self, event_type: str, payload: Dict[str, Any]):
-        """Publishes an event to the queue and dispatches it to registered subscribers."""
         event = {"type": event_type, "payload": payload}
         await self.queue.put(event)
 
-        # Dispatch to registered callbacks if present
         if event_type in self._subscribers:
             for callback in self._subscribers[event_type]:
                 try:
@@ -56,17 +53,12 @@ class CentralEventBus:
                     else:
                         callback(payload)
                 except Exception as e:
-                    logger.error(
-                        f"Error executing callback for {event_type}: {e}",
-                        exc_info=True,
-                    )
+                    logger.error(f"Error executing callback for {event_type}: {e}", exc_info=True)
 
     async def consume(self) -> Dict[str, Any]:
         return await self.queue.get()
 
-    def arm_local_sl_guard(
-        self, symbol: str, direction: str, quantity: float, stop_loss: float
-    ):
+    def arm_local_sl_guard(self, symbol: str, direction: str, quantity: float, stop_loss: float):
         clean_symbol = symbol.replace("/", "").replace("_", "").upper()
         self.active_local_sl_guards[clean_symbol] = {
             "direction": direction.upper(),
