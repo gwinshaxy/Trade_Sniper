@@ -1,4 +1,5 @@
 import os
+import sys
 import logging
 import psycopg2
 from psycopg2 import pool
@@ -206,6 +207,55 @@ def set_asset_cooldown(symbol: str, hours: int = DEFAULT_COOLDOWN_HOURS):
         logger.error(f"[{symbol}] Error setting asset cooldown: {e}")
     finally:
         release_db_connection(conn)
+
+
+def clear_asset_cooldown(symbol: str):
+    """Clears the cooldown entry for a specific asset pair."""
+    clean_symbol = normalize_symbol(symbol)
+
+    # 1. Clear from in-memory dictionary/cache if stored locally
+    if hasattr(sys.modules[__name__], 'COOLDOWN_CACHE'):
+        getattr(sys.modules[__name__], 'COOLDOWN_CACHE').pop(clean_symbol, None)
+
+    # 2. Clear from Database strategy_parameters table
+    conn = get_db_connection()
+    if conn:
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute("""
+                    UPDATE strategy_parameters 
+                    SET cooldown_until = NULL, updated_at = CURRENT_TIMESTAMP 
+                    WHERE UPPER(REPLACE(REPLACE(REPLACE(symbol, '/', ''), ':', ''), '_', '')) = %s;
+                """, (clean_symbol,))
+                conn.commit()
+                logger.info(f"Successfully cleared cooldown for {clean_symbol} in DB.")
+        except Exception as e:
+            logger.error(f"Failed to clear cooldown in DB for {clean_symbol}: {e}")
+        finally:
+            release_db_connection(conn)
+
+
+def clear_all_asset_cooldowns():
+    """Clears all active cooldown timers across all assets."""
+    # 1. Clear in-memory dictionary/cache
+    if hasattr(sys.modules[__name__], 'COOLDOWN_CACHE'):
+        getattr(sys.modules[__name__], 'COOLDOWN_CACHE').clear()
+
+    # 2. Clear all entries in strategy_parameters table
+    conn = get_db_connection()
+    if conn:
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute("""
+                    UPDATE strategy_parameters 
+                    SET cooldown_until = NULL, updated_at = CURRENT_TIMESTAMP;
+                """)
+                conn.commit()
+                logger.info("Successfully cleared ALL asset cooldowns in DB.")
+        except Exception as e:
+            logger.error(f"Failed to clear all cooldowns in DB: {e}")
+        finally:
+            release_db_connection(conn)
 
 
 def verify_base_schema():
