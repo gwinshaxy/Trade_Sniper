@@ -5,6 +5,13 @@ from psycopg2 import pool
 import requests
 from dotenv import load_dotenv
 
+try:
+    from config import STRATEGY_CONFIG
+except ImportError:
+    STRATEGY_CONFIG = {}
+
+DEFAULT_COOLDOWN_HOURS = STRATEGY_CONFIG.get("alert_cooldown_hours", 1)
+
 base_dir = os.path.dirname(os.path.abspath(__file__))
 env_path = os.path.join(base_dir, ".env")
 load_dotenv(dotenv_path=env_path)
@@ -179,7 +186,7 @@ def check_asset_cooldown(symbol: str) -> bool:
         release_db_connection(conn)
 
 
-def set_asset_cooldown(symbol: str, hours: int = 4):
+def set_asset_cooldown(symbol: str, hours: int = DEFAULT_COOLDOWN_HOURS):
     conn = get_db_connection()
     if not conn:
         return
@@ -324,7 +331,6 @@ def verify_base_schema():
 
 
 def calculate_pnl(direction: str, entry_price: float, current_price: float, quantity: float, account_balance: float = 100.0, total_fees: float = 0.0, exchange_closed_pnl: float = None) -> tuple:
-    """FIX #1: Accepts optional exchange_closed_pnl to write real exchange-reported PnL."""
     if exchange_closed_pnl is not None:
         pnl_usd = float(exchange_closed_pnl) - abs(total_fees)
     else:

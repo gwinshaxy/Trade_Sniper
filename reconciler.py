@@ -17,7 +17,6 @@ logger = logging.getLogger("reconciler")
 DUST_THRESHOLD = 0.001
 RETRY_THRESHOLD = 3
 
-# FIX #9: Thread-safe lock for reconciler shared state
 reconciler_lock = threading.Lock()
 consecutive_zero_counts: Dict[int, int] = {}
 
@@ -117,7 +116,6 @@ def reconcile_open_trades(executor: BybitFuturesLiveExecutor) -> int:
     reconciled_count = 0
     current_trade_ids: Set[int] = {trade[0] for trade in open_db_trades}
 
-    # FIX #9: Thread-safe cache cleanup
     with reconciler_lock:
         for cached_id in list(consecutive_zero_counts.keys()):
             if cached_id not in current_trade_ids:
@@ -161,28 +159,16 @@ def reconcile_open_trades(executor: BybitFuturesLiveExecutor) -> int:
 
                 logger.warning(f"🚨 GHOST DB RECORD CONFIRMED: Trade #{trade_id} ({pair}) reached zero checks limit. Auto-closing...")
 
-                # FIX #1: Query Bybit for verified closed PnL instead of writing 0.0
-                exit_price = float(entry_price)
-                real_closed_pnl = None
-                real_fee = 0.0
-                try:
-                    formatted_symbol = pair.replace("/", "").replace(":USDT", "").replace("_", "").upper()
-                    cpnl_resp = executor.exchange.private_get_v5_position_closed_pnl({
-                        "category": "linear",
-                        "symbol": formatted_symbol,
-                        "limit": 1
-                    })
-                    records = cpnl_resp.get("result", {}).get("list", [])
-                    if records:
-                        latest = records[0]
-                        real_closed_pnl = float(latest.get("closedPnl", 0) or 0)
-                        real_fee = abs(float(latest.get("openFee", 0) or 0)) + abs(float(latest.get("closeFee", 0) or 0))
-                        exit_price = float(latest.get("avgExitPrice", 0) or entry_price)
-                    else:
+                real_closed_pnl, real_fee, fetched_exit = executor.fetch_real_closed_pnl(pair)
+                if fetched_exit > 0:
+                    exit_price = fetched_exit
+                else:
+                    try:
                         ticker = executor.exchange.fetch_ticker(ccxt_symbol)
                         exit_price = float(ticker.get("last") or ticker.get("close") or entry_price)
-                except Exception as e:
-                    logger.warning(f"[{pair}] Failed to fetch closed PnL for ghost trade #{trade_id}: {e}")
+                    except Exception as e:
+                        logger.warning(f"[{pair}] Failed to fetch ticker for ghost trade #{trade_id}: {e}")
+                        exit_price = float(entry_price)
 
                 bal = float(account_balance or 100.0)
                 pnl_usd, pnl_pct, outcome = calculate_pnl(
@@ -251,7 +237,6 @@ def reconcile_open_trades(executor: BybitFuturesLiveExecutor) -> int:
         except Exception as err:
             logger.error(f"Error reconciling trade ID #{trade_id}: {err}")
 
-    # FIX #3: Orphan adoption now works with partial unique index
     if live_exchange_positions:
         for ex_symbol, ex_pos in live_exchange_positions.items():
             if ex_symbol not in tracked_ccxt_symbols:

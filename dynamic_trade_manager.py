@@ -9,13 +9,13 @@ class DynamicTradeManager:
     """
     Handles dynamic active position management, trailing stops,
     and breakeven locking based on real-time price updates and exchange state.
-
-    FIX #5: Directional guards added to all SL update branches.
     """
 
-    def __init__(self, trailing_mult: float = 1.5, be_rr_trigger: float = 1.0):
+    def __init__(self, trailing_mult: float = 3.0, be_rr_trigger: float = 1.5, trail_rr_trigger: float = 2.0):
+        # Increased defaults: wider ATR multiplier and delayed R:R triggers
         self.trailing_mult = trailing_mult
         self.be_rr_trigger = be_rr_trigger
+        self.trail_rr_trigger = trail_rr_trigger
 
     def _safe_float(self, value: Any, default: float = 0.0) -> float:
         if value is None:
@@ -65,23 +65,17 @@ class DynamicTradeManager:
         is_long = direction in ["BUY", "LONG"]
         db_needs_update = False
 
-        # FIX #5: Pre-flight direction sanity check
-        if is_long and current_sl > 0 and current_sl >= entry_price:
-            logger.error(
-                f"🚨 CORRUPT SL DETECTED for #{trade_id}: LONG SL (${current_sl}) >= entry (${entry_price}). "
-                f"Restoring to entry * 0.98."
-            )
-            current_sl = entry_price * 0.98
-            db_needs_update = True
-        elif (not is_long) and current_sl > 0 and current_sl <= entry_price:
-            logger.error(
-                f"🚨 CORRUPT SL DETECTED for #{trade_id}: SHORT SL (${current_sl}) <= entry (${entry_price}). "
-                f"Restoring to entry * 1.02."
-            )
-            current_sl = entry_price * 1.02
-            db_needs_update = True
+        # Directional validation before processing updates (Guard against Inverted SL)
+        if is_long:
+            if current_sl >= entry_price and trade_state == "OPEN":
+                current_sl = entry_price * 0.98  # Sanitize corrupt SL
+                db_needs_update = True
+        elif not is_long:
+            if current_sl <= entry_price and current_sl > 0 and trade_state == "OPEN":
+                current_sl = entry_price * 1.02  # Sanitize corrupt SL
+                db_needs_update = True
 
-        # FIX #5: Directionally correct fallback SL
+        # Directionally correct fallback SL
         if current_sl == 0.0 and entry_price > 0:
             current_sl = entry_price * (1.0 - 0.02) if is_long else entry_price * (1.0 + 0.02)
             db_needs_update = True
@@ -129,13 +123,16 @@ class DynamicTradeManager:
                     "msg": f"🛑 Target SL hit for #{trade_id}. Executing market close on Bybit..."
                 }
 
-        # 3. Dynamic Trailing Stop & Breakeven Adjustments (FIX #5 directional guards)
+        # -------------------------------------------------------------------------
+        # 3. Dynamic Trailing Stop & Breakeven Adjustments (Delayed R:R activation)
+        # -------------------------------------------------------------------------
         if atr > 0:
             risk_dist = abs(entry_price - current_sl) if current_sl > 0 else (entry_price * 0.02)
 
             if is_long:
                 unrealized_profit = close_price - entry_price
 
+                # Lock Breakeven only after reaching be_rr_trigger (e.g., 1.5R)
                 if trade_state == "OPEN" and unrealized_profit >= (risk_dist * self.be_rr_trigger):
                     candidate_sl = entry_price + (atr * 0.1)
                     if candidate_sl > entry_price and candidate_sl > current_sl:
@@ -143,10 +140,11 @@ class DynamicTradeManager:
                             "action": "UPDATE_SL",
                             "new_sl": candidate_sl,
                             "new_state": "BE_LOCKED",
-                            "msg": f"🔒 Trade #{trade_id} moved to Breakeven @ ${candidate_sl:.5f}"
+                            "msg": f"🔒 Trade #{trade_id} moved to Breakeven @ ${candidate_sl:.5f} (Target 1.5R reached)"
                         }
 
-                if trade_state in ["BE_LOCKED", "TRAILING"]:
+                # Start Trailing only after reaching trail_rr_trigger (e.g., 2.0R)
+                if trade_state in ["BE_LOCKED", "TRAILING"] and unrealized_profit >= (risk_dist * self.trail_rr_trigger):
                     candidate_sl = close_price - (atr * self.trailing_mult)
                     if candidate_sl > entry_price and candidate_sl > current_sl:
                         return {
@@ -158,6 +156,7 @@ class DynamicTradeManager:
             else:  # SHORT
                 unrealized_profit = entry_price - close_price
 
+                # Lock Breakeven only after reaching be_rr_trigger (e.g., 1.5R)
                 if trade_state == "OPEN" and unrealized_profit >= (risk_dist * self.be_rr_trigger):
                     candidate_sl = entry_price - (atr * 0.1)
                     if candidate_sl < entry_price and (current_sl == 0 or candidate_sl < current_sl):
@@ -165,10 +164,11 @@ class DynamicTradeManager:
                             "action": "UPDATE_SL",
                             "new_sl": candidate_sl,
                             "new_state": "BE_LOCKED",
-                            "msg": f"🔒 Trade #{trade_id} moved to Breakeven @ ${candidate_sl:.5f}"
+                            "msg": f"🔒 Trade #{trade_id} moved to Breakeven @ ${candidate_sl:.5f} (Target 1.5R reached)"
                         }
 
-                if trade_state in ["BE_LOCKED", "TRAILING"]:
+                # Start Trailing only after reaching trail_rr_trigger (e.g., 2.0R)
+                if trade_state in ["BE_LOCKED", "TRAILING"] and unrealized_profit >= (risk_dist * self.trail_rr_trigger):
                     candidate_sl = close_price + (atr * self.trailing_mult)
                     if candidate_sl < entry_price and (current_sl == 0 or candidate_sl < current_sl):
                         return {

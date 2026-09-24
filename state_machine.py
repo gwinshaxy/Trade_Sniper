@@ -52,37 +52,39 @@ class StateMachineEngine:
 
     async def _handle_trade_signal(self, payload: dict):
         symbol = payload["symbol"]
-        direction = payload["direction"].upper()
-        entry_price = safe_float(payload.get("entry_price"), 0.0)
-        stop_loss = safe_float(payload.get("stop_loss"), 0.0)
-        take_profit = safe_float(payload.get("take_profit"), 0.0)
-        amount_usd = safe_float(payload.get("amount_usd"), 25.0)
-        account_balance = safe_float(payload.get("account_balance"), 100.0)
-        leverage = int(safe_float(payload.get("leverage"), 10))
-
-        # FIX #6: Extract risk_pct dynamically from payload / STRATEGY_CONFIG default
-        default_risk = safe_float(STRATEGY_CONFIG.get("risk_pct"), 1.0) if isinstance(STRATEGY_CONFIG, dict) else 1.0
-        risk_pct_value = safe_float(payload.get("risk_pct"), default=default_risk)
-
+        
+        # 1. Acquire lock FIRST before running DB or API pre-checks
         acquired = await event_bus.guard.try_acquire_trade_lock(symbol)
         if not acquired:
-            logger.warning(f"[{symbol}] Atomic Lock Guard: Active trade lock in-flight. Discarding signal.")
+            logger.warning(f"[{symbol}] Active execution in-flight. Blocking duplicate order.")
             return
 
         try:
+            # DB active trade count check
             conn_check = get_db_connection()
             if conn_check:
                 try:
                     with conn_check.cursor() as cur:
                         cur.execute("""
                             SELECT COUNT(*) FROM trade_setups 
-                            WHERE pair = %s AND status = 'EXECUTED' AND trade_state = 'OPEN';
+                            WHERE pair = %s AND status = 'EXECUTED' AND trade_state != 'CLOSED';
                         """, (symbol,))
                         if cur.fetchone()[0] > 0:
-                            logger.warning(f"[{symbol}] Trade setup already OPEN in database. Skipping duplicate execution.")
+                            logger.warning(f"[{symbol}] Active trade already present in DB. Skipping.")
                             return
                 finally:
                     release_db_connection(conn_check)
+
+            direction = payload["direction"].upper()
+            entry_price = safe_float(payload.get("entry_price"), 0.0)
+            stop_loss = safe_float(payload.get("stop_loss"), 0.0)
+            take_profit = safe_float(payload.get("take_profit"), 0.0)
+            amount_usd = safe_float(payload.get("amount_usd"), 25.0)
+            account_balance = safe_float(payload.get("account_balance"), 100.0)
+            leverage = int(safe_float(payload.get("leverage"), 10))
+
+            default_risk = safe_float(STRATEGY_CONFIG.get("risk_pct"), 1.0) if isinstance(STRATEGY_CONFIG, dict) else 1.0
+            risk_pct_value = safe_float(payload.get("risk_pct"), default=default_risk)
 
             conn = get_db_connection()
             if conn:
@@ -125,7 +127,7 @@ class StateMachineEngine:
                 take_profit,
                 leverage,
                 account_balance,
-                risk_pct_value  # FIX #6: was hardcoded 1.0
+                risk_pct_value
             )
 
             if exec_result.get("status") == "SUCCESS":
@@ -199,4 +201,3 @@ class StateMachineEngine:
 
         if order_status in ["Filled", "Cancelled"]:
             logger.info(f"[{symbol}] Bybit execution report event received: Status={order_status}, Price={price}")
-			

@@ -60,7 +60,6 @@ POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", "60"))
 ACCOUNT_RISK_PCT = float(os.getenv("ACCOUNT_RISK_PCT", "1.0"))
 FALLBACK_BALANCE = float(os.getenv("ACCOUNT_BALANCE", "100.0"))
 
-# FIX #8: Reduced from 4 to 2 to halve trade frequency (fee drag reduction)
 MAX_CONCURRENT_POSITIONS = int(os.getenv("MAX_CONCURRENT_POSITIONS", "2"))
 
 logger = logging.getLogger("main_orchestrator")
@@ -151,7 +150,7 @@ async def dynamic_trade_management_loop():
                         )
 
                         finalize_trade_in_db(trade_id, actual_exit_price, pnl_usd, pnl_pct, outcome, fee_usd=est_fees)
-                        set_asset_cooldown(pair, hours=4)
+                        set_asset_cooldown(pair)
 
                         send_telegram_notification(
                             f"<b>🔴 POSITION CLOSED ({action})</b>\n\n"
@@ -231,9 +230,11 @@ async def strategy_evaluation_loop():
                     logger.warning(f"[{symbol}] Kline data empty. Skipping evaluation.")
                     continue
 
+                # Evaluate signal on the last fully closed candle to avoid intrabar noise
+                closed_candle_df = df_klines.iloc[:-1]
                 cfg = load_symbol_config(symbol)
                 signal = evaluate_signals(
-                    df=df_klines, symbol=symbol,
+                    df=closed_candle_df, symbol=symbol,
                     account_balance=active_usdt_balance,
                     risk_pct=cfg.get("risk_pct", ACCOUNT_RISK_PCT),
                     tema_period=cfg.get("tema_period", 200),
@@ -268,7 +269,6 @@ async def strategy_evaluation_loop():
                     raw_tp = signal.get("take_profit") or signal.get("tp_price") or 0.0
                     raw_symbol = signal.get("pair") or signal.get("symbol") or symbol
 
-                    # FIX #6: Propagate risk_pct through the signal payload
                     await event_bus.publish("TRADE_SIGNAL", {
                         "pair": raw_symbol,
                         "symbol": raw_symbol,
