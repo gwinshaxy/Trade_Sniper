@@ -1,4 +1,3 @@
-
 import os
 import asyncio
 import json
@@ -41,18 +40,20 @@ class UnifiedWebSocketEngine:
         self.current_ep_idx = (self.current_ep_idx + 1) % len(self.ws_endpoints)
 
     async def _ping_loop(self, ws):
+        """
+        FIX #4: Bybit testnet drops the WS with 1011 (keepalive ping timeout)
+        if we don't ping more frequently. Reduced from 20s to 15s.
+        """
         try:
             while True:
-                await asyncio.sleep(20)
+                await asyncio.sleep(15)  # was 20
                 if ws.open:
                     await ws.send(json.dumps({"op": "ping"}))
         except (asyncio.CancelledError, Exception):
             pass
 
     async def _authenticate_private_ws(self, ws) -> bool:
-        """
-        FIX #10: Loop-reads frames until auth response arrives, ignoring pings/subscriptions.
-        """
+        """Loop-reads frames until auth response arrives, ignoring pings/subscriptions."""
         if not self.api_key or not self.api_secret:
             logger.warning("Private WebSocket credentials not provided. Skipping private stream authentication.")
             return False
@@ -112,7 +113,7 @@ class UnifiedWebSocketEngine:
             exec_price = float(execution_data.get("execPrice", 0) or 0)
             closed_pnl = float(execution_data.get("closedPnl", 0) or 0)
 
-            # FIX #10: Only finalize trades on true close events; pass through entry fills
+            # Only finalize trades on true close events; pass through entry fills
             closed_size = float(execution_data.get("closedSize", 0) or 0)
             if exec_type == "Trade" and closed_size <= 0:
                 await event_bus.publish("EXECUTION_EVENT", {

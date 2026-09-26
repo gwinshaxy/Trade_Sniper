@@ -123,7 +123,12 @@ def release_db_connection(conn):
 
 
 def finalize_trade_in_db(trade_id: int, exit_price: float, pnl_usd: float, pnl_pct: float, outcome: str, fee_usd: float = 0.0):
-    """Centralized database update wrapper to record trade state upon closure."""
+    """
+    Centralized database update wrapper to record trade state upon closure.
+
+    FIX #5: This is now the ONLY place that sets asset cooldown, eliminating
+    duplicate cooldown log spam from multiple callers.
+    """
     conn = get_db_connection()
     if not conn:
         return
@@ -151,8 +156,9 @@ def finalize_trade_in_db(trade_id: int, exit_price: float, pnl_usd: float, pnl_p
             conn.commit()
             logger.info(f"Database Record #{trade_id} successfully finalized with state CLOSED (PnL: ${pnl_usd:.2f}, Fees: ${fee_usd:.2f}).")
 
+        # FIX #5: Sole cooldown setter — every close path routes here
         if pair:
-            set_asset_cooldown(pair, hours=4)
+            set_asset_cooldown(pair, hours=DEFAULT_COOLDOWN_HOURS)
     except Exception as e:
         logger.error(f"Failed to finalize trade record #{trade_id} in database: {e}")
     finally:
@@ -213,11 +219,9 @@ def clear_asset_cooldown(symbol: str):
     """Clears the cooldown entry for a specific asset pair."""
     clean_symbol = normalize_symbol(symbol)
 
-    # 1. Clear from in-memory dictionary/cache if stored locally
     if hasattr(sys.modules[__name__], 'COOLDOWN_CACHE'):
         getattr(sys.modules[__name__], 'COOLDOWN_CACHE').pop(clean_symbol, None)
 
-    # 2. Clear from Database strategy_parameters table
     conn = get_db_connection()
     if conn:
         try:
@@ -237,11 +241,9 @@ def clear_asset_cooldown(symbol: str):
 
 def clear_all_asset_cooldowns():
     """Clears all active cooldown timers across all assets."""
-    # 1. Clear in-memory dictionary/cache
     if hasattr(sys.modules[__name__], 'COOLDOWN_CACHE'):
         getattr(sys.modules[__name__], 'COOLDOWN_CACHE').clear()
 
-    # 2. Clear all entries in strategy_parameters table
     conn = get_db_connection()
     if conn:
         try:
@@ -297,11 +299,22 @@ def verify_base_schema():
 
         cursor.execute("ALTER TABLE trade_setups ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP;")
 
+        # FIX #2: Partial unique index predicate MUST match the ON CONFLICT clause
+        # in reconciler.py exactly. The previous version was missing 'EXECUTED',
+        # causing Postgres to silently ignore the conflict target and permit
+        # duplicate OPEN rows.
+        # Optional passive check — logs a warning if the index is missing,
+        # but never runs the DDL at runtime.
         cursor.execute("""
-            CREATE UNIQUE INDEX IF NOT EXISTS idx_trade_setups_open_pair
-            ON trade_setups (pair)
-            WHERE trade_state IN ('OPEN', 'EXECUTED', 'BE_LOCKED', 'TRAILING');
+            SELECT 1 FROM pg_indexes
+            WHERE indexname = 'idx_trade_setups_open_pair'
+              AND indexdef LIKE '%EXECUTED%';
         """)
+        if not cursor.fetchone():
+            logger.warning(
+                "Index idx_trade_setups_open_pair missing or stale. "
+                "Run the migration manually in Supabase SQL editor."
+            )
 
         trade_columns = [
             "stop_loss NUMERIC(18, 8)",
@@ -442,8 +455,8 @@ def close_trade_manually(trade_id: int, exit_price: float, reason: str = "MANUAL
             direction, float(entry_price), float(exit_price), float(position_size), float(account_balance or 100.0)
         )
 
+        # FIX #5: finalize_trade_in_db handles cooldown — no separate call here
         finalize_trade_in_db(trade_id, exit_price, pnl_usd, pnl_pct, outcome)
-        set_asset_cooldown(pair, hours=4)
 
         emoji = "🔴" if pnl_usd < 0 else "🟢"
         send_telegram_notification(

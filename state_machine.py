@@ -131,6 +131,15 @@ class StateMachineEngine:
             )
 
             if exec_result.get("status") == "SUCCESS":
+                # Register symbol in grace-period cache IMMEDIATELY, before
+                # the DB insert, so the reconciler skips adoption if it fires
+                # between the WS execution event and our INSERT completing.
+                try:
+                    from reconciler import mark_symbol_recently_opened
+                    mark_symbol_recently_opened(symbol)
+                except Exception as grace_err:
+                    logger.debug(f"[{symbol}] Grace registration failed: {grace_err}")
+
                 executed_qty = exec_result["executed_qty"]
                 fill_price = exec_result["fill_price"]
                 sl_attached = exec_result.get("stop_loss_attached", False)
@@ -139,28 +148,60 @@ class StateMachineEngine:
                 if conn_db:
                     try:
                         with conn_db.cursor() as cur:
+                            # -----------------------------------------------------------------
+                            # FIX #P1: Use an ON CONFLICT upsert that matches the partial
+                            # unique index (idx_unique_open_pair) which permits only ONE
+                            # open trade per pair. This eliminates the race-condition
+                            # duplicate-key error when the reconciler's ORPHAN-adoption
+                            # path wins the insert race. We also RETURN id so the
+                            # trade_id is always populated for notifications.
+                            #
+                            # NOTE: The WHERE clause in ON CONFLICT must match the
+                            # partial index predicate exactly.
+                            # -----------------------------------------------------------------
                             cur.execute("""
                                 INSERT INTO trade_setups 
                                 (pair, direction, entry_price, stop_loss, take_profit, position_size, account_balance, risk_pct, status, trade_state, updated_at)
                                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'EXECUTED', 'OPEN', NOW())
+                                ON CONFLICT (pair) WHERE trade_state IN ('OPEN', 'EXECUTED', 'BE_LOCKED', 'TRAILING')
+                                DO UPDATE SET
+                                    direction = EXCLUDED.direction,
+                                    entry_price = EXCLUDED.entry_price,
+                                    stop_loss = COALESCE(NULLIF(EXCLUDED.stop_loss, 0.0), trade_setups.stop_loss),
+                                    take_profit = COALESCE(NULLIF(EXCLUDED.take_profit, 0.0), trade_setups.take_profit),
+                                    position_size = EXCLUDED.position_size,
+                                    account_balance = EXCLUDED.account_balance,
+                                    risk_pct = EXCLUDED.risk_pct,
+                                    updated_at = NOW()
                                 RETURNING id;
                             """, (symbol, direction, fill_price, stop_loss, take_profit, executed_qty, account_balance, risk_pct_value))
-                            trade_id = cur.fetchone()[0]
+                            row = cur.fetchone()
+                            trade_id = row[0] if row else None
                             conn_db.commit()
 
-                        emoji = "🟢" if direction in ["BUY", "LONG"] else "🔴"
-                        sl_status = "✅ Attached" if sl_attached else "⚠️ Fallback Active"
-                        send_telegram_notification(
-                            f"<b>{emoji} LIVE BYBIT FUTURES ORDER EXECUTED ({direction})</b>\n\n"
-                            f"<b>Trade ID:</b> <code>#{trade_id}</code>\n"
-                            f"<b>Pair:</b> <code>{symbol}</code>\n"
-                            f"<b>Entry:</b> ${fill_price:.5f}\n"
-                            f"<b>Qty:</b> {executed_qty}\n"
-                            f"<b>Risk %:</b> {risk_pct_value}%\n"
-                            f"<b>SL:</b> ${stop_loss:.5f} ({sl_status}) | <b>TP:</b> ${take_profit:.5f}"
-                        )
+                        if trade_id is not None:
+                            emoji = "🟢" if direction in ["BUY", "LONG"] else "🔴"
+                            sl_status = "✅ Attached" if sl_attached else "⚠️ Fallback Active"
+                            send_telegram_notification(
+                                f"<b>{emoji} LIVE BYBIT FUTURES ORDER EXECUTED ({direction})</b>\n\n"
+                                f"<b>Trade ID:</b> <code>#{trade_id}</code>\n"
+                                f"<b>Pair:</b> <code>{symbol}</code>\n"
+                                f"<b>Entry:</b> ${fill_price:.5f}\n"
+                                f"<b>Qty:</b> {executed_qty}\n"
+                                f"<b>Risk %:</b> {risk_pct_value}%\n"
+                                f"<b>SL:</b> ${stop_loss:.5f} ({sl_status}) | <b>TP:</b> ${take_profit:.5f}"
+                            )
+                        else:
+                            logger.error(f"[{symbol}] Upsert returned no trade_id — DB state may be inconsistent.")
                     finally:
                         release_db_connection(conn_db)
+            elif exec_result.get("status") == "FAILED" and "SL failed to attach" in str(exec_result.get("error", "")):
+                # SL attach failed but emergency close likely succeeded.
+                # Do NOT raise — the position is clean; just log and continue.
+                logger.warning(
+                    f"[{symbol}] Order rejected post-entry: {exec_result.get('error')}. "
+                    f"Position expected to be clean."
+                )
             else:
                 logger.error(f"[{symbol}] Futures Trade Execution failed: {exec_result.get('error')}")
 

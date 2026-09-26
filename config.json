@@ -14,7 +14,7 @@
   "atr_mult_sl": 2.5,
   "min_rr": 3.0,
   "scan_interval_minutes": 60,
-  "alert_cooldown_hours": 4,
+  "alert_cooldown_hours": 1,
   "enable_live_trading": true,
   "watchlist": [
     "XRP/USDT",

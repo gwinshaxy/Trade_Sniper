@@ -43,17 +43,39 @@ def is_symbol_under_grace_period(ccxt_symbol: str) -> bool:
 
 
 def check_active_or_pending_orders(executor: BybitFuturesLiveExecutor, ccxt_symbol: str) -> bool:
+    """
+    FIX #P2: Filter out protective (SL/TP) orders. Only entry orders should
+    suppress the zero-contract counter. Bybit's `stopOrderType` field is
+    non-empty for SL/TP conditional orders — we skip those.
+
+    Previously, a stale closed ENTRY order within the 5-minute lookback
+    window would cause this function to return True on every reconciler
+    cycle, resetting the zero-counter to 0 and preventing ghost-record
+    detection (exactly the XRP trade #1 failure mode observed in the log).
+    """
     try:
         open_orders = executor.exchange.fetch_open_orders(ccxt_symbol)
-        if open_orders:
+        for oo in open_orders:
+            info = oo.get("info", {}) or {}
+            stop_order_type = str(info.get("stopOrderType", "") or "").strip()
+            # Skip protective SL/TP orders — they don't indicate an entry in flight
+            if stop_order_type in ("StopLoss", "TakeProfit", "TrailingStop", "Stop"):
+                continue
+            # Any non-protective open order counts as pending entry activity
             return True
 
         since = int((time.time() - 300) * 1000)
-        recent_closed = executor.exchange.fetch_closed_orders(ccxt_symbol, since=since, limit=5)
+        recent_closed = executor.exchange.fetch_closed_orders(ccxt_symbol, since=since, limit=10)
         for order in recent_closed:
             status = str(order.get("status", "")).lower()
-            if status in ["open", "untriggered", "new"]:
-                return True
+            if status not in ["open", "untriggered", "new"]:
+                continue
+            info = order.get("info", {}) or {}
+            stop_order_type = str(info.get("stopOrderType", "") or "").strip()
+            # Same protective-order filter for closed-but-still-conditional orders
+            if stop_order_type in ("StopLoss", "TakeProfit", "TrailingStop", "Stop"):
+                continue
+            return True
     except Exception as e:
         logger.debug(f"[{ccxt_symbol}] Exception checking pending orders: {e}")
         return False
@@ -61,28 +83,58 @@ def check_active_or_pending_orders(executor: BybitFuturesLiveExecutor, ccxt_symb
 
 
 def fetch_all_live_exchange_positions(executor: BybitFuturesLiveExecutor) -> Dict[str, dict]:
+    """
+    Filters out positions with stale updatedTime (>60s old) that Bybit's
+    bulk /v5/position/list endpoint may return for recently-closed trades.
+    This prevents false-positive ORPHAN detection immediately after a close.
+
+    Reads stopLoss/takeProfit from the raw Bybit `info` dict because
+    CCXT does not reliably populate the normalized top-level keys on Bybit V5.
+    """
     active_positions = {}
+    now_ms = int(time.time() * 1000)
+    STALE_MS = 60_000  # 60 seconds
+
     try:
         positions = executor.exchange.fetch_positions()
         for p in positions:
             contracts = float(p.get("contracts", 0) or 0)
-            if contracts > DUST_THRESHOLD:
-                raw_symbol = p.get("symbol", "")
-                ccxt_symbol = format_ccxt_futures_symbol(raw_symbol)
-                side = str(p.get("side", "")).lower()
-                if not side or side == "none":
-                    side = "long" if float(p.get("side", 0) or 0) > 0 else "short"
+            if contracts <= DUST_THRESHOLD:
+                continue
 
-                active_positions[ccxt_symbol] = {
-                    "symbol": ccxt_symbol,
-                    "side": side,
-                    "contracts": contracts,
-                    "entry_price": float(p.get("entryPrice", 0) or 0),
-                    "stop_loss": float(p.get("stopLoss", 0) or 0),
-                    "take_profit": float(p.get("takeProfit", 0) or 0),
-                    "unrealized_pnl": float(p.get("unrealizedPnl", 0) or 0),
-                    "leverage": float(p.get("leverage", 1) or 1)
-                }
+            info = p.get("info", {}) or {}
+
+            # Skip stale positions
+            updated_ms = int(info.get("updatedTime", 0) or 0)
+            if updated_ms > 0 and (now_ms - updated_ms) > STALE_MS:
+                logger.debug(
+                    f"[{p.get('symbol')}] Skipping stale position "
+                    f"(updated {int((now_ms - updated_ms) / 1000)}s ago)."
+                )
+                continue
+
+            raw_symbol = p.get("symbol", "")
+            ccxt_symbol = format_ccxt_futures_symbol(raw_symbol)
+            side = str(p.get("side", "")).lower()
+            if not side or side == "none":
+                side = "long" if float(p.get("side", 0) or 0) > 0 else "short"
+
+            # Prefer raw Bybit fields; fall back to CCXT normalized keys.
+            sl_raw = p.get("stopLoss")
+            tp_raw = p.get("takeProfit")
+            sl_val = float(sl_raw) if sl_raw not in (None, "") else float(info.get("stopLoss", 0) or 0)
+            tp_val = float(tp_raw) if tp_raw not in (None, "") else float(info.get("takeProfit", 0) or 0)
+
+            active_positions[ccxt_symbol] = {
+                "symbol": ccxt_symbol,
+                "side": side,
+                "contracts": contracts,
+                "entry_price": float(p.get("entryPrice", 0) or 0),
+                "stop_loss": sl_val,
+                "take_profit": tp_val,
+                "unrealized_pnl": float(p.get("unrealizedPnl", 0) or 0),
+                "leverage": float(p.get("leverage", 1) or 1),
+            }
     except Exception as e:
         logger.error(f"Reconciler: Network/API error fetching bulk positions: {e}. Preserving DB state.")
         return {}
@@ -163,12 +215,11 @@ def reconcile_open_trades(executor: BybitFuturesLiveExecutor) -> int:
                 if fetched_exit > 0:
                     exit_price = fetched_exit
                 else:
-                    try:
-                        ticker = executor.exchange.fetch_ticker(ccxt_symbol)
-                        exit_price = float(ticker.get("last") or ticker.get("close") or entry_price)
-                    except Exception as e:
-                        logger.warning(f"[{pair}] Failed to fetch ticker for ghost trade #{trade_id}: {e}")
-                        exit_price = float(entry_price)
+                    exit_price = float(entry_price)  # Not current ticker — use entry
+                    logger.warning(
+                        f"[{pair}] No verified exit for ghost #{trade_id}. "
+                        f"Using entry price (${entry_price}); PnL will reflect fees only."
+                    )
 
                 bal = float(account_balance or 100.0)
                 pnl_usd, pnl_pct, outcome = calculate_pnl(
@@ -181,6 +232,9 @@ def reconcile_open_trades(executor: BybitFuturesLiveExecutor) -> int:
                     exchange_closed_pnl=real_closed_pnl
                 )
 
+                if real_closed_pnl is None and exit_price == float(entry_price):
+                    outcome = "UNKNOWN"
+
                 finalize_trade_in_db(
                     trade_id=trade_id,
                     exit_price=exit_price,
@@ -190,7 +244,7 @@ def reconcile_open_trades(executor: BybitFuturesLiveExecutor) -> int:
                     fee_usd=real_fee
                 )
 
-                set_asset_cooldown(pair, hours=2)
+                set_asset_cooldown(pair)
                 reconciled_count += 1
 
                 with reconciler_lock:
@@ -215,6 +269,7 @@ def reconcile_open_trades(executor: BybitFuturesLiveExecutor) -> int:
                     db_sl_val = float(db_sl or 0.0)
                     db_tp_val = float(db_tp or 0.0)
 
+                    # Exchange has SL/TP, DB missing → sync exchange → DB
                     if (live_sl > 0 and db_sl_val == 0.0) or (live_tp > 0 and db_tp_val == 0.0):
                         conn_sync = get_db_connection()
                         if conn_sync:
@@ -233,6 +288,42 @@ def reconcile_open_trades(executor: BybitFuturesLiveExecutor) -> int:
                                 logger.error(f"Failed to sync exchange SL/TP to DB for trade #{trade_id}: {sync_err}")
                             finally:
                                 release_db_connection(conn_sync)
+
+                    # Exchange missing SL, DB has one → re-attach from DB
+                    if live_sl == 0.0 and db_sl_val > 0:
+                        logger.warning(
+                            f"[{pair}] Exchange SL missing for Trade #{trade_id} "
+                            f"(DB has ${db_sl_val:.5f}). Re-attaching from DB..."
+                        )
+                        try:
+                            reattach_idx = executor._get_position_idx(
+                                ccxt_symbol, direction
+                            )
+                            ok = executor.set_position_trading_stop(
+                                symbol=pair,
+                                stop_loss=db_sl_val,
+                                take_profit=(db_tp_val if db_tp_val > 0 else None),
+                                position_idx=reattach_idx,
+                                direction=direction,
+                            )
+                            if ok:
+                                logger.info(
+                                    f"[{pair}] SL re-attached from DB for Trade #{trade_id}."
+                                )
+                                send_telegram_notification(
+                                    f"<b>🔧 SL RE-ATTACHED FROM DB</b>\n\n"
+                                    f"<b>Trade ID:</b> <code>#{trade_id}</code>\n"
+                                    f"<b>Pair:</b> <code>{pair}</code>\n"
+                                    f"<b>SL:</b> <code>${db_sl_val:.5f}</code>"
+                                )
+                            else:
+                                logger.error(
+                                    f"[{pair}] SL re-attach from DB FAILED for Trade #{trade_id}."
+                                )
+                        except Exception as reattach_err:
+                            logger.error(
+                                f"[{pair}] SL re-attach exception for Trade #{trade_id}: {reattach_err}"
+                            )
 
         except Exception as err:
             logger.error(f"Error reconciling trade ID #{trade_id}: {err}")
