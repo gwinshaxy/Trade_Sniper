@@ -1,7 +1,7 @@
 import logging
 import time
 import threading
-from typing import Dict, List, Set
+from typing import Dict, List, Set, Optional
 from common import (
     get_db_connection,
     release_db_connection,
@@ -17,11 +17,22 @@ logger = logging.getLogger("reconciler")
 DUST_THRESHOLD = 0.001
 RETRY_THRESHOLD = 3
 
+# FIX #5: Require BOTH 3 checks AND a minimum sustained-zero duration before
+# declaring a ghost. Bybit testnet's position endpoint can lag 5-10 minutes
+# after a close, so a pure check-count threshold produces false positives.
+GHOST_MIN_SUSTAINED_ZERO_SECONDS = 600  # 10 minutes
+
 reconciler_lock = threading.Lock()
 consecutive_zero_counts: Dict[int, int] = {}
+# FIX #5: Track the wall-clock time each trade first read zero contracts.
+first_zero_at: Dict[int, float] = {}
 
 RECENTLY_OPENED_CACHE: Dict[str, float] = {}
 GRACE_PERIOD_SECONDS = 15.0
+
+# FIX #6: In-memory cache of entry order IDs per trade_id so we can query
+# the order status directly when the position endpoint reports zero.
+ENTRY_ORDER_CACHE: Dict[int, str] = {}
 
 
 def mark_symbol_recently_opened(ccxt_symbol: str) -> None:
@@ -42,16 +53,20 @@ def is_symbol_under_grace_period(ccxt_symbol: str) -> bool:
     return False
 
 
+def mark_trade_entry_order(trade_id: int, entry_order_id: str) -> None:
+    """FIX #6: Register the entry order ID for a trade so the reconciler can
+    query its authoritative status before declaring the trade a ghost."""
+    if trade_id and entry_order_id:
+        with reconciler_lock:
+            ENTRY_ORDER_CACHE[trade_id] = str(entry_order_id)
+        logger.debug(f"[Trade #{trade_id}] Registered entry_order_id={entry_order_id}.")
+
+
 def check_active_or_pending_orders(executor: BybitFuturesLiveExecutor, ccxt_symbol: str) -> bool:
     """
     FIX #P2: Filter out protective (SL/TP) orders. Only entry orders should
     suppress the zero-contract counter. Bybit's `stopOrderType` field is
     non-empty for SL/TP conditional orders — we skip those.
-
-    Previously, a stale closed ENTRY order within the 5-minute lookback
-    window would cause this function to return True on every reconciler
-    cycle, resetting the zero-counter to 0 and preventing ghost-record
-    detection (exactly the XRP trade #1 failure mode observed in the log).
     """
     try:
         open_orders = executor.exchange.fetch_open_orders(ccxt_symbol)
@@ -79,6 +94,65 @@ def check_active_or_pending_orders(executor: BybitFuturesLiveExecutor, ccxt_symb
     except Exception as e:
         logger.debug(f"[{ccxt_symbol}] Exception checking pending orders: {e}")
         return False
+    return False
+
+
+def check_entry_order_never_filled(
+    executor: BybitFuturesLiveExecutor,
+    trade_id: int,
+    ccxt_symbol: str,
+) -> Optional[str]:
+    """
+    FIX #6: If the entry order was cancelled/rejected/expired without filling,
+    the trade should be marked CANCELLED (not ghost-closed). Returns the
+    terminal status string if the order never filled, else None.
+    """
+    with reconciler_lock:
+        entry_order_id = ENTRY_ORDER_CACHE.get(trade_id)
+
+    if not entry_order_id:
+        return None
+
+    try:
+        order = executor.exchange.fetch_order(entry_order_id, ccxt_symbol)
+        status = str(order.get("status", "")).lower()
+        filled = float(order.get("filled", 0) or 0)
+
+        if status in ("canceled", "rejected", "expired") and filled < DUST_THRESHOLD:
+            logger.warning(
+                f"[Trade #{trade_id}] Entry order {entry_order_id} never filled "
+                f"(status={status}, filled={filled}). Marking as CANCELLED, not ghost-closed."
+            )
+            return status.upper()
+    except Exception as e:
+        logger.debug(f"[Trade #{trade_id}] Entry order lookup failed: {e}")
+    return None
+
+
+def check_unprocessed_execution_close(
+    executor: BybitFuturesLiveExecutor,
+    symbol: str,
+) -> bool:
+    """
+    FIX #4: Query /v5/execution/list for a recent close fill. If Bybit has
+    already recorded a closing trade (closedSize > 0) that the DB hasn't
+    processed, we must NOT count this cycle as a zero-contract confirmation.
+    """
+    try:
+        execs = executor.fetch_recent_executions(symbol, lookback_ms=300_000)
+        for e in execs:
+            if str(e.get("execType", "")) != "Trade":
+                continue
+            closed_size = float(e.get("closedSize", 0) or 0)
+            if closed_size > DUST_THRESHOLD:
+                logger.info(
+                    f"[{symbol}] Unprocessed close fill detected in execution/list "
+                    f"(closedSize={closed_size}, price={e.get('execPrice')}). "
+                    f"Not counting as ghost."
+                )
+                return True
+    except Exception as e:
+        logger.debug(f"[{symbol}] execution/list check failed: {e}")
     return False
 
 
@@ -143,7 +217,7 @@ def fetch_all_live_exchange_positions(executor: BybitFuturesLiveExecutor) -> Dic
 
 
 def reconcile_open_trades(executor: BybitFuturesLiveExecutor) -> int:
-    global consecutive_zero_counts
+    global consecutive_zero_counts, first_zero_at
     logger.info("🔍 Running Database <-> Bybit Futures Position Reconciliation & Auto-Healing...")
 
     open_db_trades = []
@@ -168,10 +242,17 @@ def reconcile_open_trades(executor: BybitFuturesLiveExecutor) -> int:
     reconciled_count = 0
     current_trade_ids: Set[int] = {trade[0] for trade in open_db_trades}
 
+    # FIX #5: Purge stale counters/caches for trades no longer open
     with reconciler_lock:
         for cached_id in list(consecutive_zero_counts.keys()):
             if cached_id not in current_trade_ids:
                 del consecutive_zero_counts[cached_id]
+        for cached_id in list(first_zero_at.keys()):
+            if cached_id not in current_trade_ids:
+                del first_zero_at[cached_id]
+        for cached_id in list(ENTRY_ORDER_CACHE.keys()):
+            if cached_id not in current_trade_ids:
+                del ENTRY_ORDER_CACHE[cached_id]
 
     live_exchange_positions = fetch_all_live_exchange_positions(executor)
     tracked_ccxt_symbols: Set[str] = set()
@@ -196,20 +277,130 @@ def reconcile_open_trades(executor: BybitFuturesLiveExecutor) -> int:
             live_contracts = float(pos_info.get("contracts", 0.0))
 
             if live_contracts < DUST_THRESHOLD:
+                # -----------------------------------------------------------------
+                # FIX #6: Entry order never filled? Mark CANCELLED, not ghost.
+                # -----------------------------------------------------------------
+                terminal_status = check_entry_order_never_filled(executor, trade_id, ccxt_symbol)
+                if terminal_status:
+                    logger.warning(
+                        f"[{pair}] Trade #{trade_id} entry order terminated "
+                        f"({terminal_status}) without fill. Marking CANCELLED."
+                    )
+                    try:
+                        finalize_trade_in_db(
+                            trade_id=trade_id,
+                            exit_price=float(entry_price),
+                            pnl_usd=0.0,
+                            pnl_pct=0.0,
+                            outcome="CANCELLED",
+                            fee_usd=0.0,
+                        )
+                    except Exception as cancel_err:
+                        logger.error(f"[{pair}] Failed to mark trade #{trade_id} CANCELLED: {cancel_err}")
+                    with reconciler_lock:
+                        consecutive_zero_counts.pop(trade_id, None)
+                        first_zero_at.pop(trade_id, None)
+                        ENTRY_ORDER_CACHE.pop(trade_id, None)
+                    reconciled_count += 1
+                    send_telegram_notification(
+                        f"<b>🛑 ENTRY ORDER CANCELLED</b>\n\n"
+                        f"<b>Trade ID:</b> <code>#{trade_id}</code>\n"
+                        f"<b>Pair:</b> <code>{pair}</code>\n"
+                        f"<b>Reason:</b> <code>Entry order {terminal_status} without fill</code>"
+                    )
+                    continue
+
+                # -----------------------------------------------------------------
+                # FIX #4: Authoritative execution/list check. If Bybit already
+                # recorded a close fill, do not count this as a ghost cycle.
+                # -----------------------------------------------------------------
+                if check_unprocessed_execution_close(executor, pair):
+                    with reconciler_lock:
+                        consecutive_zero_counts[trade_id] = 0
+                        first_zero_at.pop(trade_id, None)
+                    continue
+
+                # -----------------------------------------------------------------
+                # FIX #7: Authoritative closed-pnl check BEFORE counting zero.
+                # If Bybit has already recorded a close, finalize directly.
+                # -----------------------------------------------------------------
+                real_pnl_pre, real_fee_pre, real_exit_pre = executor.fetch_real_closed_pnl(pair)
+                if real_exit_pre > 0:
+                    logger.info(
+                        f"[{pair}] Trade #{trade_id} already closed per closed-pnl "
+                        f"endpoint (exit=${real_exit_pre:.5f}). Finalizing directly."
+                    )
+                    bal_pre = float(account_balance or 100.0)
+                    pnl_usd_pre, pnl_pct_pre, outcome_pre = calculate_pnl(
+                        direction=direction,
+                        entry_price=float(entry_price),
+                        current_price=real_exit_pre,
+                        quantity=float(position_size),
+                        account_balance=bal_pre,
+                        total_fees=real_fee_pre,
+                        exchange_closed_pnl=real_pnl_pre,
+                    )
+                    if real_pnl_pre is None and real_exit_pre == float(entry_price):
+                        outcome_pre = "UNKNOWN"
+
+                    try:
+                        finalize_trade_in_db(
+                            trade_id=trade_id,
+                            exit_price=real_exit_pre,
+                            pnl_usd=pnl_usd_pre,
+                            pnl_pct=pnl_pct_pre,
+                            outcome=outcome_pre,
+                            fee_usd=real_fee_pre,
+                        )
+                    except Exception as fin_err:
+                        logger.error(f"[{pair}] Direct finalize failed for #{trade_id}: {fin_err}")
+                        continue
+
+                    set_asset_cooldown(pair)
+                    reconciled_count += 1
+                    with reconciler_lock:
+                        consecutive_zero_counts.pop(trade_id, None)
+                        first_zero_at.pop(trade_id, None)
+                        ENTRY_ORDER_CACHE.pop(trade_id, None)
+
+                    send_telegram_notification(
+                        f"<b>✅ TRADE FINALIZED VIA CLOSED-PNL</b>\n\n"
+                        f"<b>Trade ID:</b> <code>#{trade_id}</code>\n"
+                        f"<b>Pair:</b> <code>{pair}</code>\n"
+                        f"<b>Exit:</b> <code>${real_exit_pre:.5f}</code>\n"
+                        f"<b>Net PnL:</b> <code>${pnl_usd_pre:.2f}</code>"
+                    )
+                    continue
+
+                # Legacy protective-order suppression
                 if check_active_or_pending_orders(executor, ccxt_symbol):
                     with reconciler_lock:
                         consecutive_zero_counts[trade_id] = 0
+                        first_zero_at.pop(trade_id, None)
                     continue
 
+                # -----------------------------------------------------------------
+                # FIX #5: Time-based ghost detection. Require BOTH the retry
+                # threshold AND a minimum sustained-zero duration.
+                # -----------------------------------------------------------------
+                now_ts = time.time()
                 with reconciler_lock:
+                    if trade_id not in first_zero_at:
+                        first_zero_at[trade_id] = now_ts
+                    zero_duration = now_ts - first_zero_at[trade_id]
                     consecutive_zero_counts[trade_id] = consecutive_zero_counts.get(trade_id, 0) + 1
                     current_zeros = consecutive_zero_counts[trade_id]
 
-                if current_zeros < RETRY_THRESHOLD:
-                    logger.info(f"[{pair}] Zero contracts detected ({current_zeros}/{RETRY_THRESHOLD}). Waiting for confirmation.")
+                if current_zeros < RETRY_THRESHOLD or zero_duration < GHOST_MIN_SUSTAINED_ZERO_SECONDS:
+                    logger.info(
+                        f"[{pair}] Zero contracts detected "
+                        f"({current_zeros}/{RETRY_THRESHOLD}, "
+                        f"{zero_duration:.0f}s/{GHOST_MIN_SUSTAINED_ZERO_SECONDS}s). "
+                        f"Waiting for confirmation."
+                    )
                     continue
 
-                logger.warning(f"🚨 GHOST DB RECORD CONFIRMED: Trade #{trade_id} ({pair}) reached zero checks limit. Auto-closing...")
+                logger.warning(f"🚨 GHOST DB RECORD CONFIRMED: Trade #{trade_id} ({pair}) sustained zero contracts for {zero_duration:.0f}s. Auto-closing...")
 
                 real_closed_pnl, real_fee, fetched_exit = executor.fetch_real_closed_pnl(pair)
                 if fetched_exit > 0:
@@ -249,6 +440,8 @@ def reconcile_open_trades(executor: BybitFuturesLiveExecutor) -> int:
 
                 with reconciler_lock:
                     consecutive_zero_counts.pop(trade_id, None)
+                    first_zero_at.pop(trade_id, None)
+                    ENTRY_ORDER_CACHE.pop(trade_id, None)
 
                 send_telegram_notification(
                     f"<b>⚠️ DB RECONCILIATION APPLIED</b>\n\n"
@@ -260,6 +453,7 @@ def reconcile_open_trades(executor: BybitFuturesLiveExecutor) -> int:
             else:
                 with reconciler_lock:
                     consecutive_zero_counts[trade_id] = 0
+                    first_zero_at.pop(trade_id, None)
 
                 ex_pos = live_exchange_positions.get(ccxt_symbol)
                 if ex_pos:

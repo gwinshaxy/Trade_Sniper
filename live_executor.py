@@ -30,8 +30,8 @@ MIN_DUST_THRESHOLD = 0.001
 MAX_SLIPPAGE_PCT = 0.002
 MAX_ALLOWED_SPREAD_PCT = 0.003
 
-ENTRY_TOLERANCE_PCT_LIVE = 0.005
-ENTRY_TOLERANCE_PCT_TESTNET = 0.05
+ENTRY_TOLERANCE_PCT_LIVE = 0.003
+ENTRY_TOLERANCE_PCT_TESTNET = 0.03
 
 USE_MAKER_ORDERS = os.getenv("USE_MAKER_ORDERS", "true").lower() == "true"
 
@@ -238,6 +238,9 @@ class BybitFuturesLiveExecutor:
         self.position_mode = "MergedSingle"
         return 0
 
+    # ---------------------------------------------------------------------
+    # FIX #7: Authoritative closedPnl lookup used by reconciler & managers.
+    # ---------------------------------------------------------------------
     def fetch_real_closed_pnl(self, symbol: str) -> tuple:
         """Centralized helper to query Bybit's /v5/position/closed-pnl endpoint."""
         real_closed_pnl = None
@@ -263,6 +266,26 @@ class BybitFuturesLiveExecutor:
             logger.warning(f"[{symbol}] fetch_real_closed_pnl error: {e}")
 
         return real_closed_pnl, real_fee, avg_exit_price
+
+    # ---------------------------------------------------------------------
+    # FIX #4 (reconciler): Authoritative execution-list lookup.
+    # Catches closes that the private WS dropped.
+    # ---------------------------------------------------------------------
+    def fetch_recent_executions(self, symbol: str, lookback_ms: int = 300_000) -> List[Dict[str, Any]]:
+        """Queries /v5/execution/list for the authoritative fill history."""
+        try:
+            formatted = symbol.replace("/", "").replace(":USDT", "").replace("_", "").upper()
+            since = int((time.time() - lookback_ms / 1000) * 1000)
+            resp = self.exchange.private_get_v5_execution_list({
+                "category": "linear",
+                "symbol": formatted,
+                "startTime": since,
+                "limit": 50,
+            })
+            return resp.get("result", {}).get("list", []) or []
+        except Exception as e:
+            logger.warning(f"[{symbol}] execution/list lookup failed: {e}")
+            return []
 
     def format_ccxt_futures_symbol(self, raw_symbol: str) -> str:
         return format_ccxt_futures_symbol(raw_symbol)
@@ -566,6 +589,7 @@ class BybitFuturesLiveExecutor:
     # FIX B: CCXT does not reliably map Bybit V5 stopLoss/takeProfit into
     # the normalized top-level keys. Fall back to the raw info dict, which
     # always contains them. This is the field the exchange actually uses.
+    # FIX #2 (leverage): also read leverage from info dict as fallback.
     # ---------------------------------------------------------------------
     def get_futures_position(self, symbol: str) -> Dict[str, Any]:
         ccxt_symbol = format_ccxt_futures_symbol(symbol)
@@ -585,6 +609,12 @@ class BybitFuturesLiveExecutor:
                         sl = safe_float(sl_raw) if sl_raw not in (None, "") else safe_float(info.get("stopLoss", 0))
                         tp = safe_float(tp_raw) if tp_raw not in (None, "") else safe_float(info.get("takeProfit", 0))
 
+                        # FIX #2: Read leverage from info dict as fallback
+                        raw_lev = pos.get('leverage')
+                        if raw_lev in (None, "", 0, 0.0):
+                            raw_lev = info.get('leverage', 1.0)
+                        lev_val = safe_float(raw_lev, 1.0)
+
                         return {
                             "symbol": symbol,
                             "side": str(pos.get('side', '')).upper(),
@@ -592,7 +622,7 @@ class BybitFuturesLiveExecutor:
                             "entry_price": safe_float(pos.get('entryPrice', 0.0)),
                             "stop_loss": sl,
                             "take_profit": tp,
-                            "leverage": safe_float(pos.get('leverage', 1.0)),
+                            "leverage": lev_val,
                             "unrealized_pnl": safe_float(pos.get('unrealizedPnl', 0.0)),
                             "error": False
                         }
@@ -778,10 +808,32 @@ class BybitFuturesLiveExecutor:
             logger.warning(f"[{symbol}] Order Rejected: High Spread detected ({spread_pct * 100:.3f}%).")
             return {"status": "FAILED", "error": f"Spread too high ({spread_pct * 100:.3f}%)"}
 
+        # -----------------------------------------------------------------
+        # FIX #1: Make set_leverage failure FATAL, verify post-set, and
+        # reject the order if the exchange leverage does not match.
+        # -----------------------------------------------------------------
         try:
             self.exchange.set_leverage(int(leverage), ccxt_symbol)
+            logger.info(f"[{symbol}] Leverage set to {int(leverage)}x on Bybit.")
         except Exception as lev_err:
-            logger.debug(f"[{symbol}] Leverage setting notice: {lev_err}")
+            logger.error(f"[{symbol}] FAILED to set leverage to {leverage}x: {lev_err}")
+            # Verify the current leverage before proceeding
+            try:
+                pos_check_pre = self.get_futures_position(ccxt_symbol)
+                actual_lev_pre = safe_float(pos_check_pre.get("leverage", 0), 0.0)
+                if actual_lev_pre and abs(actual_lev_pre - leverage) > 0.5:
+                    return {
+                        "status": "FAILED",
+                        "error": (
+                            f"Leverage mismatch: requested {leverage}x, "
+                            f"exchange reports {actual_lev_pre}x. Order aborted."
+                        ),
+                    }
+            except Exception as verify_err:
+                return {
+                    "status": "FAILED",
+                    "error": f"Could not verify leverage after failed set_leverage: {lev_err} | verify: {verify_err}",
+                }
 
         if stop_loss > 0 and abs(ref_price - stop_loss) > 0:
             risk_amount_usd = account_balance * (risk_pct / 100.0)
@@ -1026,6 +1078,34 @@ class BybitFuturesLiveExecutor:
                 f"[{symbol}] Futures Order Filled: Side {side.upper()}, "
                 f"Price ${fill_price:.6f}, Qty {executed_qty}, Status={status}"
             )
+
+            # -----------------------------------------------------------------
+            # FIX #1: Post-fill leverage verification. If the position opened
+            # at a different leverage than requested, close it immediately to
+            # prevent oversized risk exposure.
+            # -----------------------------------------------------------------
+            try:
+                time.sleep(1.0)
+                verify_pos = self.get_futures_position(ccxt_symbol)
+                if verify_pos.get("contracts", 0) > MIN_DUST_THRESHOLD:
+                    actual_lev = safe_float(verify_pos.get("leverage", 0), 0.0)
+                    if actual_lev and abs(actual_lev - leverage) > 0.5:
+                        logger.critical(
+                            f"🚨 [{symbol}] LEVERAGE MISMATCH: requested {leverage}x, "
+                            f"position opened at {actual_lev}x. Closing to prevent oversized risk."
+                        )
+                        self.close_live_position_bybit(
+                            symbol=symbol, position_size=executed_qty,
+                            current_price=fill_price, outcome="LEVERAGE_MISMATCH"
+                        )
+                        return {
+                            "status": "FAILED",
+                            "error": f"Leverage mismatch: {actual_lev}x vs requested {leverage}x",
+                        }
+                    elif actual_lev:
+                        logger.info(f"[{symbol}] Post-fill leverage verified: {actual_lev}x.")
+            except Exception as lev_verify_err:
+                logger.warning(f"[{symbol}] Post-fill leverage verification failed: {lev_verify_err}")
 
             # Attach SL; if it fails, cancel pending orders and close position
             sl_attached = False

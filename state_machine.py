@@ -143,6 +143,7 @@ class StateMachineEngine:
                 executed_qty = exec_result["executed_qty"]
                 fill_price = exec_result["fill_price"]
                 sl_attached = exec_result.get("stop_loss_attached", False)
+                entry_order_id = exec_result.get("order_id")
 
                 conn_db = get_db_connection()
                 if conn_db:
@@ -180,6 +181,18 @@ class StateMachineEngine:
                             conn_db.commit()
 
                         if trade_id is not None:
+                            # -----------------------------------------------------------------
+                            # FIX #8: Register the entry order ID in the reconciler's
+                            # cache so it can verify the order status before declaring
+                            # the trade a ghost.
+                            # -----------------------------------------------------------------
+                            if entry_order_id:
+                                try:
+                                    from reconciler import mark_trade_entry_order
+                                    mark_trade_entry_order(trade_id, entry_order_id)
+                                except Exception as reg_err:
+                                    logger.debug(f"[{symbol}] Entry order cache registration failed: {reg_err}")
+
                             emoji = "🟢" if direction in ["BUY", "LONG"] else "🔴"
                             sl_status = "✅ Attached" if sl_attached else "⚠️ Fallback Active"
                             send_telegram_notification(

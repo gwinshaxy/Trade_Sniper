@@ -142,6 +142,13 @@ from common import (
 )
 from live_executor import LiveExecutionEngine
 
+# FIX #3: Import STRATEGY_CONFIG once at module load so the leverage input
+# can be pre-populated from config.json instead of a hard-coded default.
+try:
+    from config import STRATEGY_CONFIG as _STRAT_CFG
+except ImportError:
+    _STRAT_CFG = {}
+
 try:
     import strategy
 except ModuleNotFoundError:
@@ -315,7 +322,16 @@ disable_htf = st.sidebar.checkbox(
 
 st.sidebar.markdown("---")
 direction = st.sidebar.selectbox("Order Direction", ["BUY", "SELL"])
-leverage = st.sidebar.number_input("Leverage", min_value=1, max_value=100, value=5)
+
+# FIX #3: Read leverage from config.json / STRATEGY_CONFIG instead of hard-coded 5
+_default_leverage = int(_STRAT_CFG.get("leverage", 5)) if isinstance(_STRAT_CFG, dict) else 5
+leverage = st.sidebar.number_input(
+    "Leverage",
+    min_value=1,
+    max_value=100,
+    value=_default_leverage,
+)
+
 overlay_chart = st.sidebar.checkbox("Overlay Trade Positions on Chart", value=True)
 overlay_gaps = st.sidebar.checkbox("Overlay Volume Profile Gaps", value=True)
 
@@ -348,17 +364,34 @@ if st.sidebar.button("🚀 Execute Live Futures Order via Bybit API", use_contai
             if res.get("status") == "SUCCESS":
                 fill_price = res["fill_price"]
                 executed_qty = res["executed_qty"]
-                
+                # FIX #8: capture the entry order ID for reconciler registration
+                manual_entry_order_id = res.get("order_id")
+
                 conn_exec = get_db_connection()
+                manual_trade_id = None
                 if conn_exec:
                     try:
                         with conn_exec.cursor() as cur:
+                            # FIX #8: RETURNING id so the trade_id is captured
                             cur.execute("""
                                 INSERT INTO trade_setups 
                                 (pair, direction, entry_price, stop_loss, take_profit, position_size, status, trade_state, account_balance, risk_pct)
-                                VALUES (%s, %s, %s, %s, %s, %s, 'EXECUTED', 'OPEN', %s, %s);
+                                VALUES (%s, %s, %s, %s, %s, %s, 'EXECUTED', 'OPEN', %s, %s)
+                                RETURNING id;
                             """, (config_target_pair, direction, fill_price, stop_loss, take_profit, executed_qty, account_balance, risk_pct))
+                            row = cur.fetchone()
+                            manual_trade_id = row[0] if row else None
                             conn_exec.commit()
+
+                        # FIX #8: register entry order ID with the reconciler so
+                        # it can verify the order status before declaring the
+                        # trade a ghost.
+                        if manual_trade_id and manual_entry_order_id:
+                            try:
+                                from reconciler import mark_trade_entry_order
+                                mark_trade_entry_order(manual_trade_id, manual_entry_order_id)
+                            except Exception as reg_err:
+                                logger.debug(f"[{config_target_pair}] Entry order cache registration failed: {reg_err}")
                     finally:
                         release_db_connection(conn_exec)
 

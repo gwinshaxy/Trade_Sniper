@@ -30,8 +30,8 @@ EXPECTED_MEXC_COLUMNS = [
 # ---------------------------------------------------------------------------
 # GLOBAL TIMEFRAME CONSTANTS (RECONCILIATION)
 # ---------------------------------------------------------------------------
-EXECUTION_TIMEFRAME = "4h"       # Signal generation / entry timeframe
-MACRO_TIMEFRAME = "1d"           # HTF confluence timeframe
+EXECUTION_TIMEFRAME = "1h"       # Signal generation / entry timeframe
+MACRO_TIMEFRAME = "4h"           # HTF confluence timeframe
 HTF_TEMA_PERIOD = 200            # TEMA period for 4H macro trend
 
 
