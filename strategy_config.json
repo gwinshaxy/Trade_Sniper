@@ -12,10 +12,14 @@
   "max_sl_pct": 0.015,
   "min_atr_pct": 0.2,
   "atr_mult_sl": 2.5,
-  "min_rr": 2.5,
+  "min_rr": 2.0,
   "scan_interval_minutes": 60,
-  "alert_cooldown_hours": 4,
+  "alert_cooldown_hours": 4 ,
   "enable_live_trading": true,
+  "disable_htf": false,
+  "atr_ratio_thresh": 1.0,   
+  "zone_tolerance": 0.01245, 
+  "lookback_bars": 600,  
   "watchlist": [
     "XRP/USDT",
     "SOL/USDT"

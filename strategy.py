@@ -173,10 +173,6 @@ def calculate_rsi(series: pd.Series, period: int = 14) -> pd.Series:
 
 
 def calculate_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
-    """
-    RECONCILIATION: Wilder's ATR smoothing (EMA with alpha=1/period)
-    instead of simple rolling mean. Matches dry-run script behavior.
-    """
     if df.empty or len(df) < period + 1:
         return pd.Series(0.0, index=df.index)
 
@@ -194,11 +190,6 @@ def calculate_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
 
 
 def calculate_adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
-    """
-    RECONCILIATION: Wilder's smoothing for DM/TR/DI/DX/ADX.
-    Uses EMA with alpha=1/period instead of simple rolling mean.
-    Matches dry-run script behavior.
-    """
     if df.empty or len(df) < period + 1:
         return pd.Series(0.0, index=df.index)
 
@@ -233,18 +224,144 @@ def calculate_adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
 
 
 # ---------------------------------------------------------------------------
-# 4. VOLUME PROFILE & LIQUIDITY GAPS
+# 4. ENTRY & EXIT OPTIMIZATION MODULES
+# ---------------------------------------------------------------------------
+
+def determine_limit_entry(
+    direction: str,
+    current_price: float,
+    current_tema: float,
+    val: float,
+    vah: float,
+    near_val: bool,
+    near_vah: bool
+) -> float:
+    if direction == "LONG":
+        if near_val and not np.isnan(val) and val < current_price:
+            return float(val)
+        return float(min(current_price, current_tema))
+        
+    elif direction == "SHORT":
+        if near_vah and not np.isnan(vah) and vah > current_price:
+            return float(vah)
+        return float(max(current_price, current_tema))
+
+    return current_price
+
+
+def check_ltf_confirmation(
+    symbol: str, 
+    direction: str, 
+    ltf_interval: str = "15m", 
+    rsi_period: int = 14
+) -> bool:
+    df_ltf = fetch_klines(symbol=symbol, interval=ltf_interval, limit=50)
+    if df_ltf.empty or len(df_ltf) < 20:
+        return True
+
+    df_ltf['ema9'] = calculate_ema(df_ltf['close'], 9)
+    df_ltf['ema21'] = calculate_ema(df_ltf['close'], 21)
+    df_ltf['rsi'] = calculate_rsi(df_ltf['close'], period=rsi_period)
+
+    last_ltf = df_ltf.iloc[-1]
+    prev_ltf = df_ltf.iloc[-2]
+
+    if direction in ["BUY", "LONG"]:
+        ema_cross = (last_ltf['ema9'] > last_ltf['ema21'])
+        rsi_rising = (last_ltf['rsi'] > prev_ltf['rsi']) and (last_ltf['rsi'] > 40.0)
+        return bool(ema_cross or rsi_rising)
+
+    elif direction in ["SELL", "SHORT"]:
+        ema_cross = (last_ltf['ema9'] < last_ltf['ema21'])
+        rsi_falling = (last_ltf['rsi'] < prev_ltf['rsi']) and (last_ltf['rsi'] < 60.0)
+        return bool(ema_cross or rsi_falling)
+
+    return False
+
+
+def check_volume_confirmation(df: pd.DataFrame, period: int = 20) -> bool:
+    if "volume" not in df.columns or len(df) < period:
+        return True
+
+    vol_sma = df['volume'].rolling(period).mean().iloc[-1]
+    last_volume = df['volume'].iloc[-1]
+
+    return bool(last_volume > vol_sma)
+
+
+def calculate_staged_targets(
+    direction: str,
+    entry_price: float,
+    stop_loss: float,
+    farthest_tp: float,
+    tp1_rr: float = 1.5
+) -> Dict[str, float]:
+    sl_distance = abs(entry_price - stop_loss)
+
+    if direction in ["BUY", "LONG"]:
+        tp1 = entry_price + (sl_distance * tp1_rr)
+        tp2 = max(farthest_tp, tp1)
+    else:
+        tp1 = entry_price - (sl_distance * tp1_rr)
+        tp2 = min(farthest_tp, tp1)
+
+    return {
+        "tp1": round(tp1, 5),
+        "tp1_ratio": 0.50,
+        "tp2": round(tp2, 5),
+        "tp2_ratio": 0.50
+    }
+
+
+def calculate_dynamic_trailing_stop(
+    direction: str,
+    entry_price: float,
+    current_price: float,
+    highest_price_since_entry: float,
+    lowest_price_since_entry: float,
+    current_atr: float,
+    atr_mult: float = 2.5,
+    tp1_hit: bool = False
+) -> float:
+    sl_distance = current_atr * atr_mult
+
+    if direction in ["BUY", "LONG"]:
+        trailing_sl = highest_price_since_entry - sl_distance
+        if tp1_hit:
+            trailing_sl = max(trailing_sl, entry_price)
+        return float(max(trailing_sl, entry_price - (current_atr * atr_mult)))
+
+    else:
+        trailing_sl = lowest_price_since_entry + sl_distance
+        if tp1_hit:
+            trailing_sl = min(trailing_sl, entry_price)
+        return float(min(trailing_sl, entry_price + (current_atr * atr_mult)))
+
+
+def check_time_based_invalidation(
+    bars_in_trade: int, 
+    max_bars: int = 24, 
+    pnl_pct: float = 0.0
+) -> bool:
+    if bars_in_trade >= max_bars and pnl_pct < 0.01:
+        return True
+    return False
+
+
+# ---------------------------------------------------------------------------
+# 5. HIGH-PERFORMANCE VECTORIZED VOLUME PROFILE & LIQUIDITY GAPS
 # ---------------------------------------------------------------------------
 
 def compute_volume_profile(df: pd.DataFrame, num_bins: int = 100, lookback_bars: int = 600, va_pct: float = 0.70):
-    if df.empty or "volume" not in df.columns or "high" not in df.columns or "low" not in df.columns:
+    if df.empty or len(df) < 5 or "volume" not in df.columns:
         return np.nan, np.nan, np.nan
 
-    df_range = df.tail(lookback_bars).copy()
-    if df_range.empty:
-        return np.nan, np.nan, np.nan
+    df_range = df.tail(lookback_bars)
+    lows = df_range["low"].values
+    highs = df_range["high"].values
+    vols = df_range["volume"].values
 
-    pLST, pHST = float(df_range["low"].min()), float(df_range["high"].max())
+    pLST, pHST = float(np.min(lows)), float(np.max(highs))
     if pLST >= pHST or np.isnan(pLST) or np.isnan(pHST):
         return np.nan, np.nan, np.nan
 
@@ -252,16 +369,17 @@ def compute_volume_profile(df: pd.DataFrame, num_bins: int = 100, lookback_bars:
     if pSTP <= 0:
         return np.nan, np.nan, np.nan
 
-    vD_vt = np.zeros(num_bins)
+    vD_vt = np.zeros(num_bins, dtype=np.float64)
+    ranges = np.maximum(highs - lows, 1e-8)
 
-    for _, row in df_range.iterrows():
-        lL, lH, lV = float(row["low"]), float(row["high"]), float(row["volume"])
-        lR = max(lH - lL, 1e-8)
+    sSI = np.maximum(np.floor((lows - pLST) / pSTP).astype(int), 0)
+    eSI = np.minimum(np.floor((highs - pLST) / pSTP).astype(int), num_bins - 1)
 
-        sSI = max(int(np.floor((lL - pLST) / pSTP)), 0)
-        eSI = min(int(np.floor((lH - pLST) / pSTP)), num_bins - 1)
+    for i in range(len(df_range)):
+        lL, lH, lV, lR = lows[i], highs[i], vols[i], ranges[i]
+        start_b, end_b = sSI[i], eSI[i]
 
-        for pLI in range(sSI, eSI + 1):
+        for pLI in range(start_b, end_b + 1):
             pL = pLST + pLI * pSTP
             if lL >= pL and lH > pL + pSTP:
                 vPOR = (pL + pSTP - lL) / lR
@@ -305,19 +423,30 @@ def calculate_volume_profile_gaps(
     df: pd.DataFrame,
     num_bins: int = 100,
     lookback_bars: int = 600,
-    detection_pct: float = 0.07
+    detection_pct: float = 0.07,
+    cached_vp: Optional[Dict[str, Any]] = None
 ) -> Dict[str, Any]:
+    if cached_vp is not None:
+        current_price = float(df.iloc[-1]["close"])
+        gaps = cached_vp.get("unique_gaps", [])
+        return {
+            "poc": cached_vp["poc"],
+            "vah": cached_vp["vah"],
+            "val": cached_vp["val"],
+            "overhead_gaps": sorted([g for g in gaps if g > current_price]),
+            "underneath_gaps": sorted([g for g in gaps if g < current_price], reverse=True)
+        }
+
     empty_res = {"poc": np.nan, "vah": np.nan, "val": np.nan, "overhead_gaps": [], "underneath_gaps": []}
-    if df.empty or "volume" not in df.columns or "high" not in df.columns or "low" not in df.columns:
+    if df.empty or "volume" not in df.columns:
         return empty_res
 
     poc, vah, val = compute_volume_profile(df, num_bins=num_bins, lookback_bars=lookback_bars)
 
-    df_range = df.tail(lookback_bars).copy()
-    if df_range.empty:
-        return empty_res
+    df_range = df.tail(lookback_bars)
+    lows, highs, vols = df_range["low"].values, df_range["high"].values, df_range["volume"].values
+    pLST, pHST = float(np.min(lows)), float(np.max(highs))
 
-    pLST, pHST = float(df_range["low"].min()), float(df_range["high"].max())
     if pLST >= pHST or np.isnan(pLST) or np.isnan(pHST):
         return empty_res
 
@@ -325,26 +454,16 @@ def calculate_volume_profile_gaps(
     if pSTP <= 0:
         return empty_res
 
-    vD_vt = np.zeros(num_bins)
+    vD_vt = np.zeros(num_bins, dtype=np.float64)
+    ranges = np.maximum(highs - lows, 1e-8)
+    sSI = np.maximum(np.floor((lows - pLST) / pSTP).astype(int), 0)
+    eSI = np.minimum(np.floor((highs - pLST) / pSTP).astype(int), num_bins - 1)
 
-    for _, row in df_range.iterrows():
-        lL, lH, lV = float(row["low"]), float(row["high"]), float(row["volume"])
-        lR = max(lH - lL, 1e-8)
-
-        sSI = max(int(np.floor((lL - pLST) / pSTP)), 0)
-        eSI = min(int(np.floor((lH - pLST) / pSTP)), num_bins - 1)
-
-        for pLI in range(sSI, eSI + 1):
+    for i in range(len(df_range)):
+        lL, lH, lV, lR = lows[i], highs[i], vols[i], ranges[i]
+        for pLI in range(sSI[i], eSI[i] + 1):
             pL = pLST + pLI * pSTP
-            if lL >= pL and lH > pL + pSTP:
-                vPOR = (pL + pSTP - lL) / lR
-            elif lH <= pL + pSTP and lL < pL:
-                vPOR = (lH - pL) / lR
-            elif lL >= pL and lH <= pL + pSTP:
-                vPOR = 1.0
-            else:
-                vPOR = pSTP / lR
-
+            vPOR = 1.0 if (lL >= pL and lH <= pL + pSTP) else (pSTP / lR)
             vD_vt[pLI] += lV * max(vPOR, 0.0)
 
     noN = max(int(num_bins * detection_pct), 1)
@@ -377,12 +496,13 @@ def calculate_volume_profile_gaps(
         "vah": vah,
         "val": val,
         "overhead_gaps": overhead_gaps,
-        "underneath_gaps": underneath_gaps
+        "underneath_gaps": underneath_gaps,
+        "unique_gaps": unique_gaps
     }
 
 
 # ---------------------------------------------------------------------------
-# 5. SYMBOL CONFIGURATION & PARAMETERS
+# 6. SYMBOL CONFIGURATION & PARAMETERS
 # ---------------------------------------------------------------------------
 
 def normalize_symbol(symbol: str) -> str:
@@ -396,9 +516,32 @@ def normalize_symbol(symbol: str) -> str:
     return s
 
 
+SYMBOL_PARAMETER_DEFAULTS: Dict[str, Dict[str, Any]] = {
+    "SOL/USDT": {"adx_threshold": 20.0},
+    "SOLUSDT": {"adx_threshold": 20.0},
+}
+
+
 def load_symbol_config(symbol: str) -> Dict[str, Any]:
     formatted_symbol = normalize_symbol(symbol)
     raw_symbol = formatted_symbol.replace("/", "").upper()
+
+    sym_defaults = (
+        SYMBOL_PARAMETER_DEFAULTS.get(formatted_symbol)
+        or SYMBOL_PARAMETER_DEFAULTS.get(raw_symbol)
+        or {}
+    )
+
+    default_config = {
+        "tema_period": 200, "rsi_period": 14, "rsi_thresh": 42.0,
+        "adx_period": 14, "adx_threshold": sym_defaults.get("adx_threshold", 20.0),
+        "use_adx_filter": True, "use_rsi_filter": True, "use_candlestick_confirm": True,
+        "zone_tolerance": 0.015, "max_sl_pct": 0.015, "min_sentiment": 0.0,
+        "min_rr": 1.5, "risk_pct": 1.0, "vp_detection_pct": 0.07, "lookback_bars": 600,
+        "vp_va_pct": 0.70, "atr_period": 14, "atr_mult": 1.5,
+        "atr_long_period": 100, "atr_ratio_thresh": 1.0,
+        "use_atr_sl": True, "disable_htf": False, "spot_only": False
+    }
 
     if HAS_DB:
         conn = get_db_connection()
@@ -418,22 +561,23 @@ def load_symbol_config(symbol: str) -> Dict[str, Any]:
                     cursor.close()
                     config = dict(zip(colnames, row)) if isinstance(row, tuple) else dict(row)
 
-                    config["tema_period"] = int(config.get("tema_period", 200))
-                    config["rsi_period"] = int(config.get("rsi_period", 14))
-                    config["rsi_thresh"] = float(config.get("rsi_thresh", 42.0))
-                    config["adx_period"] = int(config.get("adx_period", 14))
-                    config["adx_threshold"] = float(config.get("adx_threshold", 22.0))
-                    config["max_sl_pct"] = float(config.get("max_sl_pct", 0.015))
-                    config["zone_tolerance"] = float(config.get("zone_tolerance", 0.005))
-                    config["min_sentiment"] = float(config.get("min_sentiment", 0.0))
-                    config["risk_pct"] = float(config.get("risk_pct", 0.5))
-                    config["min_rr"] = float(config.get("min_rr", 2.0))
-                    # RECONCILIATION: default lookback_bars reduced from 1200 -> 600
-                    config["lookback_bars"] = int(config.get("lookback_bars", 600))
-                    config["vp_detection_pct"] = float(config.get("vp_detection_pct", 0.07))
-                    config["vp_va_pct"] = float(config.get("vp_va_pct", 0.70))
-                    config["atr_period"] = int(config.get("atr_period", 14))
-                    config["atr_mult"] = float(config.get("atr_mult", 1.5))
+                    config["tema_period"] = int(config.get("tema_period", default_config["tema_period"]))
+                    config["rsi_period"] = int(config.get("rsi_period", default_config["rsi_period"]))
+                    config["rsi_thresh"] = float(config.get("rsi_thresh", default_config["rsi_thresh"]))
+                    config["adx_period"] = int(config.get("adx_period", default_config["adx_period"]))
+                    config["adx_threshold"] = float(config.get("adx_threshold", default_config["adx_threshold"]))
+                    config["max_sl_pct"] = float(config.get("max_sl_pct", default_config["max_sl_pct"]))
+                    config["zone_tolerance"] = float(config.get("zone_tolerance", default_config["zone_tolerance"]))
+                    config["min_sentiment"] = float(config.get("min_sentiment", default_config["min_sentiment"]))
+                    config["risk_pct"] = float(config.get("risk_pct", default_config["risk_pct"]))
+                    config["min_rr"] = float(config.get("min_rr", default_config["min_rr"]))
+                    config["lookback_bars"] = int(config.get("lookback_bars", default_config["lookback_bars"]))
+                    config["vp_detection_pct"] = float(config.get("vp_detection_pct", default_config["vp_detection_pct"]))
+                    config["vp_va_pct"] = float(config.get("vp_va_pct", default_config["vp_va_pct"]))
+                    config["atr_period"] = int(config.get("atr_period", default_config["atr_period"]))
+                    config["atr_mult"] = float(config.get("atr_mult", default_config["atr_mult"]))
+                    config["atr_long_period"] = int(config.get("atr_long_period", default_config["atr_long_period"]))
+                    config["atr_ratio_thresh"] = float(config.get("atr_ratio_thresh", default_config["atr_ratio_thresh"]))
 
                     config.setdefault("use_rsi_filter", True)
                     config.setdefault("use_candlestick_confirm", True)
@@ -448,19 +592,11 @@ def load_symbol_config(symbol: str) -> Dict[str, Any]:
             finally:
                 release_db_connection(conn)
 
-    return {
-        "tema_period": 200, "rsi_period": 14, "rsi_thresh": 42.0,
-        "adx_period": 14, "adx_threshold": 22.0,
-        "use_adx_filter": True, "use_rsi_filter": True, "use_candlestick_confirm": True,
-        "zone_tolerance": 0.005, "max_sl_pct": 0.015, "min_sentiment": 0.0,
-        "min_rr": 2.0, "risk_pct": 0.5, "vp_detection_pct": 0.07, "lookback_bars": 600,
-        "vp_va_pct": 0.70, "atr_period": 14, "atr_mult": 1.5,
-        "use_atr_sl": True, "disable_htf": False, "spot_only": False
-    }
+    return default_config
 
 
 # ---------------------------------------------------------------------------
-# 6. HARMONIZED MULTI-DIRECTIONAL EVALUATION ENGINE
+# 7. HARMONIZED MULTI-DIRECTIONAL EVALUATION ENGINE
 # ---------------------------------------------------------------------------
 
 def evaluate_signals(
@@ -485,7 +621,8 @@ def evaluate_signals(
     use_atr_sl: Optional[bool] = None,
     disable_htf: Optional[bool] = None,
     spot_only: Optional[bool] = None,
-    sentiment_score: Optional[float] = None
+    sentiment_score: Optional[float] = None,
+    cached_vp: Optional[Dict[str, Any]] = None
 ) -> Dict[str, Any]:
     no_signal = {
         "action": "HOLD", "symbol": symbol, "direction": "NONE",
@@ -522,61 +659,99 @@ def evaluate_signals(
         no_signal["reason"] = "Insufficient data rows"
         return no_signal
 
-    df = df.copy()
-    df["tema"] = calculate_tema(df["close"], tema_period)
-    df["rsi"] = calculate_rsi(df["close"], rsi_period)
-    df["adx"] = calculate_adx(df, adx_period)
-    df["atr"] = calculate_atr(df, atr_period)
+    if not check_volume_confirmation(df, period=20):
+        no_signal["reason"] = "Volume Gate: Trigger candle volume below 20-SMA volume"
+        return no_signal
+
+    tema_series = df["tema"] if "tema" in df.columns else calculate_tema(df["close"], tema_period)
+    rsi_series = df["rsi"] if "rsi" in df.columns else calculate_rsi(df["close"], rsi_period)
+    adx_series = df["adx"] if "adx" in df.columns else calculate_adx(df, adx_period)
+    atr_series = df["atr"] if "atr" in df.columns else calculate_atr(df, atr_period)
 
     last_row = df.iloc[-1]
     prev_row = df.iloc[-2]
     current_price = float(last_row["close"])
-    current_tema = float(last_row["tema"])
-    current_rsi = float(last_row["rsi"])
-    current_adx = float(last_row["adx"])
-    current_atr = float(last_row["atr"])
+    current_tema = float(tema_series.iloc[-1])
+    current_rsi = float(rsi_series.iloc[-1])
+    current_atr = float(atr_series.iloc[-1])
 
     final_sentiment = float(sentiment_score) if sentiment_score is not None else 0.5
     if final_sentiment < min_sentiment:
         no_signal["reason"] = f"Sentiment score ({final_sentiment:.2f}) below threshold ({min_sentiment:.2f})"
         return no_signal
 
-    # -----------------------------------------------------------------------
-    # HTF CONFLUENCE (RECONCILIATION: 4H TEMA(200) with slope confirmation)
-    # -----------------------------------------------------------------------
+    effective_adx_threshold = float(adx_threshold)
+
+    atr_short_period = int(atr_period)
+    atr_long_period = int(sym_cfg.get("atr_long_period", 100))
+    atr_ratio_thresh = float(sym_cfg.get("atr_ratio_thresh", 1.0))
+
+    atr_short_series = df["atr_short"] if "atr_short" in df.columns else calculate_atr(df, atr_short_period)
+    atr_long_series = df["atr_long"] if "atr_long" in df.columns else calculate_atr(df, atr_long_period)
+
+    current_adx = float(adx_series.iloc[-1])
+    current_atr_short = float(atr_short_series.iloc[-1])
+    current_atr_long = float(atr_long_series.iloc[-1])
+
+    atr_ratio = (current_atr_short / current_atr_long) if current_atr_long > 0 else 0.0
+
+    adx_gate_passed = (not use_adx_filter) or (current_adx >= effective_adx_threshold)
+    atr_ratio_passed = atr_ratio > atr_ratio_thresh
+
+    if not (adx_gate_passed or atr_ratio_passed):
+        no_signal["reason"] = (
+            f"Volatility Gate Blocked: ADX={current_adx:.2f} (Required > {effective_adx_threshold}), "
+            f"ATR Ratio={atr_ratio:.2f} (Required > {atr_ratio_thresh})"
+        )
+        return no_signal
+
     macro_trend_long = True
     macro_trend_short = True
 
     if not disable_htf:
         try:
-            df_htf = fetch_klines(symbol, interval=MACRO_TIMEFRAME, limit=max(HTF_TEMA_PERIOD + 20, 250))
-            if not df_htf.empty and len(df_htf) >= HTF_TEMA_PERIOD + 2:
-                df_htf["tema_htf"] = calculate_tema(df_htf["close"], HTF_TEMA_PERIOD)
-                htf_last = df_htf.iloc[-1]
-                htf_prev = df_htf.iloc[-2]
+            if "macro_long" in df.columns and "macro_short" in df.columns:
+                macro_trend_long = bool(last_row["macro_long"])
+                macro_trend_short = bool(last_row["macro_short"])
+            else:
+                # Ensure timestamp is available as a column or reset index if it's already the index
+                work_df = df.copy()
+                if 'timestamp' not in work_df.columns and isinstance(work_df.index, pd.DatetimeIndex):
+                    work_df = work_df.reset_index()
+                
+                if 'timestamp' in work_df.columns:
+                    work_df['timestamp'] = pd.to_datetime(work_df['timestamp'])
+                    df_htf = work_df.set_index('timestamp').resample('4h').agg({
+                        'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'volume': 'sum'
+                    }).dropna().reset_index()
 
-                htf_close = float(htf_last["close"])
-                htf_tema_now = float(htf_last["tema_htf"])
-                htf_tema_prev = float(htf_prev["tema_htf"])
+                    if not df_htf.empty and len(df_htf) >= HTF_TEMA_PERIOD + 2:
+                        df_htf["tema_htf"] = calculate_tema(df_htf["close"], HTF_TEMA_PERIOD)
+                        htf_last = df_htf.iloc[-1]
+                        htf_prev = df_htf.iloc[-2]
 
-                macro_trend_long = (htf_close > htf_tema_now) and (htf_tema_now > htf_tema_prev)
-                macro_trend_short = (htf_close < htf_tema_now) and (htf_tema_now < htf_tema_prev)
+                        htf_close = float(htf_last["close"])
+                        htf_tema_now = float(htf_last["tema_htf"])
+                        htf_tema_prev = float(htf_prev["tema_htf"])
+
+                        macro_trend_long = (htf_close > htf_tema_now) and (htf_tema_now > htf_tema_prev)
+                        macro_trend_short = (htf_close < htf_tema_now) and (htf_tema_now < htf_tema_prev)
+                else:
+                    logger.warning(f"[{symbol}] 'timestamp' column not found in DataFrame for HTF resampling.")
         except Exception as e:
-            logger.warning(f"[{symbol}] Could not calculate HTF {MACRO_TIMEFRAME} TEMA({HTF_TEMA_PERIOD}) confluence: {e}")
+            logger.warning(f"[{symbol}] Could not calculate HTF macro confluence: {e}")
 
-    vp_data = calculate_volume_profile_gaps(df, num_bins=100, lookback_bars=lookback_bars, detection_pct=vp_detection_pct)
-    poc = vp_data["poc"]
-    vah = vp_data["vah"]
-    val = vp_data["val"]
-    overhead_gaps = vp_data["overhead_gaps"]
-    underneath_gaps = vp_data["underneath_gaps"]
+    vp_data = calculate_volume_profile_gaps(
+        df,
+        lookback_bars=lookback_bars,
+        detection_pct=vp_detection_pct,
+        cached_vp=cached_vp
+    )
+    poc, vah, val = vp_data["poc"], vp_data["vah"], vp_data["val"]
+    overhead_gaps, underneath_gaps = vp_data["overhead_gaps"], vp_data["underneath_gaps"]
 
-    adx_valid = (not use_adx_filter) or (current_adx >= adx_threshold)
     MIN_SL_PCT = 0.002
 
-    # -----------------------------------------------------------------------
-    # PROXIMITY ZONES (RECONCILIATION: TEMA + VAL/VAH + gap proximity)
-    # -----------------------------------------------------------------------
     upper_tema_zone = current_tema * (1.0 + zone_tolerance)
     lower_tema_zone = current_tema * (1.0 - zone_tolerance)
     near_tema = lower_tema_zone <= current_price <= upper_tema_zone
@@ -610,11 +785,17 @@ def evaluate_signals(
         (current_price > current_tema)
         and long_zone_ok
         and long_rsi_valid
-        and adx_valid
         and long_candlestick
         and macro_trend_long
     ):
-        entry_price = float(current_price)
+        if not check_ltf_confirmation(symbol, direction="LONG", ltf_interval="15m", rsi_period=rsi_period):
+            no_signal["reason"] = "LTF Gate: 15m momentum cross/RSI not aligned for LONG entry"
+            return no_signal
+
+        entry_price = determine_limit_entry(
+            direction="LONG", current_price=current_price, current_tema=current_tema,
+            val=val, vah=vah, near_val=near_val, near_vah=near_vah
+        )
 
         if use_atr_sl and current_atr > 0:
             sl_dist = max(current_atr * atr_mult, entry_price * MIN_SL_PCT)
@@ -631,42 +812,37 @@ def evaluate_signals(
         if sl_distance < (entry_price * MIN_SL_PCT):
             return no_signal
 
-        # RECONCILIATION: farthest valid TP candidate selection
         min_tp = entry_price + (sl_distance * min_rr)
-        tp_candidates: List[float] = []
-
-        for g in overhead_gaps:
-            gf = float(g)
-            if gf >= min_tp:
-                tp_candidates.append(gf)
+        tp_candidates = [float(g) for g in overhead_gaps if float(g) >= min_tp]
 
         for ref in (vah, poc):
             if ref is not None and not (isinstance(ref, float) and np.isnan(ref)):
-                rf = float(ref)
-                if rf >= min_tp:
-                    tp_candidates.append(rf)
+                if float(ref) >= min_tp:
+                    tp_candidates.append(float(ref))
 
-        if tp_candidates:
-            take_profit = max(tp_candidates)
-        else:
-            take_profit = min_tp
+        farthest_tp = max(tp_candidates) if tp_candidates else min_tp
+        computed_rr = (farthest_tp - entry_price) / sl_distance
 
-        computed_rr = (take_profit - entry_price) / sl_distance
         if computed_rr >= min_rr:
             risk_amt = float(account_balance) * (risk_pct / 100.0)
             position_size = round(risk_amt / sl_distance, 6) if sl_distance > 0 else 0.0
 
+            staged_targets = calculate_staged_targets(
+                direction="LONG", entry_price=entry_price, stop_loss=stop_loss,
+                farthest_tp=farthest_tp, tp1_rr=1.5
+            )
+
             return {
-                "action": "BUY", "symbol": symbol, "direction": "LONG",
-                "entry_price": float(entry_price), "stop_loss": float(stop_loss),
-                "take_profit": float(take_profit), "atr": float(round(current_atr, 4)),
-                "rr_ratio": float(computed_rr),
-                "risk_pct": float(risk_pct),
+                "action": "BUY", "order_type": "LIMIT", "symbol": symbol, "direction": "LONG",
+                "entry_price": float(round(entry_price, 5)),
+                "stop_loss": float(round(stop_loss, 5)),
+                "take_profit": float(round(farthest_tp, 5)),
+                "tp1": staged_targets["tp1"], "tp1_ratio": staged_targets["tp1_ratio"],
+                "tp2": staged_targets["tp2"], "tp2_ratio": staged_targets["tp2_ratio"],
+                "max_bar_duration": 24, "atr": float(round(current_atr, 4)),
+                "rr_ratio": float(computed_rr), "risk_pct": float(risk_pct),
                 "position_size": float(position_size),
-                "reason": (
-                    f"Long confluence: 4H TEMA({HTF_TEMA_PERIOD}) macro bullish, "
-                    f"price in TEMA/VAL/gap zone, R:R={computed_rr:.2f}"
-                )
+                "reason": f"Long confluence: 4H TEMA({HTF_TEMA_PERIOD}) macro bullish, limit entry calculated, R:R={computed_rr:.2f}"
             }
 
     # -----------------------------------------------------------------------
@@ -687,11 +863,17 @@ def evaluate_signals(
             (current_price < current_tema)
             and short_zone_ok
             and short_rsi_valid
-            and adx_valid
             and short_candlestick
             and macro_trend_short
         ):
-            entry_price = float(current_price)
+            if not check_ltf_confirmation(symbol, direction="SHORT", ltf_interval="15m", rsi_period=rsi_period):
+                no_signal["reason"] = "LTF Gate: 15m momentum cross/RSI not aligned for SHORT entry"
+                return no_signal
+
+            entry_price = determine_limit_entry(
+                direction="SHORT", current_price=current_price, current_tema=current_tema,
+                val=val, vah=vah, near_val=near_val, near_vah=near_vah
+            )
 
             if use_atr_sl and current_atr > 0:
                 sl_dist = max(current_atr * atr_mult, entry_price * MIN_SL_PCT)
@@ -708,42 +890,37 @@ def evaluate_signals(
             if sl_distance < (entry_price * MIN_SL_PCT):
                 return no_signal
 
-            # RECONCILIATION: farthest valid TP candidate selection (lowest for shorts)
             min_tp = entry_price - (sl_distance * min_rr)
-            tp_candidates = []
-
-            for g in underneath_gaps:
-                gf = float(g)
-                if gf <= min_tp:
-                    tp_candidates.append(gf)
+            tp_candidates = [float(g) for g in underneath_gaps if float(g) <= min_tp]
 
             for ref in (val, poc):
                 if ref is not None and not (isinstance(ref, float) and np.isnan(ref)):
-                    rf = float(ref)
-                    if rf <= min_tp:
-                        tp_candidates.append(rf)
+                    if float(ref) <= min_tp:
+                        tp_candidates.append(float(ref))
 
-            if tp_candidates:
-                take_profit = min(tp_candidates)
-            else:
-                take_profit = min_tp
+            farthest_tp = min(tp_candidates) if tp_candidates else min_tp
+            computed_rr = (entry_price - farthest_tp) / sl_distance
 
-            computed_rr = (entry_price - take_profit) / sl_distance
             if computed_rr >= min_rr:
                 risk_amt = float(account_balance) * (risk_pct / 100.0)
                 position_size = round(risk_amt / sl_distance, 6) if sl_distance > 0 else 0.0
 
+                staged_targets = calculate_staged_targets(
+                    direction="SHORT", entry_price=entry_price, stop_loss=stop_loss,
+                    farthest_tp=farthest_tp, tp1_rr=1.5
+                )
+
                 return {
-                    "action": "SELL", "symbol": symbol, "direction": "SHORT",
-                    "entry_price": float(entry_price), "stop_loss": float(stop_loss),
-                    "take_profit": float(take_profit), "atr": float(round(current_atr, 4)),
-                    "rr_ratio": float(computed_rr),
-                    "risk_pct": float(risk_pct),
+                    "action": "SELL", "order_type": "LIMIT", "symbol": symbol, "direction": "SHORT",
+                    "entry_price": float(round(entry_price, 5)),
+                    "stop_loss": float(round(stop_loss, 5)),
+                    "take_profit": float(round(farthest_tp, 5)),
+                    "tp1": staged_targets["tp1"], "tp1_ratio": staged_targets["tp1_ratio"],
+                    "tp2": staged_targets["tp2"], "tp2_ratio": staged_targets["tp2_ratio"],
+                    "max_bar_duration": 24, "atr": float(round(current_atr, 4)),
+                    "rr_ratio": float(computed_rr), "risk_pct": float(risk_pct),
                     "position_size": float(position_size),
-                    "reason": (
-                        f"Short confluence: 4H TEMA({HTF_TEMA_PERIOD}) macro bearish, "
-                        f"price in TEMA/VAH/gap zone, R:R={computed_rr:.2f}"
-                    )
+                    "reason": f"Short confluence: 4H TEMA({HTF_TEMA_PERIOD}) macro bearish, limit entry calculated, R:R={computed_rr:.2f}"
                 }
 
     no_signal["reason"] = "Market conditions did not meet strategy entry criteria"
@@ -751,7 +928,7 @@ def evaluate_signals(
 
 
 # ---------------------------------------------------------------------------
-# 7. EVENT-DRIVEN SIGNAL GENERATION CLASS
+# 8. EVENT-DRIVEN SIGNAL GENERATION CLASS
 # ---------------------------------------------------------------------------
 
 class StrategyEngine:
@@ -767,10 +944,6 @@ class StrategyEngine:
         position_side: str = "LONG",
         params: dict = None
     ) -> Dict[str, Any]:
-        """
-        Incremental, event-driven signal generation from a pre-computed dataframe.
-        FIX #7 preserved: take_profit always computed locally to prevent NameError.
-        """
         if df.empty or len(df) < 50:
             return {"signal": "HOLD", "action": "HOLD"}
 
@@ -778,7 +951,7 @@ class StrategyEngine:
             current_price = float(df.iloc[-1]["close"])
 
         params = params or {}
-        min_rr = float(params.get("min_rr", getattr(self.config, "MIN_RR", 2.5) if self.config else 2.5))
+        min_rr = float(params.get("min_rr", getattr(self.config, "MIN_RR", 1.5) if self.config else 1.5))
         atr_multiplier = float(params.get("atr_mult", getattr(self.config, "ATR_MULT", 2.5) if self.config else 2.5))
         atr_period = int(params.get("atr_period", getattr(self.config, "ATR_PERIOD", 14) if self.config else 14))
         risk_pct = float(params.get("risk_pct", 0.5))
@@ -791,7 +964,6 @@ class StrategyEngine:
             high_close = (df["high"] - df["close"].shift()).abs()
             low_close = (df["low"] - df["close"].shift()).abs()
             tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
-            # RECONCILIATION: Wilder's smoothing for inline ATR calc
             current_atr = float(tr.ewm(alpha=1.0 / atr_period, adjust=False).mean().iloc[-1])
 
         latest = df.iloc[-1]
@@ -817,25 +989,27 @@ class StrategyEngine:
         sl_val = float(round(stop_loss, 5))
         tp_val = float(round(take_profit, 5))
 
+        staged_targets = calculate_staged_targets(
+            direction="LONG" if direction in ["BUY", "LONG"] else "SHORT",
+            entry_price=current_price,
+            stop_loss=sl_val,
+            farthest_tp=tp_val,
+            tp1_rr=1.5
+        )
+
         risk_amt = account_balance * (risk_pct / 100.0)
         position_size = round(risk_amt / sl_dist, 6) if sl_dist > 0 else 0.0
 
         signal_payload = {
-            "signal": direction,
-            "action": direction,
-            "pair": self.symbol,
-            "symbol": self.symbol,
-            "side": direction,
-            "direction": direction,
-            "entry_price": float(current_price),
-            "stop_loss": sl_val,
-            "sl_price": sl_val,
-            "take_profit": tp_val,
-            "tp_price": tp_val,
-            "risk_reward": min_rr,
-            "risk_pct": risk_pct,
-            "position_size": float(position_size),
-            "atr": float(round(current_atr, 4)),
+            "signal": direction, "action": direction, "order_type": "LIMIT",
+            "pair": self.symbol, "symbol": self.symbol, "side": direction,
+            "direction": direction, "entry_price": float(current_price),
+            "stop_loss": sl_val, "sl_price": sl_val, "take_profit": tp_val,
+            "tp_price": tp_val, "tp1": staged_targets["tp1"],
+            "tp1_ratio": staged_targets["tp1_ratio"], "tp2": staged_targets["tp2"],
+            "tp2_ratio": staged_targets["tp2_ratio"], "max_bar_duration": 24,
+            "risk_reward": min_rr, "risk_pct": risk_pct,
+            "position_size": float(position_size), "atr": float(round(current_atr, 4)),
             "timestamp": int(time.time()),
         }
 
@@ -851,7 +1025,7 @@ class StrategyEngine:
 
 
 # ---------------------------------------------------------------------------
-# 8. CONVENIENCE: FULL EVALUATION WRAPPER (1H EXECUTION TF)
+# 9. CONVENIENCE: FULL EVALUATION WRAPPER
 # ---------------------------------------------------------------------------
 
 def generate_live_signal(
@@ -861,16 +1035,11 @@ def generate_live_signal(
     limit: int = 600,
     **kwargs
 ) -> Dict[str, Any]:
-    """
-    Fetches 1H execution-timeframe klines and runs the full evaluation engine,
-    which internally uses 4H TEMA(200) for macro confluence.
-    """
     df = fetch_klines(symbol=symbol, interval=execution_timeframe, limit=limit)
     if df.empty:
         return {
             "action": "HOLD", "symbol": symbol, "direction": "NONE",
             "entry_price": 0.0, "stop_loss": 0.0, "take_profit": 0.0,
-            "atr": 0.0, "position_size": 0.0,
-            "reason": "Failed to fetch klines"
+            "atr": 0.0, "position_size": 0.0, "reason": "Failed to fetch klines"
         }
     return evaluate_signals(df, symbol, account_balance=account_balance, **kwargs)
