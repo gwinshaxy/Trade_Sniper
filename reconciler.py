@@ -17,22 +17,39 @@ logger = logging.getLogger("reconciler")
 DUST_THRESHOLD = 0.001
 RETRY_THRESHOLD = 3
 
-# FIX #5: Require BOTH 3 checks AND a minimum sustained-zero duration before
+# Require BOTH 3 checks AND a minimum sustained-zero duration before
 # declaring a ghost. Bybit testnet's position endpoint can lag 5-10 minutes
 # after a close, so a pure check-count threshold produces false positives.
 GHOST_MIN_SUSTAINED_ZERO_SECONDS = 600  # 10 minutes
 
 reconciler_lock = threading.Lock()
 consecutive_zero_counts: Dict[int, int] = {}
-# FIX #5: Track the wall-clock time each trade first read zero contracts.
+# Track the wall-clock time each trade first read zero contracts.
 first_zero_at: Dict[int, float] = {}
 
 RECENTLY_OPENED_CACHE: Dict[str, float] = {}
 GRACE_PERIOD_SECONDS = 15.0
 
-# FIX #6: In-memory cache of entry order IDs per trade_id so we can query
+# In-memory cache of entry order IDs per trade_id so we can query
 # the order status directly when the position endpoint reports zero.
 ENTRY_ORDER_CACHE: Dict[int, str] = {}
+
+
+# =====================================================================
+# FIX 1: Unified Symbol Stripping in Position Matching
+# =====================================================================
+def normalize_pair(pair_str: str) -> str:
+    """Standardizes pairs (e.g., 'SOL/USDT:USDT' -> 'SOLUSDT') for reliable comparison."""
+    if not pair_str:
+        return ""
+    return (
+        pair_str.upper()
+        .replace("/", "")
+        .replace(":", "")
+        .replace("-", "")
+        .replace("_", "")
+        .replace("USDTUSDT", "USDT")
+    )
 
 
 def mark_symbol_recently_opened(ccxt_symbol: str) -> None:
@@ -54,7 +71,7 @@ def is_symbol_under_grace_period(ccxt_symbol: str) -> bool:
 
 
 def mark_trade_entry_order(trade_id: int, entry_order_id: str) -> None:
-    """FIX #6: Register the entry order ID for a trade so the reconciler can
+    """Register the entry order ID for a trade so the reconciler can
     query its authoritative status before declaring the trade a ghost."""
     if trade_id and entry_order_id:
         with reconciler_lock:
@@ -64,7 +81,7 @@ def mark_trade_entry_order(trade_id: int, entry_order_id: str) -> None:
 
 def check_active_or_pending_orders(executor: BybitFuturesLiveExecutor, ccxt_symbol: str) -> bool:
     """
-    FIX #P2: Filter out protective (SL/TP) orders. Only entry orders should
+    Filter out protective (SL/TP) orders. Only entry orders should
     suppress the zero-contract counter. Bybit's `stopOrderType` field is
     non-empty for SL/TP conditional orders — we skip those.
     """
@@ -103,7 +120,7 @@ def check_entry_order_never_filled(
     ccxt_symbol: str,
 ) -> Optional[str]:
     """
-    FIX #6: If the entry order was cancelled/rejected/expired without filling,
+    If the entry order was cancelled/rejected/expired without filling,
     the trade should be marked CANCELLED (not ghost-closed). Returns the
     terminal status string if the order never filled, else None.
     """
@@ -134,7 +151,7 @@ def check_unprocessed_execution_close(
     symbol: str,
 ) -> bool:
     """
-    FIX #4: Query /v5/execution/list for a recent close fill. If Bybit has
+    Query /v5/execution/list for a recent close fill. If Bybit has
     already recorded a closing trade (closedSize > 0) that the DB hasn't
     processed, we must NOT count this cycle as a zero-contract confirmation.
     """
@@ -201,6 +218,8 @@ def fetch_all_live_exchange_positions(executor: BybitFuturesLiveExecutor) -> Dic
 
             active_positions[ccxt_symbol] = {
                 "symbol": ccxt_symbol,
+                "raw_symbol": raw_symbol,
+                "normalized_symbol": normalize_pair(raw_symbol),
                 "side": side,
                 "contracts": contracts,
                 "entry_price": float(p.get("entryPrice", 0) or 0),
@@ -242,7 +261,7 @@ def reconcile_open_trades(executor: BybitFuturesLiveExecutor) -> int:
     reconciled_count = 0
     current_trade_ids: Set[int] = {trade[0] for trade in open_db_trades}
 
-    # FIX #5: Purge stale counters/caches for trades no longer open
+    # Purge stale counters/caches for trades no longer open
     with reconciler_lock:
         for cached_id in list(consecutive_zero_counts.keys()):
             if cached_id not in current_trade_ids:
@@ -260,6 +279,7 @@ def reconcile_open_trades(executor: BybitFuturesLiveExecutor) -> int:
     for trade in open_db_trades:
         trade_id, pair, direction, entry_price, position_size, account_balance, db_sl, db_tp = trade
         ccxt_symbol = format_ccxt_futures_symbol(pair)
+        normalized_db_pair = normalize_pair(pair)
         tracked_ccxt_symbols.add(ccxt_symbol)
 
         try:
@@ -277,9 +297,7 @@ def reconcile_open_trades(executor: BybitFuturesLiveExecutor) -> int:
             live_contracts = float(pos_info.get("contracts", 0.0))
 
             if live_contracts < DUST_THRESHOLD:
-                # -----------------------------------------------------------------
-                # FIX #6: Entry order never filled? Mark CANCELLED, not ghost.
-                # -----------------------------------------------------------------
+                # Entry order never filled? Mark CANCELLED, not ghost.
                 terminal_status = check_entry_order_never_filled(executor, trade_id, ccxt_symbol)
                 if terminal_status:
                     logger.warning(
@@ -310,20 +328,14 @@ def reconcile_open_trades(executor: BybitFuturesLiveExecutor) -> int:
                     )
                     continue
 
-                # -----------------------------------------------------------------
-                # FIX #4: Authoritative execution/list check. If Bybit already
-                # recorded a close fill, do not count this as a ghost cycle.
-                # -----------------------------------------------------------------
+                # Unprocessed execution/list check
                 if check_unprocessed_execution_close(executor, pair):
                     with reconciler_lock:
                         consecutive_zero_counts[trade_id] = 0
                         first_zero_at.pop(trade_id, None)
                     continue
 
-                # -----------------------------------------------------------------
-                # FIX #7: Authoritative closed-pnl check BEFORE counting zero.
-                # If Bybit has already recorded a close, finalize directly.
-                # -----------------------------------------------------------------
+                # Authoritative closed-pnl check BEFORE counting zero.
                 real_pnl_pre, real_fee_pre, real_exit_pre = executor.fetch_real_closed_pnl(pair)
                 if real_exit_pre > 0:
                     logger.info(
@@ -372,17 +384,14 @@ def reconcile_open_trades(executor: BybitFuturesLiveExecutor) -> int:
                     )
                     continue
 
-                # Legacy protective-order suppression
+                # Protective-order suppression
                 if check_active_or_pending_orders(executor, ccxt_symbol):
                     with reconciler_lock:
                         consecutive_zero_counts[trade_id] = 0
                         first_zero_at.pop(trade_id, None)
                     continue
 
-                # -----------------------------------------------------------------
-                # FIX #5: Time-based ghost detection. Require BOTH the retry
-                # threshold AND a minimum sustained-zero duration.
-                # -----------------------------------------------------------------
+                # Time-based ghost detection counter
                 now_ts = time.time()
                 with reconciler_lock:
                     if trade_id not in first_zero_at:
@@ -400,9 +409,19 @@ def reconcile_open_trades(executor: BybitFuturesLiveExecutor) -> int:
                     )
                     continue
 
+                # =====================================================================
+                # FIX 2: Authoritative Bybit Closed PnL / Execution Verification
+                # =====================================================================
+                real_closed_pnl, real_fee, fetched_exit = executor.fetch_real_closed_pnl(pair)
+                if real_closed_pnl is None and fetched_exit == 0.0:
+                    logger.warning(
+                        f"[{pair}] Trade #{trade_id} reported 0 contracts, "
+                        f"but Bybit closedPnl shows NO close record. Skipping ghost close to prevent false termination."
+                    )
+                    continue  # Skip closing this trade
+
                 logger.warning(f"🚨 GHOST DB RECORD CONFIRMED: Trade #{trade_id} ({pair}) sustained zero contracts for {zero_duration:.0f}s. Auto-closing...")
 
-                real_closed_pnl, real_fee, fetched_exit = executor.fetch_real_closed_pnl(pair)
                 if fetched_exit > 0:
                     exit_price = fetched_exit
                 else:
@@ -455,7 +474,14 @@ def reconcile_open_trades(executor: BybitFuturesLiveExecutor) -> int:
                     consecutive_zero_counts[trade_id] = 0
                     first_zero_at.pop(trade_id, None)
 
+                # Look up live exchange position by ccxt_symbol or normalized pair matching (Fix 1)
                 ex_pos = live_exchange_positions.get(ccxt_symbol)
+                if not ex_pos:
+                    for pos_data in live_exchange_positions.values():
+                        if pos_data.get("normalized_symbol") == normalized_db_pair:
+                            ex_pos = pos_data
+                            break
+
                 if ex_pos:
                     live_sl = ex_pos.get('stop_loss', 0.0)
                     live_tp = ex_pos.get('take_profit', 0.0)
@@ -522,23 +548,64 @@ def reconcile_open_trades(executor: BybitFuturesLiveExecutor) -> int:
         except Exception as err:
             logger.error(f"Error reconciling trade ID #{trade_id}: {err}")
 
+    # =====================================================================
+    # FIX 3: Sync Adopted Trades with Stop Loss / Take Profit & Deduplication
+    # =====================================================================
     if live_exchange_positions:
         for ex_symbol, ex_pos in live_exchange_positions.items():
-            if ex_symbol not in tracked_ccxt_symbols:
+            ex_normalized = ex_pos.get("normalized_symbol") or normalize_pair(ex_symbol)
+            
+            # Check if symbol is already tracked via standard symbol or normalized string
+            is_tracked = any(
+                normalize_pair(tracked_sym) == ex_normalized 
+                for tracked_sym in tracked_ccxt_symbols
+            )
+            
+            if not is_tracked:
                 if is_symbol_under_grace_period(ex_symbol):
                     logger.info(f"[{ex_symbol}] Orphan check bypassed: Symbol is within recent order execution grace period window.")
                     continue
-
-                logger.warning(f"🚨 ORPHAN POSITION DETECTED: {ex_symbol}. Safely inserting/updating position in DB...")
 
                 conn_adopt = get_db_connection()
                 if conn_adopt:
                     try:
                         with conn_adopt.cursor() as cursor:
+                            # Verify whether an active setup already exists in trade_setups using normalized pair comparison
+                            cursor.execute("""
+                                SELECT id, stop_loss, take_profit FROM trade_setups 
+                                WHERE trade_state IN ('OPEN', 'EXECUTED', 'BE_LOCKED', 'TRAILING');
+                            """)
+                            existing_open_trades = cursor.fetchall()
+                            
+                            existing_trade_id = None
+                            existing_sl = 0.0
+                            existing_tp = 0.0
+                            
+                            for row in existing_open_trades:
+                                t_id, t_sl, t_tp = row[0], float(row[1] or 0.0), float(row[2] or 0.0)
+                                cursor.execute("SELECT pair FROM trade_setups WHERE id = %s;", (t_id,))
+                                p_row = cursor.fetchone()
+                                if p_row and normalize_pair(p_row[0]) == ex_normalized:
+                                    existing_trade_id = t_id
+                                    existing_sl = t_sl
+                                    existing_tp = t_tp
+                                    break
+
+                            if existing_trade_id is not None:
+                                logger.info(
+                                    f"[{ex_symbol}] Active trade setup #{existing_trade_id} already exists for normalized pair "
+                                    f"'{ex_normalized}'. Skipping insertion of duplicate orphan record."
+                                )
+                                continue
+
+                            logger.warning(f"🚨 ORPHAN POSITION DETECTED: {ex_symbol}. Safely inserting/updating position in DB...")
+
                             db_pair = ex_symbol
                             direction = "BUY" if ex_pos['side'].lower() in ["long", "buy"] else "SELL"
                             entry_price = float(ex_pos.get('entry_price', 0.0))
                             position_size = float(ex_pos.get('contracts', 0.0))
+                            adopt_sl = float(ex_pos.get('stop_loss', 0.0))
+                            adopt_tp = float(ex_pos.get('take_profit', 0.0))
 
                             cursor.execute("""
                                 INSERT INTO trade_setups (
@@ -555,8 +622,7 @@ def reconcile_open_trades(executor: BybitFuturesLiveExecutor) -> int:
                                 RETURNING id;
                             """, (
                                 db_pair, direction, entry_price, position_size,
-                                ex_pos.get('stop_loss', 0.0),
-                                ex_pos.get('take_profit', 0.0)
+                                adopt_sl, adopt_tp
                             ))
 
                             row = cursor.fetchone()
@@ -571,7 +637,7 @@ def reconcile_open_trades(executor: BybitFuturesLiveExecutor) -> int:
                                     f"<b>Pair:</b> <code>{db_pair}</code>\n"
                                     f"<b>Side:</b> <code>{direction}</code>\n"
                                     f"<b>Contracts:</b> <code>{position_size}</code>\n"
-                                    f"<b>SL:</b> <code>${ex_pos.get('stop_loss', 0.0)}</code> | <b>TP:</b> <code>${ex_pos.get('take_profit', 0.0)}</code>"
+                                    f"<b>SL:</b> <code>${adopt_sl}</code> \vert{} <b>TP:</b> <code>${adopt_tp}</code>"
                                 )
                     except Exception as db_err:
                         logger.error(f"Failed to auto-insert/upsert orphan position for {ex_symbol}: {db_err}")

@@ -517,8 +517,8 @@ def normalize_symbol(symbol: str) -> str:
 
 
 SYMBOL_PARAMETER_DEFAULTS: Dict[str, Dict[str, Any]] = {
-    "SOL/USDT": {"adx_threshold": 20.0},
-    "SOLUSDT": {"adx_threshold": 20.0},
+    "SOL/USDT": {"adx_threshold": 25.0},
+    "SOLUSDT": {"adx_threshold": 25.0},
 }
 
 
@@ -534,10 +534,10 @@ def load_symbol_config(symbol: str) -> Dict[str, Any]:
 
     default_config = {
         "tema_period": 200, "rsi_period": 14, "rsi_thresh": 42.0,
-        "adx_period": 14, "adx_threshold": sym_defaults.get("adx_threshold", 20.0),
+        "adx_period": 14, "adx_threshold": sym_defaults.get("adx_threshold", 25.0),
         "use_adx_filter": True, "use_rsi_filter": True, "use_candlestick_confirm": True,
-        "zone_tolerance": 0.015, "max_sl_pct": 0.015, "min_sentiment": 0.0,
-        "min_rr": 1.5, "risk_pct": 1.0, "vp_detection_pct": 0.07, "lookback_bars": 600,
+        "zone_tolerance": 0.01245, "max_sl_pct": 0.015, "min_sentiment": 0.0,
+        "min_rr": 2.0, "risk_pct": 1.0, "vp_detection_pct": 0.07, "lookback_bars": 600,
         "vp_va_pct": 0.70, "atr_period": 14, "atr_mult": 1.5,
         "atr_long_period": 100, "atr_ratio_thresh": 1.0,
         "use_atr_sl": True, "disable_htf": False, "spot_only": False
