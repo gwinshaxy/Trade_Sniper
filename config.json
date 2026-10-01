@@ -23,24 +23,41 @@
   "zone_tolerance": 0.01245,  
   "lookback_bars": 600,
   "watchlist": [
-    "XRP/USDT",
-    "SOL/USDT"
+    "ARB/USDT:USDT",
+    "BTC/USDT:USDT",
+    "UNI/USDT:USDT",
+    "ETH/USDT:USDT",
+    "CAKE/USDT:USDT",
+    "SUI/USDT:USDT",
+    "AAVE/USDT:USDT"
   ],
   "symbols": {
     "ARB/USDT:USDT": {
       "binance": "ARB/USDT:USDT",
       "bybit": "ARBPERP"
     },
-    "ARB/USDT": {
-      "binance": "ARB/USDT",
-      "bybit": "ARBPERP"
+    "UNI/USDT:USDT": {
+      "binance": "UNI/USDT:USDT",
+      "bybit": "UNIPERP"
+    },
+    "ETH/USDT:USDT": {
+      "binance": "ETH/USDT:USDT",
+      "bybit": "ETHUSDT"
+    },
+    "CAKE/USDT:USDT": {
+      "binance": "CAKE/USDT:USDT",
+      "bybit": "CAKEPERP"
+    },
+    "SUI/USDT:USDT": {
+      "binance": "SUI/USDT:USDT",
+      "bybit": "SUIPERP"
+    },
+    "AAVE/USDT:USDT": {
+      "binance": "AAVE/USDT:USDT",
+      "bybit": "AAVEPERP"
     },
     "BTC/USDT:USDT": {
       "binance": "BTC/USDT:USDT",
-      "bybit": "BTCUSDT"
-    },
-    "BTC/USDT": {
-      "binance": "BTC/USDT",
       "bybit": "BTCUSDT"
     }
   },
