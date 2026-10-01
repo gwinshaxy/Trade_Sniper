@@ -141,7 +141,8 @@ def fetch_cryptocompare_fallback_kline(symbol: str, limit: int = 50) -> List[Dic
 
 
 class BybitFuturesLiveExecutor:
-    def __init__(self):
+    def __init__(self, config: Optional[Dict[str, Any]] = None):
+        self.config = config or {}
         self.exchange = ccxt.bybit({
             'apiKey': BYBIT_API_KEY,
             'secret': BYBIT_SECRET_KEY,
@@ -196,8 +197,13 @@ class BybitFuturesLiveExecutor:
             return 1 if is_buy else 2
 
         try:
+            exchange_symbol = ccxt_symbol
+            if hasattr(self, 'config') and isinstance(self.config, dict):
+                symbols_map = self.config.get("symbols", {})
+                exchange_symbol = symbols_map.get(ccxt_symbol, symbols_map.get(ccxt_symbol.split('/')[0], ccxt_symbol))
+
             formatted = (
-                ccxt_symbol.replace("/", "")
+                exchange_symbol.replace("/", "")
                 .replace(":USDT", "")
                 .replace("-", "")
                 .replace("_", "")
@@ -259,8 +265,33 @@ class BybitFuturesLiveExecutor:
             logger.warning(f"[{symbol}] execution/list lookup failed: {e}")
             return []
 
-    def format_ccxt_futures_symbol(self, raw_symbol: str) -> str:
-        return format_ccxt_futures_symbol(raw_symbol)
+    def format_ccxt_futures_symbol(self, symbol: str) -> str:
+        """Consistently converts raw/dirty symbols to CCXT Bybit Linear Futures format, 
+        checking the configuration mapping first if available."""
+        if not symbol:
+            return ""
+            
+        # Check if instance has config mapping for symbols
+        if hasattr(self, 'config') and isinstance(self.config, dict):
+            symbols_map = self.config.get("symbols", {})
+            if symbol in symbols_map:
+                mapped = symbols_map[symbol]
+                if ":" in mapped:
+                    return mapped
+                symbol = mapped
+
+        if ":" in symbol:
+            return symbol
+        raw = symbol.replace("/", "").replace("_", "").replace("-", "").upper()
+        if raw.endswith("USDTUSDT"):
+            raw = raw[:-4]
+        if raw.endswith("USDT"):
+            base = raw[:-4]
+            return f"{base}/USDT:USDT"
+        if raw.endswith("USDC"):
+            base = raw[:-4]
+            return f"{base}/USDC:USDC"
+        return f"{raw}/USDT:USDT"
 
     def _verify_sl(
         self,
@@ -276,8 +307,13 @@ class BybitFuturesLiveExecutor:
         )
         last_live_sl = 0.0
 
+        exchange_symbol = ccxt_symbol
+        if hasattr(self, 'config') and isinstance(self.config, dict):
+            symbols_map = self.config.get("symbols", {})
+            exchange_symbol = symbols_map.get(ccxt_symbol, symbols_map.get(ccxt_symbol.split('/')[0], ccxt_symbol))
+
         raw_symbol = (
-            ccxt_symbol.replace("/", "").replace(":USDT", "").upper()
+            exchange_symbol.replace("/", "").replace(":USDT", "").upper()
         )
 
         for attempt in range(max_attempts):
@@ -320,8 +356,14 @@ class BybitFuturesLiveExecutor:
     ) -> bool:
         try:
             ccxt_symbol = self.format_ccxt_futures_symbol(symbol)
+            
+            exchange_symbol = ccxt_symbol
+            if hasattr(self, 'config') and isinstance(self.config, dict):
+                symbols_map = self.config.get("symbols", {})
+                exchange_symbol = symbols_map.get(symbol, symbols_map.get(ccxt_symbol, ccxt_symbol))
+
             formatted_symbol = (
-                symbol.replace("/", "")
+                exchange_symbol.replace("/", "")
                 .replace(":USDT", "")
                 .replace("-", "")
                 .replace("_", "")
@@ -418,7 +460,7 @@ class BybitFuturesLiveExecutor:
             return False
 
     async def fetch_ticker_direct_async(self, symbol: str) -> float:
-        ccxt_symbol = format_ccxt_futures_symbol(symbol)
+        ccxt_symbol = self.format_ccxt_futures_symbol(symbol)
         try:
             async_config = {'enableRateLimit': True, 'options': {'defaultType': 'linear'}}
             async_public = ccxt_async.bybit(async_config)
@@ -434,7 +476,7 @@ class BybitFuturesLiveExecutor:
             return 0.0
 
     async def fetch_tickers_batch_async(self, symbols: List[str]) -> Dict[str, float]:
-        formatted_symbols = [format_ccxt_futures_symbol(s) for s in symbols]
+        formatted_symbols = [self.format_ccxt_futures_symbol(s) for s in symbols]
         price_map = {}
         try:
             async_config = {'enableRateLimit': True, 'options': {'defaultType': 'linear'}}
@@ -456,7 +498,7 @@ class BybitFuturesLiveExecutor:
             return {s: 0.0 for s in symbols}
 
     def fetch_ticker_data(self, symbol: str) -> Dict[str, Any]:
-        ccxt_symbol = format_ccxt_futures_symbol(symbol)
+        ccxt_symbol = self.format_ccxt_futures_symbol(symbol)
         try:
             ticker = self.public_exchange.fetch_ticker(ccxt_symbol)
             bid = safe_float(ticker.get('bid'))
@@ -526,15 +568,23 @@ class BybitFuturesLiveExecutor:
         return await asyncio.to_thread(self.get_futures_position, symbol)
 
     def get_futures_position(self, symbol: str) -> Dict[str, Any]:
-        ccxt_symbol = format_ccxt_futures_symbol(symbol)
+        ccxt_symbol = self.format_ccxt_futures_symbol(symbol)
+        
+        # Configuration map fallback check for exchange symbol resolution
+        exchange_symbol = ccxt_symbol
+        if hasattr(self, 'config') and isinstance(self.config, dict):
+            symbols_map = self.config.get("symbols", {})
+            exchange_symbol = symbols_map.get(symbol, symbols_map.get(ccxt_symbol, ccxt_symbol))
+
         clean_target = symbol.replace("/", "").replace(":", "").replace("_", "").replace("-", "").upper()
         try:
-            positions = self.exchange.fetch_positions([ccxt_symbol])
-            for pos in positions:
+            # Replaced fetch_positions([ccxt_symbol]) with fetch_position(exchange_symbol) with configuration fallback
+            pos = self.exchange.fetch_position(exchange_symbol)
+            if pos:
                 pos_symbol = str(pos.get('symbol', '')).replace("/", "").replace(":", "").replace("_", "").replace("-", "").upper()
                 contracts = safe_float(pos.get('contracts', 0.0))
 
-                if clean_target in pos_symbol or pos_symbol in clean_target:
+                if clean_target in pos_symbol or pos_symbol in clean_target or pos_symbol == exchange_symbol.replace("/", "").replace(":", "").upper():
                     if contracts > 0:
                         info = pos.get("info", {}) or {}
 
@@ -565,7 +615,7 @@ class BybitFuturesLiveExecutor:
                 "leverage": 1.0, "unrealized_pnl": 0.0, "error": False
             }
         except (ccxt.NetworkError, ccxt.ExchangeError, Exception) as e:
-            logger.error(f"Failed to fetch futures position for {ccxt_symbol}: {e}")
+            logger.error(f"Failed to fetch futures position for {exchange_symbol}: {e}")
             return {
                 "symbol": symbol, "side": "NONE", "contracts": 0.0,
                 "entry_price": 0.0, "stop_loss": 0.0, "take_profit": 0.0,
@@ -680,13 +730,11 @@ class BybitFuturesLiveExecutor:
 
                 order["stop_loss_attached"] = sl_success
 
-                # SOLUTION 2: Prevent Emergency Guard Immediate Position Liquidations
                 if not sl_success:
                     logger.warning(
                         f"⚠️ [SL ATTACH RETRY NEEDED] Could not verify exchange Stop Loss for {symbol} at ${target_sl}. "
                         f"Trade will remain open; reconciler will auto-reattach SL on next sync cycle."
                     )
-                    # DO NOT call close_live_position_bybit() here!
                     return order
 
         return order
@@ -694,7 +742,7 @@ class BybitFuturesLiveExecutor:
     def order_futures_bybit(self, symbol: str, direction: str, amount_usd: float,
                             entry_price: float = 0.0, stop_loss: float = 0.0, take_profit: float = 0.0,
                             leverage: float = 5.0, account_balance: float = 100.0, risk_pct: float = 1.0) -> Dict[str, Any]:
-        ccxt_symbol = format_ccxt_futures_symbol(symbol)
+        ccxt_symbol = self.format_ccxt_futures_symbol(symbol)
         dir_clean = direction.upper().strip()
         is_long = dir_clean in ["BUY", "LONG"]
         side = 'buy' if is_long else 'sell'
@@ -1116,14 +1164,7 @@ class BybitFuturesLiveExecutor:
         current_price: float,
         outcome: str = "CLOSE",
     ) -> Dict[str, Any]:
-        """
-        Correct close sequence for PostOnly + failed-SL scenarios.
-          1. Cancel all pending entry orders first.
-          2. Fetch position; if contracts > 0, market reduceOnly close.
-          3. If contracts == 0, ghost close with real closedPnl.
-          4. Never fabricate exit_price.
-        """
-        ccxt_symbol = format_ccxt_futures_symbol(symbol)
+        ccxt_symbol = self.format_ccxt_futures_symbol(symbol)
 
         try:
             open_orders = self.exchange.fetch_open_orders(ccxt_symbol)
