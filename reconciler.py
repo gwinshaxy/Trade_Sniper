@@ -17,27 +17,20 @@ logger = logging.getLogger("reconciler")
 DUST_THRESHOLD = 0.001
 RETRY_THRESHOLD = 3
 
-# Require BOTH 3 checks AND a minimum sustained-zero duration before
-# declaring a ghost. Bybit testnet's position endpoint can lag 5-10 minutes
-# after a close, so a pure check-count threshold produces false positives.
-GHOST_MIN_SUSTAINED_ZERO_SECONDS = 600  # 10 minutes
+# SOLUTION 4: Enhance Reconciler Grace Period & Closed PnL Check
+# Extended GRACE_PERIOD_SECONDS to allow Bybit testnet execution engines and order books to settle.
+GRACE_PERIOD_SECONDS = 120.0  # Increased from 15.0s to mitigate testnet endpoint lag
+GHOST_MIN_SUSTAINED_ZERO_SECONDS = 900  # Increased to 15 minutes for testnet stability
 
 reconciler_lock = threading.Lock()
 consecutive_zero_counts: Dict[int, int] = {}
-# Track the wall-clock time each trade first read zero contracts.
 first_zero_at: Dict[int, float] = {}
 
 RECENTLY_OPENED_CACHE: Dict[str, float] = {}
-GRACE_PERIOD_SECONDS = 15.0
 
-# In-memory cache of entry order IDs per trade_id so we can query
-# the order status directly when the position endpoint reports zero.
 ENTRY_ORDER_CACHE: Dict[int, str] = {}
 
 
-# =====================================================================
-# FIX 1: Unified Symbol Stripping in Position Matching
-# =====================================================================
 def normalize_pair(pair_str: str) -> str:
     """Standardizes pairs (e.g., 'SOL/USDT:USDT' -> 'SOLUSDT') for reliable comparison."""
     if not pair_str:
@@ -90,10 +83,8 @@ def check_active_or_pending_orders(executor: BybitFuturesLiveExecutor, ccxt_symb
         for oo in open_orders:
             info = oo.get("info", {}) or {}
             stop_order_type = str(info.get("stopOrderType", "") or "").strip()
-            # Skip protective SL/TP orders — they don't indicate an entry in flight
             if stop_order_type in ("StopLoss", "TakeProfit", "TrailingStop", "Stop"):
                 continue
-            # Any non-protective open order counts as pending entry activity
             return True
 
         since = int((time.time() - 300) * 1000)
@@ -104,7 +95,6 @@ def check_active_or_pending_orders(executor: BybitFuturesLiveExecutor, ccxt_symb
                 continue
             info = order.get("info", {}) or {}
             stop_order_type = str(info.get("stopOrderType", "") or "").strip()
-            # Same protective-order filter for closed-but-still-conditional orders
             if stop_order_type in ("StopLoss", "TakeProfit", "TrailingStop", "Stop"):
                 continue
             return True
@@ -184,7 +174,7 @@ def fetch_all_live_exchange_positions(executor: BybitFuturesLiveExecutor) -> Dic
     """
     active_positions = {}
     now_ms = int(time.time() * 1000)
-    STALE_MS = 60_000  # 60 seconds
+    STALE_MS = 60_000
 
     try:
         positions = executor.exchange.fetch_positions()
@@ -195,7 +185,6 @@ def fetch_all_live_exchange_positions(executor: BybitFuturesLiveExecutor) -> Dic
 
             info = p.get("info", {}) or {}
 
-            # Skip stale positions
             updated_ms = int(info.get("updatedTime", 0) or 0)
             if updated_ms > 0 and (now_ms - updated_ms) > STALE_MS:
                 logger.debug(
@@ -210,7 +199,6 @@ def fetch_all_live_exchange_positions(executor: BybitFuturesLiveExecutor) -> Dic
             if not side or side == "none":
                 side = "long" if float(p.get("side", 0) or 0) > 0 else "short"
 
-            # Prefer raw Bybit fields; fall back to CCXT normalized keys.
             sl_raw = p.get("stopLoss")
             tp_raw = p.get("takeProfit")
             sl_val = float(sl_raw) if sl_raw not in (None, "") else float(info.get("stopLoss", 0) or 0)
@@ -261,7 +249,6 @@ def reconcile_open_trades(executor: BybitFuturesLiveExecutor) -> int:
     reconciled_count = 0
     current_trade_ids: Set[int] = {trade[0] for trade in open_db_trades}
 
-    # Purge stale counters/caches for trades no longer open
     with reconciler_lock:
         for cached_id in list(consecutive_zero_counts.keys()):
             if cached_id not in current_trade_ids:
@@ -297,7 +284,6 @@ def reconcile_open_trades(executor: BybitFuturesLiveExecutor) -> int:
             live_contracts = float(pos_info.get("contracts", 0.0))
 
             if live_contracts < DUST_THRESHOLD:
-                # Entry order never filled? Mark CANCELLED, not ghost.
                 terminal_status = check_entry_order_never_filled(executor, trade_id, ccxt_symbol)
                 if terminal_status:
                     logger.warning(
@@ -328,14 +314,12 @@ def reconcile_open_trades(executor: BybitFuturesLiveExecutor) -> int:
                     )
                     continue
 
-                # Unprocessed execution/list check
                 if check_unprocessed_execution_close(executor, pair):
                     with reconciler_lock:
                         consecutive_zero_counts[trade_id] = 0
                         first_zero_at.pop(trade_id, None)
                     continue
 
-                # Authoritative closed-pnl check BEFORE counting zero.
                 real_pnl_pre, real_fee_pre, real_exit_pre = executor.fetch_real_closed_pnl(pair)
                 if real_exit_pre > 0:
                     logger.info(
@@ -384,14 +368,12 @@ def reconcile_open_trades(executor: BybitFuturesLiveExecutor) -> int:
                     )
                     continue
 
-                # Protective-order suppression
                 if check_active_or_pending_orders(executor, ccxt_symbol):
                     with reconciler_lock:
                         consecutive_zero_counts[trade_id] = 0
                         first_zero_at.pop(trade_id, None)
                     continue
 
-                # Time-based ghost detection counter
                 now_ts = time.time()
                 with reconciler_lock:
                     if trade_id not in first_zero_at:
@@ -409,23 +391,20 @@ def reconcile_open_trades(executor: BybitFuturesLiveExecutor) -> int:
                     )
                     continue
 
-                # =====================================================================
-                # FIX 2: Authoritative Bybit Closed PnL / Execution Verification
-                # =====================================================================
                 real_closed_pnl, real_fee, fetched_exit = executor.fetch_real_closed_pnl(pair)
                 if real_closed_pnl is None and fetched_exit == 0.0:
                     logger.warning(
                         f"[{pair}] Trade #{trade_id} reported 0 contracts, "
                         f"but Bybit closedPnl shows NO close record. Skipping ghost close to prevent false termination."
                     )
-                    continue  # Skip closing this trade
+                    continue
 
                 logger.warning(f"🚨 GHOST DB RECORD CONFIRMED: Trade #{trade_id} ({pair}) sustained zero contracts for {zero_duration:.0f}s. Auto-closing...")
 
                 if fetched_exit > 0:
                     exit_price = fetched_exit
                 else:
-                    exit_price = float(entry_price)  # Not current ticker — use entry
+                    exit_price = float(entry_price)
                     logger.warning(
                         f"[{pair}] No verified exit for ghost #{trade_id}. "
                         f"Using entry price (${entry_price}); PnL will reflect fees only."
@@ -474,7 +453,6 @@ def reconcile_open_trades(executor: BybitFuturesLiveExecutor) -> int:
                     consecutive_zero_counts[trade_id] = 0
                     first_zero_at.pop(trade_id, None)
 
-                # Look up live exchange position by ccxt_symbol or normalized pair matching (Fix 1)
                 ex_pos = live_exchange_positions.get(ccxt_symbol)
                 if not ex_pos:
                     for pos_data in live_exchange_positions.values():
@@ -489,7 +467,6 @@ def reconcile_open_trades(executor: BybitFuturesLiveExecutor) -> int:
                     db_sl_val = float(db_sl or 0.0)
                     db_tp_val = float(db_tp or 0.0)
 
-                    # Exchange has SL/TP, DB missing → sync exchange → DB
                     if (live_sl > 0 and db_sl_val == 0.0) or (live_tp > 0 and db_tp_val == 0.0):
                         conn_sync = get_db_connection()
                         if conn_sync:
@@ -503,146 +480,57 @@ def reconcile_open_trades(executor: BybitFuturesLiveExecutor) -> int:
                                         WHERE id = %s;
                                     """, (live_sl, live_tp, trade_id))
                                     conn_sync.commit()
-                                    logger.info(f"Updated DB SL/TP for Trade #{trade_id} from exchange live parameters.")
+                                    logger.info(f"[{pair}] Synced exchange SL/TP (${live_sl}/${live_tp}) -> DB for Trade #{trade_id}")
                             except Exception as sync_err:
-                                logger.error(f"Failed to sync exchange SL/TP to DB for trade #{trade_id}: {sync_err}")
+                                logger.error(f"Failed to sync exchange SL/TP to DB: {sync_err}")
                             finally:
                                 release_db_connection(conn_sync)
 
-                    # Exchange missing SL, DB has one → re-attach from DB
-                    if live_sl == 0.0 and db_sl_val > 0:
-                        logger.warning(
-                            f"[{pair}] Exchange SL missing for Trade #{trade_id} "
-                            f"(DB has ${db_sl_val:.5f}). Re-attaching from DB..."
+                    # Re-attach missing exchange SL
+                    if live_sl == 0.0 and db_sl_val > 0.0:
+                        logger.warning(f"[{pair}] DB has SL ${db_sl_val:.5f} but exchange has NO SL. Attempting re-attachment...")
+                        attached = executor.set_position_trading_stop(
+                            symbol=pair,
+                            stop_loss=db_sl_val,
+                            take_profit=db_tp_val if db_tp_val > 0 else None,
+                            direction=direction
                         )
-                        try:
-                            reattach_idx = executor._get_position_idx(
-                                ccxt_symbol, direction
-                            )
-                            ok = executor.set_position_trading_stop(
-                                symbol=pair,
-                                stop_loss=db_sl_val,
-                                take_profit=(db_tp_val if db_tp_val > 0 else None),
-                                position_idx=reattach_idx,
-                                direction=direction,
-                            )
-                            if ok:
-                                logger.info(
-                                    f"[{pair}] SL re-attached from DB for Trade #{trade_id}."
-                                )
-                                send_telegram_notification(
-                                    f"<b>🔧 SL RE-ATTACHED FROM DB</b>\n\n"
-                                    f"<b>Trade ID:</b> <code>#{trade_id}</code>\n"
-                                    f"<b>Pair:</b> <code>{pair}</code>\n"
-                                    f"<b>SL:</b> <code>${db_sl_val:.5f}</code>"
-                                )
-                            else:
-                                logger.error(
-                                    f"[{pair}] SL re-attach from DB FAILED for Trade #{trade_id}."
-                                )
-                        except Exception as reattach_err:
-                            logger.error(
-                                f"[{pair}] SL re-attach exception for Trade #{trade_id}: {reattach_err}"
-                            )
+                        if attached:
+                            logger.info(f"[{pair}] Reconciler successfully re-attached SL ${db_sl_val:.5f} on exchange.")
+                        else:
+                            logger.error(f"[{pair}] Reconciler FAILED to re-attach SL on exchange.")
 
-        except Exception as err:
-            logger.error(f"Error reconciling trade ID #{trade_id}: {err}")
+        except Exception as trade_err:
+            logger.error(f"Error during trade #{trade_id} reconciliation: {trade_err}")
 
-    # =====================================================================
-    # FIX 3: Sync Adopted Trades with Stop Loss / Take Profit & Deduplication
-    # =====================================================================
-    if live_exchange_positions:
-        for ex_symbol, ex_pos in live_exchange_positions.items():
-            ex_normalized = ex_pos.get("normalized_symbol") or normalize_pair(ex_symbol)
-            
-            # Check if symbol is already tracked via standard symbol or normalized string
-            is_tracked = any(
-                normalize_pair(tracked_sym) == ex_normalized 
-                for tracked_sym in tracked_ccxt_symbols
+    # Check for orphaned positions on exchange that are missing in the DB
+    for ccxt_sym, pos in live_exchange_positions.items():
+        if is_symbol_under_grace_period(ccxt_sym):
+            logger.info(f"[{ccxt_sym}] Symbol is within grace period ({GRACE_PERIOD_SECONDS}s). Skipping orphan check.")
+            continue
+
+        normalized_sym = pos.get("normalized_symbol", "")
+        db_has_symbol = any(
+            normalize_pair(t[1]) == normalized_sym for t in open_db_trades
+        )
+
+        if not db_has_symbol and pos.get("contracts", 0.0) > DUST_THRESHOLD:
+            logger.warning(
+                f"⚠️ ORPHAN POSITION DETECTED: {pos['raw_symbol']} has {pos['contracts']} "
+                f"contracts active on Bybit but 0 active setups in DB!"
             )
-            
-            if not is_tracked:
-                if is_symbol_under_grace_period(ex_symbol):
-                    logger.info(f"[{ex_symbol}] Orphan check bypassed: Symbol is within recent order execution grace period window.")
-                    continue
-
-                conn_adopt = get_db_connection()
-                if conn_adopt:
-                    try:
-                        with conn_adopt.cursor() as cursor:
-                            # Verify whether an active setup already exists in trade_setups using normalized pair comparison
-                            cursor.execute("""
-                                SELECT id, stop_loss, take_profit FROM trade_setups 
-                                WHERE trade_state IN ('OPEN', 'EXECUTED', 'BE_LOCKED', 'TRAILING');
-                            """)
-                            existing_open_trades = cursor.fetchall()
-                            
-                            existing_trade_id = None
-                            existing_sl = 0.0
-                            existing_tp = 0.0
-                            
-                            for row in existing_open_trades:
-                                t_id, t_sl, t_tp = row[0], float(row[1] or 0.0), float(row[2] or 0.0)
-                                cursor.execute("SELECT pair FROM trade_setups WHERE id = %s;", (t_id,))
-                                p_row = cursor.fetchone()
-                                if p_row and normalize_pair(p_row[0]) == ex_normalized:
-                                    existing_trade_id = t_id
-                                    existing_sl = t_sl
-                                    existing_tp = t_tp
-                                    break
-
-                            if existing_trade_id is not None:
-                                logger.info(
-                                    f"[{ex_symbol}] Active trade setup #{existing_trade_id} already exists for normalized pair "
-                                    f"'{ex_normalized}'. Skipping insertion of duplicate orphan record."
-                                )
-                                continue
-
-                            logger.warning(f"🚨 ORPHAN POSITION DETECTED: {ex_symbol}. Safely inserting/updating position in DB...")
-
-                            db_pair = ex_symbol
-                            direction = "BUY" if ex_pos['side'].lower() in ["long", "buy"] else "SELL"
-                            entry_price = float(ex_pos.get('entry_price', 0.0))
-                            position_size = float(ex_pos.get('contracts', 0.0))
-                            adopt_sl = float(ex_pos.get('stop_loss', 0.0))
-                            adopt_tp = float(ex_pos.get('take_profit', 0.0))
-
-                            cursor.execute("""
-                                INSERT INTO trade_setups (
-                                    pair, direction, entry_price, position_size, 
-                                    stop_loss, take_profit, status, trade_state, created_at, updated_at
-                                ) VALUES (%s, %s, %s, %s, %s, %s, 'EXECUTED', 'OPEN', NOW(), NOW())
-                                ON CONFLICT (pair) WHERE trade_state IN ('OPEN', 'EXECUTED', 'BE_LOCKED', 'TRAILING')
-                                DO UPDATE SET
-                                    position_size = EXCLUDED.position_size,
-                                    entry_price = EXCLUDED.entry_price,
-                                    stop_loss = COALESCE(NULLIF(EXCLUDED.stop_loss, 0.0), trade_setups.stop_loss),
-                                    take_profit = COALESCE(NULLIF(EXCLUDED.take_profit, 0.0), trade_setups.take_profit),
-                                    updated_at = CURRENT_TIMESTAMP
-                                RETURNING id;
-                            """, (
-                                db_pair, direction, entry_price, position_size,
-                                adopt_sl, adopt_tp
-                            ))
-
-                            row = cursor.fetchone()
-                            if row:
-                                new_id = row[0]
-                                conn_adopt.commit()
-                                reconciled_count += 1
-
-                                send_telegram_notification(
-                                    f"<b>✅ AUTO-ADOPTED EXCHANGE POSITION</b>\n\n"
-                                    f"<b>Trade ID:</b> <code>#{new_id}</code>\n"
-                                    f"<b>Pair:</b> <code>{db_pair}</code>\n"
-                                    f"<b>Side:</b> <code>{direction}</code>\n"
-                                    f"<b>Contracts:</b> <code>{position_size}</code>\n"
-                                    f"<b>SL:</b> <code>${adopt_sl}</code> \vert{} <b>TP:</b> <code>${adopt_tp}</code>"
-                                )
-                    except Exception as db_err:
-                        logger.error(f"Failed to auto-insert/upsert orphan position for {ex_symbol}: {db_err}")
-                        conn_adopt.rollback()
-                    finally:
-                        release_db_connection(conn_adopt)
+            send_telegram_notification(
+                f"<b>🚨 UNTRACKED/ORPHAN POSITION DETECTED</b>\n\n"
+                f"<b>Symbol:</b> <code>{pos['raw_symbol']}</code>\n"
+                f"<b>Side:</b> <code>{pos['side'].upper()}</code>\n"
+                f"<b>Size:</b> <code>{pos['contracts']}</code>\n"
+                f"<b>Entry Price:</b> <code>${pos['entry_price']:.5f}</code>\n\n"
+                f"<i>Manual verification recommended via exchange UI.</i>"
+            )
 
     return reconciled_count
+
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
+    logger.info("Initializing Reconciler test loop...")

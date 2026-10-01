@@ -7,14 +7,16 @@
   "short_risk_multiplier": 1.0,
   "proximity_threshold_pct": 0.5,
   "adx_period": 14,
-  "adx_threshold": 25.0,
+  "adx_threshold": 20.0,
   "use_adx_filter": true,
+  "rsi_thresh": 42.2,
+  "rsi_period": 14,
   "max_sl_pct": 0.015,
   "min_atr_pct": 0.2,
   "atr_mult_sl": 2.5,
-  "min_rr": 2.0,
+  "min_rr": 3.5,
   "scan_interval_minutes": 60,
-  "alert_cooldown_hours": 4 ,
+  "alert_cooldown_hours": 4,
   "enable_live_trading": true,
   "disable_htf": false,
   "atr_ratio_thresh": 1.0,   
@@ -24,6 +26,16 @@
     "XRP/USDT",
     "SOL/USDT"
   ],
+  "symbols": {
+    "ARB/USDT": {
+      "binance": "ARB/USDT",
+      "bybit": "ARBPERP"
+    },
+    "BTC/USDT": {
+      "binance": "BTC/USDT",
+      "bybit": "BTCUSDT"
+    }
+  },
   "use_mtf_tema_alignment": true,
   "htf_tema_period": 200,
   "htf_alignment_mode": "TEMA Slope",

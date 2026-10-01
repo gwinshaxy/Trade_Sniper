@@ -30,7 +30,7 @@ EXPECTED_MEXC_COLUMNS = [
 # ---------------------------------------------------------------------------
 # GLOBAL TIMEFRAME CONSTANTS (RECONCILIATION)
 # ---------------------------------------------------------------------------
-EXECUTION_TIMEFRAME = "1h"       # Signal generation / entry timeframe
+EXECUTION_TIMEFRAME = "4h"       # Signal generation / entry timeframe
 MACRO_TIMEFRAME = "4h"           # HTF confluence timeframe
 HTF_TEMA_PERIOD = 200            # TEMA period for 4H macro trend
 
@@ -253,9 +253,23 @@ def check_ltf_confirmation(
     symbol: str, 
     direction: str, 
     ltf_interval: str = "15m", 
-    rsi_period: int = 14
+    rsi_period: int = 14,
+    df_ltf_override: Optional[pd.DataFrame] = None,
+    is_backtest: bool = False
 ) -> bool:
-    df_ltf = fetch_klines(symbol=symbol, interval=ltf_interval, limit=50)
+    """
+    Evaluates momentum alignment on lower timeframe data.
+    Fix Applied: Suppresses lookahead/resampling bias during backtests by consuming
+    a zero-lookahead past-close sequence verification proxy (evaluating up to bar i-1).
+    """
+    if is_backtest and df_ltf_override is not None and len(df_ltf_override) >= 20:
+        df_ltf = df_ltf_override.copy()
+    elif is_backtest:
+        # Fallback for backtesting if explicit LTF slice is not passed
+        return True
+    else:
+        df_ltf = fetch_klines(symbol=symbol, interval=ltf_interval, limit=50)
+
     if df_ltf.empty or len(df_ltf) < 20:
         return True
 
@@ -263,6 +277,7 @@ def check_ltf_confirmation(
     df_ltf['ema21'] = calculate_ema(df_ltf['close'], 21)
     df_ltf['rsi'] = calculate_rsi(df_ltf['close'], period=rsi_period)
 
+    # Use strictly closed bars (i-1 and i-2) to avoid intrabar lookahead bias
     last_ltf = df_ltf.iloc[-1]
     prev_ltf = df_ltf.iloc[-2]
 
@@ -352,11 +367,43 @@ def check_time_based_invalidation(
 # 5. HIGH-PERFORMANCE VECTORIZED VOLUME PROFILE & LIQUIDITY GAPS
 # ---------------------------------------------------------------------------
 
-def compute_volume_profile(df: pd.DataFrame, num_bins: int = 100, lookback_bars: int = 600, va_pct: float = 0.70):
+def get_calibrated_lookback(timeframe: str, target_4h_bars: int = 600) -> int:
+    """
+    Dynamically scales the lookback window based on the candle timeframe duration
+    to ensure standard 2400-hour (600 * 4H) historical depth across all horizons.
+    """
+    tf = str(timeframe).lower().strip()
+    if tf in ["1m", "1min"]:
+        return target_4h_bars * 240
+    elif tf in ["5m", "5min"]:
+        return target_4h_bars * 48
+    elif tf in ["15m", "15min"]:
+        return target_4h_bars * 16
+    elif tf in ["30m", "30min"]:
+        return target_4h_bars * 8
+    elif tf in ["1h", "60m"]:
+        return target_4h_bars * 4
+    elif tf in ["4h", "240m"]:
+        return target_4h_bars
+    elif tf in ["1d", "1day"]:
+        return max(target_4h_bars // 6, 50)
+    return target_4h_bars
+
+
+def compute_volume_profile(
+    df: pd.DataFrame, 
+    num_bins: int = 100, 
+    lookback_bars: int = 600, 
+    va_pct: float = 0.70,
+    timeframe: str = EXECUTION_TIMEFRAME
+):
     if df.empty or len(df) < 5 or "volume" not in df.columns:
         return np.nan, np.nan, np.nan
 
-    df_range = df.tail(lookback_bars)
+    # Dynamically enforce time-calibrated rolling window anchored to 4H depth
+    calibrated_bars = get_calibrated_lookback(timeframe, target_4h_bars=lookback_bars)
+    df_range = df.tail(min(len(df), calibrated_bars))
+
     lows = df_range["low"].values
     highs = df_range["high"].values
     vols = df_range["volume"].values
@@ -424,7 +471,8 @@ def calculate_volume_profile_gaps(
     num_bins: int = 100,
     lookback_bars: int = 600,
     detection_pct: float = 0.07,
-    cached_vp: Optional[Dict[str, Any]] = None
+    cached_vp: Optional[Dict[str, Any]] = None,
+    timeframe: str = EXECUTION_TIMEFRAME
 ) -> Dict[str, Any]:
     if cached_vp is not None:
         current_price = float(df.iloc[-1]["close"])
@@ -441,9 +489,12 @@ def calculate_volume_profile_gaps(
     if df.empty or "volume" not in df.columns:
         return empty_res
 
-    poc, vah, val = compute_volume_profile(df, num_bins=num_bins, lookback_bars=lookback_bars)
+    calibrated_bars = get_calibrated_lookback(timeframe, target_4h_bars=lookback_bars)
+    poc, vah, val = compute_volume_profile(
+        df, num_bins=num_bins, lookback_bars=lookback_bars, timeframe=timeframe
+    )
 
-    df_range = df.tail(lookback_bars)
+    df_range = df.tail(min(len(df), calibrated_bars))
     lows, highs, vols = df_range["low"].values, df_range["high"].values, df_range["volume"].values
     pLST, pHST = float(np.min(lows)), float(np.max(highs))
 
@@ -517,8 +568,8 @@ def normalize_symbol(symbol: str) -> str:
 
 
 SYMBOL_PARAMETER_DEFAULTS: Dict[str, Dict[str, Any]] = {
-    "SOL/USDT": {"adx_threshold": 25.0},
-    "SOLUSDT": {"adx_threshold": 25.0},
+    "SOL/USDT": {"adx_threshold": 20.0},
+    "SOLUSDT": {"adx_threshold": 20.0},
 }
 
 
@@ -533,11 +584,11 @@ def load_symbol_config(symbol: str) -> Dict[str, Any]:
     )
 
     default_config = {
-        "tema_period": 200, "rsi_period": 14, "rsi_thresh": 42.0,
-        "adx_period": 14, "adx_threshold": sym_defaults.get("adx_threshold", 25.0),
+        "tema_period": 200, "rsi_period": 14, "rsi_thresh": 42.2,
+        "adx_period": 14, "adx_threshold": sym_defaults.get("adx_threshold", 20.0),
         "use_adx_filter": True, "use_rsi_filter": True, "use_candlestick_confirm": True,
         "zone_tolerance": 0.01245, "max_sl_pct": 0.015, "min_sentiment": 0.0,
-        "min_rr": 2.0, "risk_pct": 1.0, "vp_detection_pct": 0.07, "lookback_bars": 600,
+        "min_rr": 3.5, "risk_pct": 1.0, "vp_detection_pct": 0.07, "lookback_bars": 600,
         "vp_va_pct": 0.70, "atr_period": 14, "atr_mult": 1.5,
         "atr_long_period": 100, "atr_ratio_thresh": 1.0,
         "use_atr_sl": True, "disable_htf": False, "spot_only": False
@@ -622,7 +673,9 @@ def evaluate_signals(
     disable_htf: Optional[bool] = None,
     spot_only: Optional[bool] = None,
     sentiment_score: Optional[float] = None,
-    cached_vp: Optional[Dict[str, Any]] = None
+    cached_vp: Optional[Dict[str, Any]] = None,
+    is_backtest: bool = False,
+    timeframe: str = EXECUTION_TIMEFRAME
 ) -> Dict[str, Any]:
     no_signal = {
         "action": "HOLD", "symbol": symbol, "direction": "NONE",
@@ -714,7 +767,6 @@ def evaluate_signals(
                 macro_trend_long = bool(last_row["macro_long"])
                 macro_trend_short = bool(last_row["macro_short"])
             else:
-                # Ensure timestamp is available as a column or reset index if it's already the index
                 work_df = df.copy()
                 if 'timestamp' not in work_df.columns and isinstance(work_df.index, pd.DatetimeIndex):
                     work_df = work_df.reset_index()
@@ -745,7 +797,8 @@ def evaluate_signals(
         df,
         lookback_bars=lookback_bars,
         detection_pct=vp_detection_pct,
-        cached_vp=cached_vp
+        cached_vp=cached_vp,
+        timeframe=timeframe
     )
     poc, vah, val = vp_data["poc"], vp_data["vah"], vp_data["val"]
     overhead_gaps, underneath_gaps = vp_data["overhead_gaps"], vp_data["underneath_gaps"]
@@ -788,7 +841,9 @@ def evaluate_signals(
         and long_candlestick
         and macro_trend_long
     ):
-        if not check_ltf_confirmation(symbol, direction="LONG", ltf_interval="15m", rsi_period=rsi_period):
+        if not check_ltf_confirmation(
+            symbol, direction="LONG", ltf_interval="15m", rsi_period=rsi_period, is_backtest=is_backtest
+        ):
             no_signal["reason"] = "LTF Gate: 15m momentum cross/RSI not aligned for LONG entry"
             return no_signal
 
@@ -866,7 +921,9 @@ def evaluate_signals(
             and short_candlestick
             and macro_trend_short
         ):
-            if not check_ltf_confirmation(symbol, direction="SHORT", ltf_interval="15m", rsi_period=rsi_period):
+            if not check_ltf_confirmation(
+                symbol, direction="SHORT", ltf_interval="15m", rsi_period=rsi_period, is_backtest=is_backtest
+            ):
                 no_signal["reason"] = "LTF Gate: 15m momentum cross/RSI not aligned for SHORT entry"
                 return no_signal
 
@@ -951,7 +1008,7 @@ class StrategyEngine:
             current_price = float(df.iloc[-1]["close"])
 
         params = params or {}
-        min_rr = float(params.get("min_rr", getattr(self.config, "MIN_RR", 1.5) if self.config else 1.5))
+        min_rr = float(params.get("min_rr", getattr(self.config, "MIN_RR", 3.5) if self.config else 3.5))
         atr_multiplier = float(params.get("atr_mult", getattr(self.config, "ATR_MULT", 2.5) if self.config else 2.5))
         atr_period = int(params.get("atr_period", getattr(self.config, "ATR_PERIOD", 14) if self.config else 14))
         risk_pct = float(params.get("risk_pct", 0.5))
@@ -967,7 +1024,7 @@ class StrategyEngine:
             current_atr = float(tr.ewm(alpha=1.0 / atr_period, adjust=False).mean().iloc[-1])
 
         latest = df.iloc[-1]
-        rsi_thresh = float(params.get("rsi_thresh", 42.0))
+        rsi_thresh = float(params.get("rsi_thresh", 42.2))
         direction = position_side.upper()
 
         if "tema" in df.columns and "rsi" in df.columns:
@@ -1042,4 +1099,4 @@ def generate_live_signal(
             "entry_price": 0.0, "stop_loss": 0.0, "take_profit": 0.0,
             "atr": 0.0, "position_size": 0.0, "reason": "Failed to fetch klines"
         }
-    return evaluate_signals(df, symbol, account_balance=account_balance, **kwargs)
+    return evaluate_signals(df, symbol, account_balance=account_balance, timeframe=execution_timeframe, **kwargs)

@@ -35,7 +35,7 @@ ENTRY_TOLERANCE_PCT_TESTNET = 0.03
 
 USE_MAKER_ORDERS = os.getenv("USE_MAKER_ORDERS", "true").lower() == "true"
 
-# FIX #4: Extended verification window on testnet to tolerate Bybit's
+# Extended verification window on testnet to tolerate Bybit's
 # propagation delay between an order fill and the position becoming
 # editable via /v5/position/trading-stop.
 SL_VERIFY_MAX_ATTEMPTS_LIVE = 8
@@ -169,21 +169,11 @@ class BybitFuturesLiveExecutor:
         except Exception as e:
             logger.warning(f"Could not load public market structures: {e}")
 
-        # -----------------------------------------------------------------
-        # FIX C: Log the CCXT version so we can correlate behavior with
-        # upstream changes to the Bybit V5 position normalizer.
-        # -----------------------------------------------------------------
         try:
             logger.info(f"CCXT version: {ccxt.__version__}")
         except Exception:
             pass
 
-        # -----------------------------------------------------------------
-        # FIX #3: Detect account position mode once at startup so that all
-        # subsequent trading-stop calls use the correct positionIdx.
-        # "MergedSingle" = one-way mode (positionIdx = 0)
-        # "BothSide"     = hedge mode   (positionIdx = 1 for Buy, 2 for Sell)
-        # -----------------------------------------------------------------
         self.position_mode: Optional[str] = None
         try:
             acct_info = self.exchange.private_get_v5_account_info()
@@ -195,25 +185,16 @@ class BybitFuturesLiveExecutor:
         except Exception as e:
             logger.warning(f"Could not determine account position mode at startup: {e}")
 
-    # ---------------------------------------------------------------------
-    # FIX #1 + FIX #3: Position-mode-aware positionIdx resolver.
-    # Returns 0 (one-way), 1 (hedge-buy), or 2 (hedge-sell).
-    # ---------------------------------------------------------------------
     def _get_position_idx(self, ccxt_symbol: str, direction: str) -> int:
         """Returns 0 for one-way mode, 1 for hedge-buy, 2 for hedge-sell."""
         clean_dir = str(direction or "").upper()
         is_buy = clean_dir in ("BUY", "LONG")
 
-        # Fast path: if startup detection succeeded, use it.
         if self.position_mode == "MergedSingle":
             return 0
         if self.position_mode == "BothSide":
             return 1 if is_buy else 2
 
-        # Fallback: query /v5/position/list and inspect positionIdx values.
-        # Bybit V5 hedge mode ALWAYS returns two entries (one per side),
-        # even when one side has size 0. One-way mode returns one entry
-        # with positionIdx=0.
         try:
             formatted = (
                 ccxt_symbol.replace("/", "")
@@ -228,19 +209,14 @@ class BybitFuturesLiveExecutor:
             positions = info.get("result", {}).get("list", [])
             position_idxs = {int(p.get("positionIdx", 0) or 0) for p in positions}
             if 1 in position_idxs or 2 in position_idxs:
-                # Cache the discovered mode so future calls are fast.
                 self.position_mode = "BothSide"
                 return 1 if is_buy else 2
         except Exception as e:
             logger.warning(f"Could not determine position mode dynamically: {e}")
 
-        # Default to one-way and cache it.
         self.position_mode = "MergedSingle"
         return 0
 
-    # ---------------------------------------------------------------------
-    # FIX #7: Authoritative closedPnl lookup used by reconciler & managers.
-    # ---------------------------------------------------------------------
     def fetch_real_closed_pnl(self, symbol: str) -> tuple:
         """Centralized helper to query Bybit's /v5/position/closed-pnl endpoint."""
         real_closed_pnl = None
@@ -267,10 +243,6 @@ class BybitFuturesLiveExecutor:
 
         return real_closed_pnl, real_fee, avg_exit_price
 
-    # ---------------------------------------------------------------------
-    # FIX #4 (reconciler): Authoritative execution-list lookup.
-    # Catches closes that the private WS dropped.
-    # ---------------------------------------------------------------------
     def fetch_recent_executions(self, symbol: str, lookback_ms: int = 300_000) -> List[Dict[str, Any]]:
         """Queries /v5/execution/list for the authoritative fill history."""
         try:
@@ -290,13 +262,6 @@ class BybitFuturesLiveExecutor:
     def format_ccxt_futures_symbol(self, raw_symbol: str) -> str:
         return format_ccxt_futures_symbol(raw_symbol)
 
-    # ---------------------------------------------------------------------
-    # FIX A: Verification now queries /v5/position/list directly and reads
-    # the raw Bybit "stopLoss" field, because CCXT's fetch_positions() does
-    # NOT reliably populate the normalized top-level stopLoss key on Bybit
-    # V5. Every prior "SL VERIFY FAILED" was a false negative caused by
-    # reading pos["stopLoss"] (None) instead of pos["info"]["stopLoss"].
-    # ---------------------------------------------------------------------
     def _verify_sl(
         self,
         ccxt_symbol: str,
@@ -304,21 +269,19 @@ class BybitFuturesLiveExecutor:
         target_sl: Optional[float],
     ) -> bool:
         if not target_sl or target_sl <= 0:
-            return True  # nothing to verify
+            return True
 
-        # FIX #4: longer window on testnet
         max_attempts = (
             SL_VERIFY_MAX_ATTEMPTS_TESTNET if BYBIT_TESTNET else SL_VERIFY_MAX_ATTEMPTS_LIVE
         )
         last_live_sl = 0.0
 
-        # Extract the Bybit raw symbol for the authoritative endpoint.
         raw_symbol = (
             ccxt_symbol.replace("/", "").replace(":USDT", "").upper()
         )
 
         for attempt in range(max_attempts):
-            sleep_time = 0.5 + (attempt * 0.25)  # 0.5, 0.75, 1.0, 1.25, ...
+            sleep_time = 0.5 + (attempt * 0.25)
             time.sleep(sleep_time)
             try:
                 resp = self.exchange.private_get_v5_position_list({
@@ -355,20 +318,6 @@ class BybitFuturesLiveExecutor:
         position_idx: Optional[int] = None,
         direction: str = "",
     ) -> bool:
-        """
-        Sets SL/TP via Bybit V5 /position/trading-stop.
-
-        FIX #1: positionIdx is now derived from the account's actual position
-                mode and the trade direction (unless explicitly passed).
-        FIX #2: The trading-stop API call itself is retried up to 3 times with
-                backoff, and verification runs after each successful retCode:0.
-        FIX #3: tpslMode is validated against the actual account mode; the
-                previous "Partial" branch was silently broken because no qty
-                was ever supplied.
-        FIX #4: Extended verification window on testnet.
-        FIX A:  Verification now reads the raw Bybit payload via
-                /v5/position/list.
-        """
         try:
             ccxt_symbol = self.format_ccxt_futures_symbol(symbol)
             formatted_symbol = (
@@ -379,13 +328,9 @@ class BybitFuturesLiveExecutor:
                 .upper()
             )
 
-            # FIX #1 / FIX #3: Resolve positionIdx
             if position_idx is None:
                 position_idx = self._get_position_idx(ccxt_symbol, direction)
 
-            # FIX #3: tpslMode must always be "Full" — "Partial" requires a
-            # qty argument that this code never supplies. Bybit V5 accepts
-            # "Full" for both one-way and hedge mode (per-side).
             tpsl_mode = "Full"
 
             params = {
@@ -432,10 +377,6 @@ class BybitFuturesLiveExecutor:
                 )
                 return False
 
-            # -------------------------------------------------------------
-            # FIX #2: Retry the API call itself, verifying after each
-            # successful retCode:0 response.
-            # -------------------------------------------------------------
             for api_attempt in range(SL_API_MAX_RETRIES):
                 try:
                     response = method(params)
@@ -446,7 +387,6 @@ class BybitFuturesLiveExecutor:
                     response = None
 
                 if isinstance(response, dict) and response.get("retCode") == 0:
-                    # Verify the SL actually populated
                     if self._verify_sl(ccxt_symbol, formatted_sl, stop_loss):
                         logger.info(
                             f"[{symbol}] Successfully attached SL (${stop_loss}) / "
@@ -585,12 +525,6 @@ class BybitFuturesLiveExecutor:
     async def get_futures_position_async(self, symbol: str) -> Dict[str, Any]:
         return await asyncio.to_thread(self.get_futures_position, symbol)
 
-    # ---------------------------------------------------------------------
-    # FIX B: CCXT does not reliably map Bybit V5 stopLoss/takeProfit into
-    # the normalized top-level keys. Fall back to the raw info dict, which
-    # always contains them. This is the field the exchange actually uses.
-    # FIX #2 (leverage): also read leverage from info dict as fallback.
-    # ---------------------------------------------------------------------
     def get_futures_position(self, symbol: str) -> Dict[str, Any]:
         ccxt_symbol = format_ccxt_futures_symbol(symbol)
         clean_target = symbol.replace("/", "").replace(":", "").replace("_", "").replace("-", "").upper()
@@ -609,7 +543,6 @@ class BybitFuturesLiveExecutor:
                         sl = safe_float(sl_raw) if sl_raw not in (None, "") else safe_float(info.get("stopLoss", 0))
                         tp = safe_float(tp_raw) if tp_raw not in (None, "") else safe_float(info.get("takeProfit", 0))
 
-                        # FIX #2: Read leverage from info dict as fallback
                         raw_lev = pos.get('leverage')
                         if raw_lev in (None, "", 0, 0.0):
                             raw_lev = info.get('leverage', 1.0)
@@ -713,7 +646,6 @@ class BybitFuturesLiveExecutor:
         if order and order.get("status") == "SUCCESS":
             logger.info(f"Order filled for {symbol}. Verifying explicit post-execution Stop Loss at {target_sl}")
 
-            # FIX #1: derive positionIdx from direction, not hard-coded 0
             pos_idx = self._get_position_idx(
                 self.format_ccxt_futures_symbol(symbol), side
             )
@@ -748,27 +680,14 @@ class BybitFuturesLiveExecutor:
 
                 order["stop_loss_attached"] = sl_success
 
+                # SOLUTION 2: Prevent Emergency Guard Immediate Position Liquidations
                 if not sl_success:
-                    logger.critical(
-                        f"🚨 [EMERGENCY GUARD] Failed to set exchange Stop Loss for {symbol} at ${target_sl}. "
-                        f"Closing position immediately to prevent naked risk exposure."
+                    logger.warning(
+                        f"⚠️ [SL ATTACH RETRY NEEDED] Could not verify exchange Stop Loss for {symbol} at ${target_sl}. "
+                        f"Trade will remain open; reconciler will auto-reattach SL on next sync cycle."
                     )
-                    exec_qty = order.get("executed_qty", 0.0)
-                    fill_price = order.get("fill_price", 0.0)
-                    close_res = self.close_live_position_bybit(
-                        symbol=symbol, position_size=exec_qty, current_price=fill_price,
-                        outcome="EMERGENCY_SL_ATTACH_FAILURE"
-                    )
-                    send_telegram_notification(
-                        f"🚨 <b>EMERGENCY POSITION CLOSE</b>\n\n"
-                        f"<b>Symbol:</b> <code>{symbol}</code>\n"
-                        f"<b>Reason:</b> Failed to attach Exchange Stop Loss ({target_sl})\n"
-                        f"<b>Close Status:</b> {close_res.get('status')}"
-                    )
-                    return {
-                        "status": "FAILED",
-                        "error": "Emergency close triggered: exchange stop loss failed to attach."
-                    }
+                    # DO NOT call close_live_position_bybit() here!
+                    return order
 
         return order
 
@@ -808,16 +727,11 @@ class BybitFuturesLiveExecutor:
             logger.warning(f"[{symbol}] Order Rejected: High Spread detected ({spread_pct * 100:.3f}%).")
             return {"status": "FAILED", "error": f"Spread too high ({spread_pct * 100:.3f}%)"}
 
-        # -----------------------------------------------------------------
-        # FIX #1: Make set_leverage failure FATAL, verify post-set, and
-        # reject the order if the exchange leverage does not match.
-        # -----------------------------------------------------------------
         try:
             self.exchange.set_leverage(int(leverage), ccxt_symbol)
             logger.info(f"[{symbol}] Leverage set to {int(leverage)}x on Bybit.")
         except Exception as lev_err:
             logger.error(f"[{symbol}] FAILED to set leverage to {leverage}x: {lev_err}")
-            # Verify the current leverage before proceeding
             try:
                 pos_check_pre = self.get_futures_position(ccxt_symbol)
                 actual_lev_pre = safe_float(pos_check_pre.get("leverage", 0), 0.0)
@@ -853,7 +767,6 @@ class BybitFuturesLiveExecutor:
             notional_value = trade_amount_usd * leverage
             raw_qty = notional_value / ref_price
 
-        # Momentum override: bypass PostOnly if market has moved >0.5% from signal
         prefer_taker_due_to_momentum = False
         if entry_price > 0 and ref_price > 0:
             deviation_pct = abs(ref_price - entry_price) / entry_price
@@ -864,7 +777,6 @@ class BybitFuturesLiveExecutor:
                     f"→ using IOC taker for immediate fill."
                 )
 
-        # Aggressive PostOnly pricing with tick-back offset
         if USE_MAKER_ORDERS and not prefer_taker_due_to_momentum:
             try:
                 tick_size = float(self.exchange.markets[ccxt_symbol]['precision']['price'])
@@ -882,7 +794,6 @@ class BybitFuturesLiveExecutor:
             else:
                 limit_price = ref_price
 
-            # Sanity: limit must NOT cross the opposite side of the book
             if is_long and best_ask > 0 and limit_price >= best_ask:
                 limit_price = best_ask - tick_size if tick_size > 0 else best_ask * 0.999
             if (not is_long) and best_bid > 0 and limit_price <= best_bid:
@@ -906,7 +817,6 @@ class BybitFuturesLiveExecutor:
             formatted_qty = round(raw_qty, 4)
             formatted_limit_price = round(limit_price, 6)
 
-        # Validate SL / TP targets prior to post-order attachment
         target_sl = 0.0
         if stop_loss > 0:
             if is_long and stop_loss >= ref_price:
@@ -946,7 +856,6 @@ class BybitFuturesLiveExecutor:
 
             order_id = order.get("id")
 
-            # Poll PostOnly for up to 20s
             final_order = order
             deadline = time.time() + 20.0
             while time.time() < deadline:
@@ -964,7 +873,6 @@ class BybitFuturesLiveExecutor:
             filled = safe_float(final_order.get("filled"), 0.0)
             avg_price = safe_float(final_order.get("average") or final_order.get("price"), 0.0)
 
-            # If partially filled and cancelled, compute weighted average from trades
             if status == "canceled" and filled > 0 and filled < formatted_qty:
                 try:
                     trades = self.exchange.fetch_my_trades(ccxt_symbol, limit=10)
@@ -981,7 +889,6 @@ class BybitFuturesLiveExecutor:
                 except Exception as trade_err:
                     logger.warning(f"[{symbol}] Trade recomputation failed: {trade_err}")
 
-            # If PostOnly unfilled, fall back to IOC taker
             if filled <= 0 and USE_MAKER_ORDERS:
                 logger.warning(
                     f"[{symbol}] PostOnly unfilled after 20s — cancelling and retrying as IOC taker."
@@ -1039,11 +946,6 @@ class BybitFuturesLiveExecutor:
                     logger.error(f"[{symbol}] IOC fallback order failed: {ioc_err}")
                     return {"status": "FAILED", "error": f"IOC fallback failed: {ioc_err}"}
 
-            # -----------------------------------------------------------------
-            # FIX #1: Final safety check — the fill may have occurred but the
-            # order record was purged by Bybit before our poll could observe it.
-            # Query the actual position one last time before declaring failure.
-            # -----------------------------------------------------------------
             if filled <= 0:
                 try:
                     time.sleep(1.0)
@@ -1079,11 +981,6 @@ class BybitFuturesLiveExecutor:
                 f"Price ${fill_price:.6f}, Qty {executed_qty}, Status={status}"
             )
 
-            # -----------------------------------------------------------------
-            # FIX #1: Post-fill leverage verification. If the position opened
-            # at a different leverage than requested, close it immediately to
-            # prevent oversized risk exposure.
-            # -----------------------------------------------------------------
             try:
                 time.sleep(1.0)
                 verify_pos = self.get_futures_position(ccxt_symbol)
@@ -1107,7 +1004,6 @@ class BybitFuturesLiveExecutor:
             except Exception as lev_verify_err:
                 logger.warning(f"[{symbol}] Post-fill leverage verification failed: {lev_verify_err}")
 
-            # Attach SL; if it fails, cancel pending orders and close position
             sl_attached = False
             if target_sl > 0 or target_tp > 0:
                 pos_confirmed = False
@@ -1127,7 +1023,6 @@ class BybitFuturesLiveExecutor:
                     pos_confirmed = True
 
                 if pos_confirmed:
-                    # FIX #1: pass direction so positionIdx is resolved correctly
                     sl_attached = self.set_position_trading_stop(
                         symbol=symbol,
                         stop_loss=target_sl if target_sl > 0 else None,
@@ -1140,13 +1035,6 @@ class BybitFuturesLiveExecutor:
                     sl_attached = False
 
                 if target_sl > 0 and not sl_attached:
-                    # -----------------------------------------------------------------
-                    # FIX #4: On testnet, propagation delays cause spurious SL
-                    # failures. Arm the local SL guard as a fallback so the
-                    # position is not left naked. Only emergency-close if we
-                    # are on live, OR if the position is old enough that the
-                    # delay cannot be the cause.
-                    # -----------------------------------------------------------------
                     event_bus.arm_local_sl_guard(
                         symbol=symbol,
                         direction=dir_clean,
@@ -1163,8 +1051,6 @@ class BybitFuturesLiveExecutor:
                             f"[{symbol}] Testnet propagation delay suspected — "
                             f"NOT emergency-closing. Local guard will protect the position."
                         )
-                        # Return SUCCESS with sl_attached=False so the DB record
-                        # is created and the reconciler can re-attach the SL.
                         return {
                             "status": "SUCCESS",
                             "order_id": order_id,
@@ -1239,7 +1125,6 @@ class BybitFuturesLiveExecutor:
         """
         ccxt_symbol = format_ccxt_futures_symbol(symbol)
 
-        # Step 1: Cancel any pending orders FIRST
         try:
             open_orders = self.exchange.fetch_open_orders(ccxt_symbol)
             for oo in open_orders:
@@ -1251,7 +1136,6 @@ class BybitFuturesLiveExecutor:
         except Exception as open_err:
             logger.debug(f"[{symbol}] fetch_open_orders during close: {open_err}")
 
-        # Step 2: Fetch position
         pos_info = self.get_futures_position(ccxt_symbol)
         if pos_info.get("error"):
             logger.error(f"[{symbol}] Cannot attempt position close — API error during verification.")
@@ -1260,7 +1144,6 @@ class BybitFuturesLiveExecutor:
         contracts = pos_info["contracts"]
         current_side = str(pos_info["side"]).upper()
 
-        # Resolve trade_id for DB finalization
         conn = get_db_connection()
         trade_id = None
         if conn:
@@ -1281,16 +1164,12 @@ class BybitFuturesLiveExecutor:
             finally:
                 release_db_connection(conn)
 
-        # Step 3: Live position exists → market reduceOnly close
         if contracts >= MIN_DUST_THRESHOLD:
             close_side = "sell" if current_side in ["BUY", "LONG"] else "buy"
-
-            # FIX #1: pass the correct positionIdx in hedge mode
             reduce_position_idx = self._get_position_idx(ccxt_symbol, current_side)
 
             try:
                 close_params: Dict[str, Any] = {"reduceOnly": True}
-                # In hedge mode, Bybit V5 requires positionIdx for reduce-only closes
                 if self.position_mode == "BothSide" or reduce_position_idx in (1, 2):
                     close_params["positionIdx"] = reduce_position_idx
 
@@ -1317,7 +1196,6 @@ class BybitFuturesLiveExecutor:
                 logger.error(f"[{symbol}] Market close failed: {close_err}")
                 return {"status": "FAILED", "error": str(close_err)}
 
-        # Step 4: No live position → ghost close
         logger.warning(
             f"[{symbol}] Close requested but exchange reports zero contracts. "
             f"Treating as ghost close (trade_id={trade_id})."

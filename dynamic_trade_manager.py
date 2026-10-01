@@ -23,13 +23,6 @@ class DynamicTradeManager:
       - At tighten trigger (default 3.5R): SL trails tighter (1.8× ATR)
       - Hard TP only used as a SAFETY NET for catastrophic exhaustion; the
         primary exit is the trailing stop.
-
-    FIX #P0 (NEW): When the exchange reports zero contracts for a tracked trade,
-    this class now FINALIZES the trade directly (querying Bybit's closedPnl
-    endpoint for the authoritative exit price and net PnL) rather than
-    deferring to the reconciler. The reconciler is only triggered by private
-    WS execution events, which are unreliable on testnet (see log analysis),
-    so deferring caused permanent zombie DB records.
     """
 
     def __init__(
@@ -54,7 +47,6 @@ class DynamicTradeManager:
         self.hard_tp_enabled = hard_tp_enabled
         self.allow_partial_tp = allow_partial_tp
         self.partial_tp_fraction = partial_tp_fraction
-        # FIX #P0: reference to the live executor so we can query closedPnl
         self.executor = executor
 
     def _safe_float(self, value: Any, default: float = 0.0) -> float:
@@ -85,9 +77,6 @@ class DynamicTradeManager:
             finally:
                 release_db_connection(conn)
 
-    # ------------------------------------------------------------------
-    # FIX #P0: Self-contained finalization for exchange-detected closes.
-    # ------------------------------------------------------------------
     def _finalize_closed_trade(self, trade: Dict[str, Any], live_pos_info: Dict[str, Any]) -> bool:
         """
         Queries Bybit for the authoritative closedPnl, computes net PnL, and
@@ -104,7 +93,6 @@ class DynamicTradeManager:
             logger.error(f"Cannot finalize closed trade: missing id/pair. Trade={trade}")
             return False
 
-        # Query Bybit for the real closed PnL and exit price
         real_closed_pnl = None
         real_fee = 0.0
         verified_exit = 0.0
@@ -114,20 +102,17 @@ class DynamicTradeManager:
             except Exception as e:
                 logger.warning(f"[{pair}] closedPnl lookup failed during finalization: {e}")
 
-        # Determine exit price: prefer exchange-verified, else live mark
         if verified_exit > 0:
             exit_price = verified_exit
         else:
             exit_price = self._safe_float(live_pos_info.get("mark_price"), 0.0) if live_pos_info else 0.0
             if exit_price <= 0:
-                # Last resort: use the last known live position entry (will yield ~0 PnL)
                 exit_price = entry_price
             logger.warning(
                 f"[{pair}] Trade #{trade_id} closed but no verified exit price. "
                 f"Using ${exit_price:.5f} for finalization."
             )
 
-        # Compute PnL
         if real_closed_pnl is not None:
             pnl_usd, pnl_pct, outcome = calculate_pnl(
                 direction=direction,
@@ -235,11 +220,6 @@ class DynamicTradeManager:
             self._update_db_sl_tp(trade_id, current_sl, current_tp)
 
         # ---- 1. Exchange closure check --------------------------------
-        # FIX #P0: Finalize DIRECTLY instead of deferring to reconciler.
-        # The reconciler is triggered by private WS execution events, which
-        # drop frequently on testnet (see 02:08–03:14 log evidence). Without
-        # this fix, closed trades remain in 'OPEN' state indefinitely and
-        # block future entries for the same symbol.
         if live_pos_info and not live_pos_info.get("error") and live_pos_info.get("contracts", 0.0) <= 0.001:
             logger.warning(
                 f"[{trade.get('pair')}] Trade #{trade_id} closed on exchange. "
@@ -255,7 +235,9 @@ class DynamicTradeManager:
                 ),
             }
 
-        # ---- 2. Hard TP/SL checks -------------------------------------
+        # ---- SOLUTION 1: Disable Local Candle-Based SL/TP Hard Closures ----
+        # Rely solely on updating the native Exchange SL/TP via set_position_trading_stop.
+        """
         if is_long:
             if self.hard_tp_enabled and current_tp > 0 and trade_state not in ["TRAILING"] and high_price >= current_tp:
                 return {
@@ -282,6 +264,7 @@ class DynamicTradeManager:
                     "target_price": current_sl,
                     "msg": f"🛑 Target SL hit for #{trade_id}. Executing market close on Bybit..."
                 }
+        """
 
         # ---- 3. Progressive breakeven + trailing ---------------------
         if atr > 0:
