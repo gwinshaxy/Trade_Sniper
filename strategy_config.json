@@ -27,9 +27,17 @@
     "SOL/USDT"
   ],
   "symbols": {
+   "ARB/USDT:USDT": {
+      "binance": "ARB/USDT:USDT",
+      "bybit": "ARBPERP"
+    },
     "ARB/USDT": {
       "binance": "ARB/USDT",
       "bybit": "ARBPERP"
+    },
+    "BTC/USDT:USDT": {
+      "binance": "BTC/USDT:USDT",
+      "bybit": "BTCUSDT"
     },
     "BTC/USDT": {
       "binance": "BTC/USDT",
