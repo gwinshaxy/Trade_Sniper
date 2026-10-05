@@ -30,7 +30,7 @@ EXPECTED_MEXC_COLUMNS = [
 # ---------------------------------------------------------------------------
 # GLOBAL TIMEFRAME CONSTANTS (RECONCILIATION)
 # ---------------------------------------------------------------------------
-EXECUTION_TIMEFRAME = "4h"       # Signal generation / entry timeframe
+EXECUTION_TIMEFRAME = "1h"       # Signal generation / entry timeframe
 MACRO_TIMEFRAME = "4h"           # HTF confluence timeframe
 HTF_TEMA_PERIOD = 200            # TEMA period for 4H macro trend
 
@@ -148,8 +148,13 @@ def fetch_klines(symbol: str, interval: str = EXECUTION_TIMEFRAME, limit: int = 
     return pd.DataFrame()
 
 
+async def fetch_klines_async(symbol: str, interval: str = EXECUTION_TIMEFRAME, limit: int = 400) -> pd.DataFrame:
+    """Async thread-pool wrapper to prevent blocking the event loop during fetch_klines execution."""
+    return await asyncio.to_thread(fetch_klines, symbol, interval, limit)
+
+
 # ---------------------------------------------------------------------------
-# 3. TECHNICAL INDICATORS
+# 3. TECHNICAL INDICATORS & INTEGRATED HELPER FUNCTIONS
 # ---------------------------------------------------------------------------
 
 def calculate_ema(series: pd.Series, period: int) -> pd.Series:
@@ -223,9 +228,77 @@ def calculate_adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
     return adx
 
 
+def check_candlestick_rejection(last_row: pd.Series, prev_row: pd.Series, direction: str) -> bool:
+    """
+    Validates structural candlestick rejections at Value Area boundaries (VAL/VAH).
+    - Long (VAL Rejection): Bullish Pinbar (long lower wick) OR Bullish Engulfing.
+    - Short (VAH Rejection): Bearish Pinbar (long upper wick) OR Bearish Engulfing.
+    """
+    open_p = float(last_row["open"])
+    close_p = float(last_row["close"])
+    high_p = float(last_row["high"])
+    low_p = float(last_row["low"])
+    
+    prev_open = float(prev_row["open"])
+    prev_close = float(prev_row["close"])
+
+    body = abs(close_p - open_p)
+    candle_range = max(high_p - low_p, 1e-8)
+    upper_wick = high_p - max(open_p, close_p)
+    lower_wick = min(open_p, close_p) - low_p
+
+    if direction in ["BUY", "LONG"]:
+        is_pinbar = (lower_wick >= 2.0 * body) and (lower_wick / candle_range >= 0.45)
+        is_engulfing = (close_p > open_p) and (close_p > prev_open) and (close_p > float(prev_row["high"]))
+        return bool(is_pinbar or is_engulfing)
+
+    elif direction in ["SELL", "SHORT"]:
+        is_pinbar = (upper_wick >= 2.0 * body) and (upper_wick / candle_range >= 0.45)
+        is_engulfing = (close_p < open_p) and (close_p < prev_open) and (close_p < float(prev_row["low"]))
+        return bool(is_pinbar or is_engulfing)
+
+    return False
+
+
+def check_volatility_expansion(
+    df: pd.DataFrame, 
+    atr_series: pd.Series, 
+    lookback_sma: int = 20, 
+    expansion_threshold: float = 1.25
+) -> bool:
+    """
+    Returns True if current relative volatility (ATR / Price) expands 
+    beyond `expansion_threshold` (25% higher) relative to its N-period SMA.
+    """
+    if len(df) < lookback_sma or atr_series.empty:
+        return False
+
+    rel_vol = atr_series / df["close"]
+    rel_vol_sma = rel_vol.rolling(lookback_sma).mean()
+
+    current_rel_vol = rel_vol.iloc[-1]
+    baseline_rel_vol = rel_vol_sma.iloc[-1]
+
+    if np.isnan(baseline_rel_vol) or baseline_rel_vol == 0:
+        return False
+
+    return bool(current_rel_vol > (baseline_rel_vol * expansion_threshold))
+
+
 # ---------------------------------------------------------------------------
-# 4. ENTRY & EXIT OPTIMIZATION MODULES
+# 4. REGIME SWITCHING ENGINE (TREND VS. RANGE)
 # ---------------------------------------------------------------------------
+
+def determine_market_regime(adx_val: float, adx_threshold: float = 25.0) -> str:
+    """
+    Explicit Market Regime Classifier.
+    - TRENDING: ADX >= adx_threshold
+    - RANGING:  ADX < adx_threshold
+    """
+    if np.isnan(adx_val):
+        return "RANGING"
+    return "TRENDING" if adx_val >= adx_threshold else "RANGING"
+
 
 def determine_limit_entry(
     direction: str,
@@ -234,17 +307,30 @@ def determine_limit_entry(
     val: float,
     vah: float,
     near_val: bool,
-    near_vah: bool
+    near_vah: bool,
+    max_entry_offset_pct: float = 0.003
 ) -> float:
+    """
+    Calculates entry limit price bounded within a configurable offset threshold 
+    of current market price to ensure fill probability during fast breakouts.
+    """
     if direction == "LONG":
         if near_val and not np.isnan(val) and val < current_price:
-            return float(val)
-        return float(min(current_price, current_tema))
+            base_limit = float(val)
+        else:
+            base_limit = float(min(current_price, current_tema))
+        
+        min_allowed_price = current_price * (1.0 - max_entry_offset_pct)
+        return float(max(base_limit, min_allowed_price))
         
     elif direction == "SHORT":
         if near_vah and not np.isnan(vah) and vah > current_price:
-            return float(vah)
-        return float(max(current_price, current_tema))
+            base_limit = float(vah)
+        else:
+            base_limit = float(max(current_price, current_tema))
+            
+        max_allowed_price = current_price * (1.0 + max_entry_offset_pct)
+        return float(min(base_limit, max_allowed_price))
 
     return current_price
 
@@ -257,17 +343,21 @@ def check_ltf_confirmation(
     df_ltf_override: Optional[pd.DataFrame] = None,
     is_backtest: bool = False
 ) -> bool:
-    """
-    Evaluates momentum alignment on lower timeframe data.
-    Fix Applied: Suppresses lookahead/resampling bias during backtests by consuming
-    a zero-lookahead past-close sequence verification proxy (evaluating up to bar i-1).
-    """
-    if is_backtest and df_ltf_override is not None and len(df_ltf_override) >= 20:
+    if df_ltf_override is not None and len(df_ltf_override) >= 20:
         df_ltf = df_ltf_override.copy()
     elif is_backtest:
-        # Fallback for backtesting if explicit LTF slice is not passed
         return True
     else:
+        # Check if running within an active event loop
+        try:
+            loop = asyncio.get_running_loop()
+            if loop.is_running():
+                # In async runtime, expect pre-fetched DataFrames via df_ltf_override to prevent blocking
+                logger.warning(f"[{symbol}] Synchronous fetch_klines called inside running event loop. Use pre-fetched df_ltf_override.")
+                return True
+        except RuntimeError:
+            pass
+            
         df_ltf = fetch_klines(symbol=symbol, interval=ltf_interval, limit=50)
 
     if df_ltf.empty or len(df_ltf) < 20:
@@ -277,9 +367,8 @@ def check_ltf_confirmation(
     df_ltf['ema21'] = calculate_ema(df_ltf['close'], 21)
     df_ltf['rsi'] = calculate_rsi(df_ltf['close'], period=rsi_period)
 
-    # Use strictly closed bars (i-1 and i-2) to avoid intrabar lookahead bias
-    last_ltf = df_ltf.iloc[-1]
-    prev_ltf = df_ltf.iloc[-2]
+    last_ltf = df_ltf.iloc[-2]
+    prev_ltf = df_ltf.iloc[-3]
 
     if direction in ["BUY", "LONG"]:
         ema_cross = (last_ltf['ema9'] > last_ltf['ema21'])
@@ -321,10 +410,10 @@ def calculate_staged_targets(
         tp2 = min(farthest_tp, tp1)
 
     return {
-        "tp1": round(tp1, 5),
-        "tp1_ratio": 0.50,
-        "tp2": round(tp2, 5),
-        "tp2_ratio": 0.50
+        "tp1": round(tp1, 3),
+        "tp1_ratio": 0.30,
+        "tp2": round(tp2, 7),
+        "tp2_ratio": 0.70
     }
 
 
@@ -368,10 +457,6 @@ def check_time_based_invalidation(
 # ---------------------------------------------------------------------------
 
 def get_calibrated_lookback(timeframe: str, target_4h_bars: int = 600) -> int:
-    """
-    Dynamically scales the lookback window based on the candle timeframe duration
-    to ensure standard 2400-hour (600 * 4H) historical depth across all horizons.
-    """
     tf = str(timeframe).lower().strip()
     if tf in ["1m", "1min"]:
         return target_4h_bars * 240
@@ -400,7 +485,6 @@ def compute_volume_profile(
     if df.empty or len(df) < 5 or "volume" not in df.columns:
         return np.nan, np.nan, np.nan
 
-    # Dynamically enforce time-calibrated rolling window anchored to 4H depth
     calibrated_bars = get_calibrated_lookback(timeframe, target_4h_bars=lookback_bars)
     df_range = df.tail(min(len(df), calibrated_bars))
 
@@ -511,43 +595,32 @@ def calculate_volume_profile_gaps(
     eSI = np.minimum(np.floor((highs - pLST) / pSTP).astype(int), num_bins - 1)
 
     for i in range(len(df_range)):
-        lL, lH, lV, lR = lows[i], highs[i], vols[i], ranges[i]
         for pLI in range(sSI[i], eSI[i] + 1):
             pL = pLST + pLI * pSTP
-            vPOR = 1.0 if (lL >= pL and lH <= pL + pSTP) else (pSTP / lR)
-            vD_vt[pLI] += lV * max(vPOR, 0.0)
+            vPOR = 1.0 if (lows[i] >= pL and highs[i] <= pL + pSTP) else (pSTP / ranges[i])
+            vD_vt[pLI] += vols[i] * max(vPOR, 0.0)
 
     noN = max(int(num_bins * detection_pct), 1)
-    max_val = np.max(vD_vt)
-    tVT = list(vD_vt)
-
-    for _ in range(noN):
-        tVT.insert(0, max_val)
-        tVT.append(max_val)
-
+    
     gap_prices = []
-    for vn in range(2 * noN, num_bins + 2 * noN):
-        uNth = all(tVT[vn - noN] < tVT[cVN] for cVN in range(vn - 2 * noN, vn - noN))
-        lNth = all(tVT[vn - noN] < tVT[cVN] for cVN in range(vn - noN + 1, vn + 1))
-
-        if uNth and lNth:
-            bin_idx = vn - 2 * noN
-            gap_price = round(pLST + (bin_idx + 0.5) * pSTP, 2)
-            if pLST <= gap_price <= pHST:
+    for i in range(noN, num_bins - noN):
+        left_window = vD_vt[i - noN : i]
+        right_window = vD_vt[i + 1 : i + 1 + noN]
+        
+        if len(left_window) == noN and len(right_window) == noN:
+            if np.all(vD_vt[i] < left_window) and np.all(vD_vt[i] < right_window):
+                gap_price = round(pLST + (i + 0.5) * pSTP, 2)
                 gap_prices.append(gap_price)
 
     unique_gaps = list(dict.fromkeys(gap_prices))
     current_price = float(df.iloc[-1]["close"])
 
-    overhead_gaps = sorted([g for g in unique_gaps if g > current_price])
-    underneath_gaps = sorted([g for g in unique_gaps if g < current_price], reverse=True)
-
     return {
         "poc": poc,
         "vah": vah,
         "val": val,
-        "overhead_gaps": overhead_gaps,
-        "underneath_gaps": underneath_gaps,
+        "overhead_gaps": sorted([g for g in unique_gaps if g > current_price]),
+        "underneath_gaps": sorted([g for g in unique_gaps if g < current_price], reverse=True),
         "unique_gaps": unique_gaps
     }
 
@@ -568,33 +641,60 @@ def normalize_symbol(symbol: str) -> str:
 
 
 SYMBOL_PARAMETER_DEFAULTS: Dict[str, Dict[str, Any]] = {
-    "SOL/USDT": {"adx_threshold": 20.0},
-    "SOLUSDT": {"adx_threshold": 20.0},
+    # High Beta / Mid-Caps
+    "CAKE/USDT": {"adx_threshold": 25.0, "atr_mult": 3.5, "min_rr": 3.5},
+    "UNI/USDT":  {"adx_threshold": 24.0, "atr_mult": 3.2, "min_rr": 3.0},
+    "SOL/USDT":  {"adx_threshold": 27.0, "atr_mult": 4.0, "min_rr": 3.5},
+    "ARB/USDT":  {"adx_threshold": 23.0, "atr_mult": 3.2, "min_rr": 3.0},
+    
+    # Mega-Caps & Lower Volatility Pairs
+    "ETH/USDT":  {"adx_threshold": 28.0, "atr_mult": 4.2, "min_rr": 2.5, "zone_tolerance": 0.015},
+    "BNB/USDT":  {"adx_threshold": 28.0, "atr_mult": 4.5, "min_rr": 2.5, "zone_tolerance": 0.015},
+    "AAVE/USDT": {"adx_threshold": 26.0, "atr_mult": 4.0, "min_rr": 3.0},
+    "XRP/USDT":  {"adx_threshold": 27.0, "atr_mult": 4.0, "min_rr": 3.0},
 }
 
 
 def load_symbol_config(symbol: str) -> Dict[str, Any]:
     formatted_symbol = normalize_symbol(symbol)
-    raw_symbol = formatted_symbol.replace("/", "").upper()
-
-    sym_defaults = (
-        SYMBOL_PARAMETER_DEFAULTS.get(formatted_symbol)
-        or SYMBOL_PARAMETER_DEFAULTS.get(raw_symbol)
-        or {}
-    )
+    raw_symbol = formatted_symbol.replace("/", "").replace(":", "").replace("_", "").strip().upper()
 
     default_config = {
-        "tema_period": 200, "rsi_period": 14, "rsi_thresh": 42.2,
-        "adx_period": 14, "adx_threshold": sym_defaults.get("adx_threshold", 20.0),
-        "use_adx_filter": True, "use_rsi_filter": True, "use_candlestick_confirm": True,
-        "zone_tolerance": 0.01245, "max_sl_pct": 0.015, "min_sentiment": 0.0,
-        "min_rr": 3.5, "risk_pct": 1.0, "vp_detection_pct": 0.07, "lookback_bars": 600,
-        "vp_va_pct": 0.70, "atr_period": 14, "atr_mult": 1.5,
-        "atr_long_period": 100, "atr_ratio_thresh": 1.0,
-        "use_atr_sl": True, "disable_htf": False, "spot_only": False
+        "tema_period": 200, 
+        "rsi_period": 14, 
+        "rsi_thresh": 42.0,
+        "adx_period": 14, 
+        "adx_threshold": 25.0,            
+        "use_adx_filter": True, 
+        "use_rsi_filter": True, 
+        "use_candlestick_confirm": True,
+        "zone_tolerance": 0.0075,           
+        "max_sl_pct": 0.02, 
+        "min_sentiment": 0.0,
+        "min_rr": 3.5,                    
+        "risk_pct": 1.0, 
+        "vp_detection_pct": 0.07, 
+        "lookback_bars": 600,
+        "vp_va_pct": 0.70, 
+        "atr_period": 14, 
+        "atr_mult": 2.5,                  
+        "atr_long_period": 100, 
+        "atr_ratio_thresh": 0.85,         
+        "use_atr_sl": True, 
+        "disable_htf": False, 
+        "spot_only": False
     }
 
-    if HAS_DB:
+    # Apply symbol-specific parameter overrides to default_config
+    sym_override = (
+        SYMBOL_PARAMETER_DEFAULTS.get(formatted_symbol) 
+        or SYMBOL_PARAMETER_DEFAULTS.get(raw_symbol)
+    )
+    if sym_override:
+        default_config.update(sym_override)
+
+    # Database retrieval logic with slash and raw symbol matching
+    if HAS_DB and os.getenv("SKIP_DB", "0") != "1":
         conn = get_db_connection()
         if conn:
             try:
@@ -602,9 +702,10 @@ def load_symbol_config(symbol: str) -> Dict[str, Any]:
                 cursor.execute("""
                     SELECT * 
                     FROM strategy_parameters 
-                    WHERE UPPER(TRIM(REPLACE(REPLACE(symbol, '"', ''), '''', ''))) IN (%s, %s)
+                    WHERE UPPER(TRIM(REPLACE(REPLACE(REPLACE(symbol, '"', ''), '''', ''), '/', ''))) IN (%s, %s)
+                       OR UPPER(TRIM(symbol)) IN (%s, %s)
                     ORDER BY updated_at DESC LIMIT 1;
-                """, (formatted_symbol, raw_symbol))
+                """, (raw_symbol, formatted_symbol.replace("/", ""), formatted_symbol, raw_symbol))
                 row = cursor.fetchone()
 
                 if row:
@@ -612,31 +713,12 @@ def load_symbol_config(symbol: str) -> Dict[str, Any]:
                     cursor.close()
                     config = dict(zip(colnames, row)) if isinstance(row, tuple) else dict(row)
 
-                    config["tema_period"] = int(config.get("tema_period", default_config["tema_period"]))
-                    config["rsi_period"] = int(config.get("rsi_period", default_config["rsi_period"]))
-                    config["rsi_thresh"] = float(config.get("rsi_thresh", default_config["rsi_thresh"]))
-                    config["adx_period"] = int(config.get("adx_period", default_config["adx_period"]))
-                    config["adx_threshold"] = float(config.get("adx_threshold", default_config["adx_threshold"]))
-                    config["max_sl_pct"] = float(config.get("max_sl_pct", default_config["max_sl_pct"]))
-                    config["zone_tolerance"] = float(config.get("zone_tolerance", default_config["zone_tolerance"]))
-                    config["min_sentiment"] = float(config.get("min_sentiment", default_config["min_sentiment"]))
-                    config["risk_pct"] = float(config.get("risk_pct", default_config["risk_pct"]))
-                    config["min_rr"] = float(config.get("min_rr", default_config["min_rr"]))
-                    config["lookback_bars"] = int(config.get("lookback_bars", default_config["lookback_bars"]))
-                    config["vp_detection_pct"] = float(config.get("vp_detection_pct", default_config["vp_detection_pct"]))
-                    config["vp_va_pct"] = float(config.get("vp_va_pct", default_config["vp_va_pct"]))
-                    config["atr_period"] = int(config.get("atr_period", default_config["atr_period"]))
-                    config["atr_mult"] = float(config.get("atr_mult", default_config["atr_mult"]))
-                    config["atr_long_period"] = int(config.get("atr_long_period", default_config["atr_long_period"]))
-                    config["atr_ratio_thresh"] = float(config.get("atr_ratio_thresh", default_config["atr_ratio_thresh"]))
+                    # Merge DB values over default_config (which contains symbol overrides)
+                    for key, val in config.items():
+                        if val is not None and key in default_config:
+                            default_config[key] = type(default_config[key])(val)
 
-                    config.setdefault("use_rsi_filter", True)
-                    config.setdefault("use_candlestick_confirm", True)
-                    config.setdefault("use_adx_filter", True)
-                    config.setdefault("use_atr_sl", True)
-                    config.setdefault("disable_htf", False)
-                    config.setdefault("spot_only", False)
-                    return config
+                    return default_config
                 cursor.close()
             except Exception as e:
                 logger.error(f"[load_symbol_config] DB query failed for {formatted_symbol}/{raw_symbol}: {e}")
@@ -727,37 +809,23 @@ def evaluate_signals(
     current_tema = float(tema_series.iloc[-1])
     current_rsi = float(rsi_series.iloc[-1])
     current_atr = float(atr_series.iloc[-1])
+    current_adx = float(adx_series.iloc[-1])
+
+    # Dynamic tolerance adjusting based on relative ATR % (e.g. Low volatility assets like ETH/BNB)
+    current_atr_pct = (current_atr / current_price) if current_price > 0 else 0.0
+    if current_atr_pct < 0.008:
+        zone_tolerance = min(zone_tolerance, 0.015)
 
     final_sentiment = float(sentiment_score) if sentiment_score is not None else 0.5
     if final_sentiment < min_sentiment:
         no_signal["reason"] = f"Sentiment score ({final_sentiment:.2f}) below threshold ({min_sentiment:.2f})"
         return no_signal
 
+    # Determine Active Market Regime
     effective_adx_threshold = float(adx_threshold)
+    market_regime = determine_market_regime(current_adx, adx_threshold=effective_adx_threshold)
 
-    atr_short_period = int(atr_period)
-    atr_long_period = int(sym_cfg.get("atr_long_period", 100))
-    atr_ratio_thresh = float(sym_cfg.get("atr_ratio_thresh", 1.0))
-
-    atr_short_series = df["atr_short"] if "atr_short" in df.columns else calculate_atr(df, atr_short_period)
-    atr_long_series = df["atr_long"] if "atr_long" in df.columns else calculate_atr(df, atr_long_period)
-
-    current_adx = float(adx_series.iloc[-1])
-    current_atr_short = float(atr_short_series.iloc[-1])
-    current_atr_long = float(atr_long_series.iloc[-1])
-
-    atr_ratio = (current_atr_short / current_atr_long) if current_atr_long > 0 else 0.0
-
-    adx_gate_passed = (not use_adx_filter) or (current_adx >= effective_adx_threshold)
-    atr_ratio_passed = atr_ratio > atr_ratio_thresh
-
-    if not (adx_gate_passed or atr_ratio_passed):
-        no_signal["reason"] = (
-            f"Volatility Gate Blocked: ADX={current_adx:.2f} (Required > {effective_adx_threshold}), "
-            f"ATR Ratio={atr_ratio:.2f} (Required > {atr_ratio_thresh})"
-        )
-        return no_signal
-
+    # HTF Macro Confluence Logic
     macro_trend_long = True
     macro_trend_short = True
 
@@ -773,23 +841,22 @@ def evaluate_signals(
                 
                 if 'timestamp' in work_df.columns:
                     work_df['timestamp'] = pd.to_datetime(work_df['timestamp'])
+                    
                     df_htf = work_df.set_index('timestamp').resample('4h').agg({
                         'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'volume': 'sum'
                     }).dropna().reset_index()
 
                     if not df_htf.empty and len(df_htf) >= HTF_TEMA_PERIOD + 2:
                         df_htf["tema_htf"] = calculate_tema(df_htf["close"], HTF_TEMA_PERIOD)
-                        htf_last = df_htf.iloc[-1]
-                        htf_prev = df_htf.iloc[-2]
+                        
+                        htf_close_last = float(df_htf.iloc[-2]["close"])
+                        htf_tema_last = float(df_htf.iloc[-2]["tema_htf"])
+                        htf_tema_prev = float(df_htf.iloc[-3]["tema_htf"])
 
-                        htf_close = float(htf_last["close"])
-                        htf_tema_now = float(htf_last["tema_htf"])
-                        htf_tema_prev = float(htf_prev["tema_htf"])
-
-                        macro_trend_long = (htf_close > htf_tema_now) and (htf_tema_now > htf_tema_prev)
-                        macro_trend_short = (htf_close < htf_tema_now) and (htf_tema_now < htf_tema_prev)
+                        macro_trend_long = (htf_close_last > htf_tema_last) and (htf_tema_last > htf_tema_prev)
+                        macro_trend_short = (htf_close_last < htf_tema_last) and (htf_tema_last < htf_tema_prev)
                 else:
-                    logger.warning(f"[{symbol}] 'timestamp' column not found in DataFrame for HTF resampling.")
+                    logger.warning(f"[{symbol}] 'timestamp' column missing for HTF resampling.")
         except Exception as e:
             logger.warning(f"[{symbol}] Could not calculate HTF macro confluence: {e}")
 
@@ -822,153 +889,75 @@ def evaluate_signals(
     )
 
     # -----------------------------------------------------------------------
-    # LONG PATH
+    # REGIME 1: TRENDING STRATEGY
     # -----------------------------------------------------------------------
-    long_candlestick = True
-    if use_candlestick_confirm:
-        long_candlestick = (
-            float(last_row["close"]) > float(last_row["open"])
-            or float(last_row["close"]) > float(prev_row["high"])
-        )
-
-    long_rsi_valid = (not use_rsi_filter) or (current_rsi >= rsi_thresh)
-    long_zone_ok = near_tema or near_val or near_gap_support
-
-    if (
-        (current_price > current_tema)
-        and long_zone_ok
-        and long_rsi_valid
-        and long_candlestick
-        and macro_trend_long
-    ):
-        if not check_ltf_confirmation(
-            symbol, direction="LONG", ltf_interval="15m", rsi_period=rsi_period, is_backtest=is_backtest
-        ):
-            no_signal["reason"] = "LTF Gate: 15m momentum cross/RSI not aligned for LONG entry"
-            return no_signal
-
-        entry_price = determine_limit_entry(
-            direction="LONG", current_price=current_price, current_tema=current_tema,
-            val=val, vah=vah, near_val=near_val, near_vah=near_vah
-        )
-
-        if use_atr_sl and current_atr > 0:
-            sl_dist = max(current_atr * atr_mult, entry_price * MIN_SL_PCT)
-            stop_loss = entry_price - sl_dist
-        else:
-            sl_anchor = val if (not np.isnan(val) and val < entry_price) else current_tema
-            stop_loss = min(sl_anchor * (1.0 - zone_tolerance), entry_price * 0.99)
-
-        max_allowed_sl = entry_price * (1.0 - max_sl_pct)
-        if stop_loss < max_allowed_sl:
-            stop_loss = max_allowed_sl
-
-        sl_distance = entry_price - stop_loss
-        if sl_distance < (entry_price * MIN_SL_PCT):
-            return no_signal
-
-        min_tp = entry_price + (sl_distance * min_rr)
-        tp_candidates = [float(g) for g in overhead_gaps if float(g) >= min_tp]
-
-        for ref in (vah, poc):
-            if ref is not None and not (isinstance(ref, float) and np.isnan(ref)):
-                if float(ref) >= min_tp:
-                    tp_candidates.append(float(ref))
-
-        farthest_tp = max(tp_candidates) if tp_candidates else min_tp
-        computed_rr = (farthest_tp - entry_price) / sl_distance
-
-        if computed_rr >= min_rr:
-            risk_amt = float(account_balance) * (risk_pct / 100.0)
-            position_size = round(risk_amt / sl_distance, 6) if sl_distance > 0 else 0.0
-
-            staged_targets = calculate_staged_targets(
-                direction="LONG", entry_price=entry_price, stop_loss=stop_loss,
-                farthest_tp=farthest_tp, tp1_rr=1.5
-            )
-
-            return {
-                "action": "BUY", "order_type": "LIMIT", "symbol": symbol, "direction": "LONG",
-                "entry_price": float(round(entry_price, 5)),
-                "stop_loss": float(round(stop_loss, 5)),
-                "take_profit": float(round(farthest_tp, 5)),
-                "tp1": staged_targets["tp1"], "tp1_ratio": staged_targets["tp1_ratio"],
-                "tp2": staged_targets["tp2"], "tp2_ratio": staged_targets["tp2_ratio"],
-                "max_bar_duration": 24, "atr": float(round(current_atr, 4)),
-                "rr_ratio": float(computed_rr), "risk_pct": float(risk_pct),
-                "position_size": float(position_size),
-                "reason": f"Long confluence: 4H TEMA({HTF_TEMA_PERIOD}) macro bullish, limit entry calculated, R:R={computed_rr:.2f}"
-            }
-
-    # -----------------------------------------------------------------------
-    # SHORT PATH
-    # -----------------------------------------------------------------------
-    if not spot_only:
-        short_candlestick = True
+    if market_regime == "TRENDING":
+        long_candlestick = True
         if use_candlestick_confirm:
-            short_candlestick = (
-                float(last_row["close"]) < float(last_row["open"])
-                or float(last_row["close"]) < float(prev_row["low"])
+            long_candlestick = (
+                float(last_row["close"]) > float(last_row["open"])
+                or float(last_row["close"]) > float(prev_row["high"])
             )
 
-        short_rsi_valid = (not use_rsi_filter) or (current_rsi <= (100.0 - rsi_thresh))
-        short_zone_ok = near_tema or near_vah or near_gap_resistance
+        long_rsi_valid = (not use_rsi_filter) or (current_rsi >= rsi_thresh)
+        long_zone_ok = near_tema or near_val or near_gap_support
 
         if (
-            (current_price < current_tema)
-            and short_zone_ok
-            and short_rsi_valid
-            and short_candlestick
-            and macro_trend_short
+            (current_price > current_tema)
+            and long_zone_ok
+            and long_rsi_valid
+            and long_candlestick
+            and macro_trend_long
         ):
             if not check_ltf_confirmation(
-                symbol, direction="SHORT", ltf_interval="15m", rsi_period=rsi_period, is_backtest=is_backtest
+                symbol, direction="LONG", ltf_interval="15m", rsi_period=rsi_period, is_backtest=is_backtest
             ):
-                no_signal["reason"] = "LTF Gate: 15m momentum cross/RSI not aligned for SHORT entry"
+                no_signal["reason"] = "Trending LTF Gate: 15m momentum cross/RSI not aligned for LONG"
                 return no_signal
 
             entry_price = determine_limit_entry(
-                direction="SHORT", current_price=current_price, current_tema=current_tema,
+                direction="LONG", current_price=current_price, current_tema=current_tema,
                 val=val, vah=vah, near_val=near_val, near_vah=near_vah
             )
 
             if use_atr_sl and current_atr > 0:
                 sl_dist = max(current_atr * atr_mult, entry_price * MIN_SL_PCT)
-                stop_loss = entry_price + sl_dist
+                stop_loss = entry_price - sl_dist
             else:
-                sl_anchor = vah if (not np.isnan(vah) and vah > entry_price) else current_tema
-                stop_loss = max(sl_anchor * (1.0 + zone_tolerance), entry_price * 1.01)
+                sl_anchor = val if (not np.isnan(val) and val < entry_price) else current_tema
+                stop_loss = min(sl_anchor * (1.0 - zone_tolerance), entry_price * 0.99)
 
-            max_allowed_sl = entry_price * (1.0 + max_sl_pct)
-            if stop_loss > max_allowed_sl:
+            max_allowed_sl = entry_price * (1.0 - max_sl_pct)
+            if stop_loss < max_allowed_sl:
                 stop_loss = max_allowed_sl
 
-            sl_distance = stop_loss - entry_price
+            sl_distance = entry_price - stop_loss
             if sl_distance < (entry_price * MIN_SL_PCT):
                 return no_signal
 
-            min_tp = entry_price - (sl_distance * min_rr)
-            tp_candidates = [float(g) for g in underneath_gaps if float(g) <= min_tp]
+            min_tp = entry_price + (sl_distance * min_rr)
+            tp_candidates = [float(g) for g in overhead_gaps if float(g) >= min_tp]
 
-            for ref in (val, poc):
+            for ref in (vah, poc):
                 if ref is not None and not (isinstance(ref, float) and np.isnan(ref)):
-                    if float(ref) <= min_tp:
+                    if float(ref) >= min_tp:
                         tp_candidates.append(float(ref))
 
-            farthest_tp = min(tp_candidates) if tp_candidates else min_tp
-            computed_rr = (entry_price - farthest_tp) / sl_distance
+            farthest_tp = max(tp_candidates) if tp_candidates else min_tp
+            computed_rr = (farthest_tp - entry_price) / sl_distance
 
             if computed_rr >= min_rr:
                 risk_amt = float(account_balance) * (risk_pct / 100.0)
                 position_size = round(risk_amt / sl_distance, 6) if sl_distance > 0 else 0.0
 
                 staged_targets = calculate_staged_targets(
-                    direction="SHORT", entry_price=entry_price, stop_loss=stop_loss,
+                    direction="LONG", entry_price=entry_price, stop_loss=stop_loss,
                     farthest_tp=farthest_tp, tp1_rr=1.5
                 )
 
                 return {
-                    "action": "SELL", "order_type": "LIMIT", "symbol": symbol, "direction": "SHORT",
+                    "action": "BUY", "order_type": "LIMIT", "symbol": symbol, "direction": "LONG",
+                    "regime": "TRENDING",
                     "entry_price": float(round(entry_price, 5)),
                     "stop_loss": float(round(stop_loss, 5)),
                     "take_profit": float(round(farthest_tp, 5)),
@@ -977,10 +966,167 @@ def evaluate_signals(
                     "max_bar_duration": 24, "atr": float(round(current_atr, 4)),
                     "rr_ratio": float(computed_rr), "risk_pct": float(risk_pct),
                     "position_size": float(position_size),
-                    "reason": f"Short confluence: 4H TEMA({HTF_TEMA_PERIOD}) macro bearish, limit entry calculated, R:R={computed_rr:.2f}"
+                    "reason": f"Trending Long Confluence: ADX={current_adx:.2f} >= {effective_adx_threshold:.1f}, R:R={computed_rr:.2f}"
                 }
 
-    no_signal["reason"] = "Market conditions did not meet strategy entry criteria"
+        # SHORT TRENDING PATH
+        if not spot_only:
+            short_candlestick = True
+            if use_candlestick_confirm:
+                short_candlestick = (
+                    float(last_row["close"]) < float(last_row["open"])
+                    or float(last_row["close"]) < float(prev_row["low"])
+                )
+
+            short_rsi_valid = (not use_rsi_filter) or (current_rsi <= (100.0 - rsi_thresh))
+            short_zone_ok = near_tema or near_vah or near_gap_resistance
+
+            if (
+                (current_price < current_tema)
+                and short_zone_ok
+                and short_rsi_valid
+                and short_candlestick
+                and macro_trend_short
+            ):
+                if not check_ltf_confirmation(
+                    symbol, direction="SHORT", ltf_interval="15m", rsi_period=rsi_period, is_backtest=is_backtest
+                ):
+                    no_signal["reason"] = "Trending LTF Gate: 15m momentum cross/RSI not aligned for SHORT"
+                    return no_signal
+
+                entry_price = determine_limit_entry(
+                    direction="SHORT", current_price=current_price, current_tema=current_tema,
+                    val=val, vah=vah, near_val=near_val, near_vah=near_vah
+                )
+
+                if use_atr_sl and current_atr > 0:
+                    sl_dist = max(current_atr * atr_mult, entry_price * MIN_SL_PCT)
+                    stop_loss = entry_price + sl_dist
+                else:
+                    sl_anchor = vah if (not np.isnan(vah) and vah > entry_price) else current_tema
+                    stop_loss = max(sl_anchor * (1.0 + zone_tolerance), entry_price * 1.01)
+
+                max_allowed_sl = entry_price * (1.0 + max_sl_pct)
+                if stop_loss > max_allowed_sl:
+                    stop_loss = max_allowed_sl
+
+                sl_distance = stop_loss - entry_price
+                if sl_distance < (entry_price * MIN_SL_PCT):
+                    return no_signal
+
+                min_tp = entry_price - (sl_distance * min_rr)
+                tp_candidates = [float(g) for g in underneath_gaps if float(g) <= min_tp]
+
+                for ref in (val, poc):
+                    if ref is not None and not (isinstance(ref, float) and np.isnan(ref)):
+                        if float(ref) <= min_tp:
+                            tp_candidates.append(float(ref))
+
+                farthest_tp = min(tp_candidates) if tp_candidates else min_tp
+                computed_rr = (entry_price - farthest_tp) / sl_distance
+
+                if computed_rr >= min_rr:
+                    risk_amt = float(account_balance) * (risk_pct / 100.0)
+                    position_size = round(risk_amt / sl_distance, 6) if sl_distance > 0 else 0.0
+
+                    staged_targets = calculate_staged_targets(
+                        direction="SHORT", entry_price=entry_price, stop_loss=stop_loss,
+                        farthest_tp=farthest_tp, tp1_rr=1.5
+                    )
+
+                    return {
+                        "action": "SELL", "order_type": "LIMIT", "symbol": symbol, "direction": "SHORT",
+                        "regime": "TRENDING",
+                        "entry_price": float(round(entry_price, 5)),
+                        "stop_loss": float(round(stop_loss, 5)),
+                        "take_profit": float(round(farthest_tp, 5)),
+                        "tp1": staged_targets["tp1"], "tp1_ratio": staged_targets["tp1_ratio"],
+                        "tp2": staged_targets["tp2"], "tp2_ratio": staged_targets["tp2_ratio"],
+                        "max_bar_duration": 24, "atr": float(round(current_atr, 4)),
+                        "rr_ratio": float(computed_rr), "risk_pct": float(risk_pct),
+                        "position_size": float(position_size),
+                        "reason": f"Trending Short Confluence: ADX={current_adx:.2f} >= {effective_adx_threshold:.1f}, R:R={computed_rr:.2f}"
+                    }
+
+    # -----------------------------------------------------------------------
+    # REGIME 2: RANGING MEAN-REVERSION STRATEGY
+    # -----------------------------------------------------------------------
+    elif market_regime == "RANGING":
+        if check_volatility_expansion(df, atr_series, lookback_sma=20, expansion_threshold=1.25):
+            no_signal["reason"] = "Ranging Gate: ATR/Price volatility is expanding rapidly"
+            return no_signal
+
+        # Mean Reversion Long (Buy near VAL)
+        if near_val and (current_rsi < 45.0):
+            if not macro_trend_long:
+                no_signal["reason"] = "Ranging Long Gate: Suppressed by strongly bearish 4H macro trend"
+                return no_signal
+
+            if not check_candlestick_rejection(last_row, prev_row, direction="LONG"):
+                no_signal["reason"] = "Ranging Long Gate: Missing bullish pinbar or engulfing rejection at VAL"
+                return no_signal
+
+            entry_price = float(current_price)
+            stop_loss = entry_price - max(current_atr * atr_mult, entry_price * 0.008)
+            sl_distance = entry_price - stop_loss
+            farthest_tp = vah if not np.isnan(vah) else (poc if not np.isnan(poc) else entry_price + (sl_distance * 2.0))
+
+            computed_rr = (farthest_tp - entry_price) / max(sl_distance, 1e-6)
+            if computed_rr >= min_rr:
+                risk_amt = float(account_balance) * (risk_pct / 100.0)
+                position_size = round(risk_amt / sl_distance, 6)
+                staged_targets = calculate_staged_targets("LONG", entry_price, stop_loss, farthest_tp)
+
+                return {
+                    "action": "BUY", "order_type": "LIMIT", "symbol": symbol, "direction": "LONG",
+                    "regime": "RANGING",
+                    "entry_price": float(round(entry_price, 5)),
+                    "stop_loss": float(round(stop_loss, 5)),
+                    "take_profit": float(round(farthest_tp, 5)),
+                    "tp1": staged_targets["tp1"], "tp1_ratio": staged_targets["tp1_ratio"],
+                    "tp2": staged_targets["tp2"], "tp2_ratio": staged_targets["tp2_ratio"],
+                    "max_bar_duration": 24, "atr": float(round(current_atr, 4)),
+                    "rr_ratio": float(computed_rr), "risk_pct": float(risk_pct),
+                    "position_size": float(position_size),
+                    "reason": f"Ranging Mean Reversion Long: ADX={current_adx:.2f} < 20.0, Confirmed VAL Rejection, R:R={computed_rr:.2f}"
+                }
+
+        # Mean Reversion Short (Sell near VAH)
+        if near_vah and (current_rsi > 55.0) and not spot_only:
+            if not macro_trend_short:
+                no_signal["reason"] = "Ranging Short Gate: Suppressed by strongly bullish 4H macro trend"
+                return no_signal
+
+            if not check_candlestick_rejection(last_row, prev_row, direction="SHORT"):
+                no_signal["reason"] = "Ranging Short Gate: Missing bearish pinbar or engulfing rejection at VAH"
+                return no_signal
+
+            entry_price = float(current_price)
+            stop_loss = entry_price + max(current_atr * atr_mult, entry_price * 0.008)
+            sl_distance = stop_loss - entry_price
+            farthest_tp = val if not np.isnan(val) else (poc if not np.isnan(poc) else entry_price - (sl_distance * 2.0))
+
+            computed_rr = (entry_price - farthest_tp) / max(sl_distance, 1e-6)
+            if computed_rr >= min_rr:
+                risk_amt = float(account_balance) * (risk_pct / 100.0)
+                position_size = round(risk_amt / sl_distance, 6)
+                staged_targets = calculate_staged_targets("SHORT", entry_price, stop_loss, farthest_tp)
+
+                return {
+                    "action": "SELL", "order_type": "LIMIT", "symbol": symbol, "direction": "SHORT",
+                    "regime": "RANGING",
+                    "entry_price": float(round(entry_price, 5)),
+                    "stop_loss": float(round(stop_loss, 5)),
+                    "take_profit": float(round(farthest_tp, 5)),
+                    "tp1": staged_targets["tp1"], "tp1_ratio": staged_targets["tp1_ratio"],
+                    "tp2": staged_targets["tp2"], "tp2_ratio": staged_targets["tp2_ratio"],
+                    "max_bar_duration": 24, "atr": float(round(current_atr, 4)),
+                    "rr_ratio": float(computed_rr), "risk_pct": float(risk_pct),
+                    "position_size": float(position_size),
+                    "reason": f"Ranging Mean Reversion Short: ADX={current_adx:.2f} < 20.0, Confirmed VAH Rejection, R:R={computed_rr:.2f}"
+                }
+
+    no_signal["reason"] = f"No setup triggered in regime {market_regime} (ADX: {current_adx:.2f})"
     return no_signal
 
 
@@ -997,92 +1143,45 @@ class StrategyEngine:
     def generate_signal(
         self,
         df: pd.DataFrame,
-        current_price: float = None,
+        current_price: Optional[float] = None,
         position_side: str = "LONG",
-        params: dict = None
+        params: Optional[dict] = None
     ) -> Dict[str, Any]:
         if df.empty or len(df) < 50:
             return {"signal": "HOLD", "action": "HOLD"}
 
-        if current_price is None:
-            current_price = float(df.iloc[-1]["close"])
-
         params = params or {}
-        min_rr = float(params.get("min_rr", getattr(self.config, "MIN_RR", 3.5) if self.config else 3.5))
-        atr_multiplier = float(params.get("atr_mult", getattr(self.config, "ATR_MULT", 2.5) if self.config else 2.5))
-        atr_period = int(params.get("atr_period", getattr(self.config, "ATR_PERIOD", 14) if self.config else 14))
-        risk_pct = float(params.get("risk_pct", 0.5))
-        account_balance = float(params.get("account_balance", 100.0))
-
-        if "atr" in df.columns:
-            current_atr = float(df["atr"].iloc[-1])
-        else:
-            high_low = df["high"] - df["low"]
-            high_close = (df["high"] - df["close"].shift()).abs()
-            low_close = (df["low"] - df["close"].shift()).abs()
-            tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
-            current_atr = float(tr.ewm(alpha=1.0 / atr_period, adjust=False).mean().iloc[-1])
-
-        latest = df.iloc[-1]
-        rsi_thresh = float(params.get("rsi_thresh", 42.2))
-        direction = position_side.upper()
-
-        if "tema" in df.columns and "rsi" in df.columns:
-            if latest["close"] > latest["tema"] and latest["rsi"] > rsi_thresh:
-                direction = "BUY"
-            elif latest["close"] < latest["tema"] and latest["rsi"] < (100.0 - rsi_thresh):
-                direction = "SELL"
-            else:
-                return {"signal": "HOLD", "action": "HOLD"}
-
-        sl_dist = max(current_atr * atr_multiplier, current_price * 0.002)
-        if direction in ["BUY", "LONG"]:
-            stop_loss = current_price - sl_dist
-            take_profit = current_price + (sl_dist * min_rr)
-        else:
-            stop_loss = current_price + sl_dist
-            take_profit = current_price - (sl_dist * min_rr)
-
-        sl_val = float(round(stop_loss, 5))
-        tp_val = float(round(take_profit, 5))
-
-        staged_targets = calculate_staged_targets(
-            direction="LONG" if direction in ["BUY", "LONG"] else "SHORT",
-            entry_price=current_price,
-            stop_loss=sl_val,
-            farthest_tp=tp_val,
-            tp1_rr=1.5
+        
+        evaluated_res = evaluate_signals(
+            df=df,
+            symbol=self.symbol,
+            account_balance=float(params.get("account_balance", 100.0)),
+            adx_threshold=float(params.get("adx_threshold", 25.0)),
+            rsi_thresh=float(params.get("rsi_thresh", 42.0)),
+            min_rr=float(params.get("min_rr", getattr(self.config, "MIN_RR", 3.5) if self.config else 3.5)),
+            atr_mult=float(params.get("atr_mult", getattr(self.config, "ATR_MULT", 2.5) if self.config else 2.5)),
+            atr_period=int(params.get("atr_period", getattr(self.config, "ATR_PERIOD", 14) if self.config else 14)),
+            risk_pct=float(params.get("risk_pct", 1.0)),
+            spot_only=(position_side.upper() == "LONG_ONLY")
         )
 
-        risk_amt = account_balance * (risk_pct / 100.0)
-        position_size = round(risk_amt / sl_dist, 6) if sl_dist > 0 else 0.0
+        action = evaluated_res.get("action", "HOLD")
+        evaluated_res["signal"] = action
+        evaluated_res["side"] = evaluated_res.get("direction", "NONE")
 
-        signal_payload = {
-            "signal": direction, "action": direction, "order_type": "LIMIT",
-            "pair": self.symbol, "symbol": self.symbol, "side": direction,
-            "direction": direction, "entry_price": float(current_price),
-            "stop_loss": sl_val, "sl_price": sl_val, "take_profit": tp_val,
-            "tp_price": tp_val, "tp1": staged_targets["tp1"],
-            "tp1_ratio": staged_targets["tp1_ratio"], "tp2": staged_targets["tp2"],
-            "tp2_ratio": staged_targets["tp2_ratio"], "max_bar_duration": 24,
-            "risk_reward": min_rr, "risk_pct": risk_pct,
-            "position_size": float(position_size), "atr": float(round(current_atr, 4)),
-            "timestamp": int(time.time()),
-        }
-
-        if getattr(self, "event_bus", None) and hasattr(self.event_bus, "publish"):
+        if action != "HOLD" and getattr(self, "event_bus", None) and hasattr(self.event_bus, "publish"):
             try:
                 loop = asyncio.get_event_loop()
                 if loop.is_running():
-                    loop.create_task(self.event_bus.publish("TRADE_SIGNAL", signal_payload))
-            except Exception:
-                pass
+                    loop.create_task(self.event_bus.publish("TRADE_SIGNAL", evaluated_res))
+            except Exception as e:
+                logger.warning(f"Failed to publish signal to event bus: {e}")
 
-        return signal_payload
+        return evaluated_res
 
 
 # ---------------------------------------------------------------------------
-# 9. CONVENIENCE: FULL EVALUATION WRAPPER
+# 9. CONVENIENCE: FULL EVALUATION WRAPPERS
 # ---------------------------------------------------------------------------
 
 def generate_live_signal(
@@ -1093,6 +1192,24 @@ def generate_live_signal(
     **kwargs
 ) -> Dict[str, Any]:
     df = fetch_klines(symbol=symbol, interval=execution_timeframe, limit=limit)
+    if df.empty:
+        return {
+            "action": "HOLD", "symbol": symbol, "direction": "NONE",
+            "entry_price": 0.0, "stop_loss": 0.0, "take_profit": 0.0,
+            "atr": 0.0, "position_size": 0.0, "reason": "Failed to fetch klines"
+        }
+    return evaluate_signals(df, symbol, account_balance=account_balance, timeframe=execution_timeframe, **kwargs)
+
+
+async def generate_live_signal_async(
+    symbol: str,
+    account_balance: float = 100.0,
+    execution_timeframe: str = EXECUTION_TIMEFRAME,
+    limit: int = 600,
+    **kwargs
+) -> Dict[str, Any]:
+    """Async variant of generate_live_signal for FastAPI and event-driven runtime loops."""
+    df = await fetch_klines_async(symbol=symbol, interval=execution_timeframe, limit=limit)
     if df.empty:
         return {
             "action": "HOLD", "symbol": symbol, "direction": "NONE",

@@ -31,12 +31,13 @@ from common import (
     check_asset_cooldown
 )
 from event_bus import event_bus
-from live_executor import LiveExecutionEngine, fetch_klines
+from live_executor import BybitFuturesLiveExecutor as LiveExecutionEngine
 from reconciler import reconcile_open_trades
 from state_machine import StateMachineEngine
 from strategy import (
     evaluate_signals,
     load_symbol_config,
+    fetch_klines,  # <--- Imported from strategy module
     calculate_tema as calc_tema,
     calculate_atr as calc_atr
 )
@@ -54,7 +55,7 @@ logging.basicConfig(
 raw_symbols = os.getenv("TRADING_SYMBOLS") or os.getenv("WATCHLIST") or "XRP/USDT,LINK/USDT,SOL/USDT,BNB/USDT"
 WATCHLIST = [s.strip() for s in raw_symbols.split(",") if s.strip()]
 
-TIMEFRAME = os.getenv("TIMEFRAME", "1h")
+TIMEFRAME = os.getenv("TIMEFRAME", "4h")
 POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", "60"))
 ACCOUNT_RISK_PCT = float(os.getenv("ACCOUNT_RISK_PCT", "1.0"))
 FALLBACK_BALANCE = float(os.getenv("ACCOUNT_BALANCE", "100.0"))
@@ -258,7 +259,7 @@ async def strategy_evaluation_loop():
                     finally:
                         release_db_connection(conn)
 
-                df_klines = await asyncio.to_thread(fetch_klines, symbol=symbol, interval=TIMEFRAME, limit=300)
+                df_klines = await asyncio.to_thread(fetch_klines, symbol=symbol, interval=TIMEFRAME, limit=600)
 
                 if df_klines is None or df_klines.empty:
                     logger.warning(f"[{symbol}] Kline data empty. Skipping evaluation.")
@@ -272,16 +273,16 @@ async def strategy_evaluation_loop():
                     risk_pct=cfg.get("risk_pct", ACCOUNT_RISK_PCT),
                     tema_period=cfg.get("tema_period", 200),
                     rsi_period=cfg.get("rsi_period", 14),
-                    rsi_thresh=cfg.get("rsi_thresh", 42.0),
+                    rsi_thresh=cfg.get("rsi_thresh", 42.2),
                     adx_period=cfg.get("adx_period", 14),
                     adx_threshold=cfg.get("adx_threshold", 20.0),
                     use_adx_filter=cfg.get("use_adx_filter", True),
                     use_rsi_filter=cfg.get("use_rsi_filter", True),
                     use_candlestick_confirm=cfg.get("use_candlestick_confirm", True),
-                    zone_tolerance=cfg.get("zone_tolerance", 0.0075),
+                    zone_tolerance=cfg.get("zone_tolerance", 0.01245),
                     max_sl_pct=cfg.get("max_sl_pct", 0.02),
                     min_sentiment=cfg.get("min_sentiment", 0.0),
-                    min_rr=cfg.get("min_rr", 2.0),
+                    min_rr=cfg.get("min_rr", 3.5),
                     atr_period=cfg.get("atr_period", 14),
                     atr_mult=cfg.get("atr_mult", 2.0),
                     use_atr_sl=cfg.get("use_atr_sl", True),

@@ -35,9 +35,6 @@ ENTRY_TOLERANCE_PCT_TESTNET = 0.03
 
 USE_MAKER_ORDERS = os.getenv("USE_MAKER_ORDERS", "true").lower() == "true"
 
-# Extended verification window on testnet to tolerate Bybit's
-# propagation delay between an order fill and the position becoming
-# editable via /v5/position/trading-stop.
 SL_VERIFY_MAX_ATTEMPTS_LIVE = 8
 SL_VERIFY_MAX_ATTEMPTS_TESTNET = 20
 SL_API_MAX_RETRIES = 3
@@ -52,92 +49,65 @@ def safe_float(val: Any, default: float = 0.0) -> float:
         return default
 
 
-def format_ccxt_futures_symbol(symbol: str) -> str:
-    """Consistently converts raw/dirty symbols to CCXT Bybit Linear Futures format."""
+def resolve_and_verify_symbol(exchange: ccxt.Exchange, base_symbol: str, quote_symbol: str = "USDT") -> str:
+    """
+    Dynamically resolves CCXT unified symbol notation across Mainnet and Testnet environments,
+    verifying active trading status before returning the symbol key.
+    """
+    if not exchange.markets:
+        exchange.load_markets()
+        
+    candidates = [
+        f"{base_symbol}/{quote_symbol}:{quote_symbol}",  # Mainnet UTA format: 'ARB/USDT:USDT'
+        f"{base_symbol}/{quote_symbol}",                # Testnet format: 'ARB/USDT'
+    ]
+    
+    for candidate in candidates:
+        if candidate in exchange.markets:
+            if exchange.markets[candidate].get('active', True):
+                return candidate
+                
+    # Fallback lookup across all markets
+    for key, market in exchange.markets.items():
+        if key.startswith(f"{base_symbol}/{quote_symbol}") and market.get('active', True):
+            return key
+            
+    raise ValueError(f"No active market found on Bybit for {base_symbol}/{quote_symbol}")
+
+
+def format_ccxt_futures_symbol(symbol: str, exchange: Optional[ccxt.Exchange] = None) -> str:
+    """
+    Dynamically resolves raw/dirty symbols using CCXT market verification if exchange instance is provided,
+    otherwise falls back to standard CCXT string normalization.
+    """
     if not symbol:
         return ""
-    if ":" in symbol:
-        return symbol
-    raw = symbol.replace("/", "").replace("_", "").replace("-", "").upper()
+
+    # Clean raw string input
+    raw = symbol.split(":")[0].replace("/", "").replace("_", "").replace("-", "").upper()
     if raw.endswith("USDTUSDT"):
         raw = raw[:-4]
+    
     if raw.endswith("USDT"):
-        base = raw[:-4]
-        return f"{base}/USDT:USDT"
-    if raw.endswith("USDC"):
-        base = raw[:-4]
-        return f"{base}/USDC:USDC"
-    return f"{raw}/USDT:USDT"
+        base_symbol = raw[:-4]
+        quote_symbol = "USDT"
+    elif raw.endswith("USDC"):
+        base_symbol = raw[:-4]
+        quote_symbol = "USDC"
+    else:
+        base_symbol = raw
+        quote_symbol = "USDT"
 
+    if exchange is not None:
+        try:
+            return resolve_and_verify_symbol(exchange, base_symbol, quote_symbol)
+        except Exception as e:
+            logger.warning(f"Failed to resolve market via exchange: {e}. Falling back to default format.")
 
-def fetch_klines(symbol: str, interval: str = "1h", limit: int = 200) -> pd.DataFrame:
-    """Primary kline fetcher prioritizing Bybit directly to eliminate basis risk."""
-    ccxt_symbol = format_ccxt_futures_symbol(symbol)
+    if ":" in symbol:
+        return symbol
 
-    try:
-        public_ex = ccxt.bybit({'options': {'defaultType': 'linear'}})
-        if BYBIT_TESTNET:
-            public_ex.set_sandbox_mode(True)
-        ohlcv = public_ex.fetch_ohlcv(ccxt_symbol, timeframe=interval, limit=limit)
-        if ohlcv:
-            df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-            df['time'] = pd.to_datetime(df['timestamp'], unit='ms')
-            return df
-    except Exception as e:
-        logger.warning(f"[{symbol}] Primary Bybit kline fetch failed ({e}). Falling back to Binance...")
-
-    try:
-        binance_ex = ccxt.binanceusdm()
-        ohlcv = binance_ex.fetch_ohlcv(symbol.split(':')[0], timeframe=interval, limit=limit)
-        if ohlcv:
-            df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-            df['time'] = pd.to_datetime(df['timestamp'], unit='ms')
-            return df
-    except Exception as e:
-        logger.warning(f"[{symbol}] Secondary Binance kline fetch failed ({e}). Falling back to CryptoCompare...")
-
-    raw_candles = fetch_cryptocompare_fallback_kline(symbol, limit=limit)
-    if raw_candles:
-        df = pd.DataFrame(raw_candles)
-        df['time'] = pd.to_datetime(df['timestamp'], unit='ms')
-        return df
-
-    return pd.DataFrame()
-
-
-def fetch_cryptocompare_fallback_kline(symbol: str, limit: int = 50) -> List[Dict[str, Any]]:
-    try:
-        raw = symbol.split(":")[0]
-        if "/" in raw:
-            fsym, tsym = raw.split("/")
-        else:
-            fsym = raw.replace("USDT", "").replace("USD", "")
-            tsym = "USDT"
-
-        url = "https://min-api.cryptocompare.com/data/v2/histominute"
-        params = {"fsym": fsym.upper(), "tsym": tsym.upper(), "limit": limit, "e": "CCCAGG"}
-        res = requests.get(url, params=params, timeout=10)
-        data = res.json()
-
-        if data.get("Response") == "Success":
-            raw_candles = data.get("Data", {}).get("Data", [])
-            return [
-                {
-                    "timestamp": c.get("time") * 1000,
-                    "open": float(c.get("open", 0.0)),
-                    "high": float(c.get("high", 0.0)),
-                    "low": float(c.get("low", 0.0)),
-                    "close": float(c.get("close", 0.0)),
-                    "volume": float(c.get("volumeto", 0.0))
-                }
-                for c in raw_candles
-            ]
-        else:
-            logger.error(f"[{symbol}] CryptoCompare fallback error: {data.get('Message')}")
-            return []
-    except Exception as e:
-        logger.error(f"[{symbol}] Exception in CryptoCompare fallback: {e}")
-        return []
+    return f"{base_symbol}/{quote_symbol}:{quote_symbol}"
 
 
 class BybitFuturesLiveExecutor:
@@ -166,14 +136,10 @@ class BybitFuturesLiveExecutor:
             self.public_exchange.set_sandbox_mode(True)
 
         try:
+            self.exchange.load_markets()
             self.public_exchange.load_markets()
         except Exception as e:
-            logger.warning(f"Could not load public market structures: {e}")
-
-        try:
-            logger.info(f"CCXT version: {ccxt.__version__}")
-        except Exception:
-            pass
+            logger.warning(f"Could not load market structures: {e}")
 
         self.position_mode: Optional[str] = None
         try:
@@ -185,6 +151,39 @@ class BybitFuturesLiveExecutor:
             logger.info(f"Bybit account position mode detected: {self.position_mode}")
         except Exception as e:
             logger.warning(f"Could not determine account position mode at startup: {e}")
+
+    def resolve_symbol(self, symbol: str) -> str:
+        """Helper method using self.exchange to resolve symbol dynamically."""
+        if not symbol:
+            return ""
+        
+        # Check config symbols map first
+        if hasattr(self, 'config') and isinstance(self.config, dict):
+            symbols_map = self.config.get("symbols", {})
+            if symbol in symbols_map:
+                mapped = symbols_map[symbol]
+                if isinstance(mapped, dict):
+                    mapped = mapped.get("binance", mapped.get("bybit", symbol))
+                if ":" in str(mapped):
+                    return str(mapped)
+                symbol = str(mapped)
+
+        raw = symbol.split(":")[0].replace("/", "").replace("_", "").replace("-", "").upper()
+        if raw.endswith("USDTUSDT"):
+            raw = raw[:-4]
+        
+        base_symbol = raw[:-4] if raw.endswith("USDT") else raw
+        quote_symbol = "USDT"
+        
+        try:
+            return resolve_and_verify_symbol(self.exchange, base_symbol, quote_symbol)
+        except Exception as e:
+            logger.warning(f"[{symbol}] Symbol dynamic resolution fallback to format_ccxt_futures_symbol: {e}")
+            return format_ccxt_futures_symbol(symbol)
+
+    def format_ccxt_futures_symbol(self, symbol: str) -> str:
+        """Instance wrapper directing to resolve_symbol for unified market verification."""
+        return self.resolve_symbol(symbol)
 
     def _get_position_idx(self, ccxt_symbol: str, direction: str) -> int:
         """Returns 0 for one-way mode, 1 for hedge-buy, 2 for hedge-sell."""
@@ -264,34 +263,6 @@ class BybitFuturesLiveExecutor:
         except Exception as e:
             logger.warning(f"[{symbol}] execution/list lookup failed: {e}")
             return []
-
-    def format_ccxt_futures_symbol(self, symbol: str) -> str:
-        """Consistently converts raw/dirty symbols to CCXT Bybit Linear Futures format, 
-        checking the configuration mapping first if available."""
-        if not symbol:
-            return ""
-            
-        # Check if instance has config mapping for symbols
-        if hasattr(self, 'config') and isinstance(self.config, dict):
-            symbols_map = self.config.get("symbols", {})
-            if symbol in symbols_map:
-                mapped = symbols_map[symbol]
-                if ":" in mapped:
-                    return mapped
-                symbol = mapped
-
-        if ":" in symbol:
-            return symbol
-        raw = symbol.replace("/", "").replace("_", "").replace("-", "").upper()
-        if raw.endswith("USDTUSDT"):
-            raw = raw[:-4]
-        if raw.endswith("USDT"):
-            base = raw[:-4]
-            return f"{base}/USDT:USDT"
-        if raw.endswith("USDC"):
-            base = raw[:-4]
-            return f"{base}/USDC:USDC"
-        return f"{raw}/USDT:USDT"
 
     def _verify_sl(
         self,
@@ -578,7 +549,6 @@ class BybitFuturesLiveExecutor:
 
         clean_target = symbol.replace("/", "").replace(":", "").replace("_", "").replace("-", "").upper()
         try:
-            # Replaced fetch_positions([ccxt_symbol]) with fetch_position(exchange_symbol) with configuration fallback
             pos = self.exchange.fetch_position(exchange_symbol)
             if pos:
                 pos_symbol = str(pos.get('symbol', '')).replace("/", "").replace(":", "").replace("_", "").replace("-", "").upper()
@@ -775,11 +745,13 @@ class BybitFuturesLiveExecutor:
             logger.warning(f"[{symbol}] Order Rejected: High Spread detected ({spread_pct * 100:.3f}%).")
             return {"status": "FAILED", "error": f"Spread too high ({spread_pct * 100:.3f}%)"}
 
+        # Ensure 5x isolated leverage is configured on Bybit prior to order submission
         try:
-            self.exchange.set_leverage(int(leverage), ccxt_symbol)
-            logger.info(f"[{symbol}] Leverage set to {int(leverage)}x on Bybit.")
+            self.exchange.set_margin_mode("isolated", ccxt_symbol, params={"category": "linear"})
+            self.exchange.set_leverage(int(leverage), ccxt_symbol, params={"category": "linear"})
+            logger.info(f"[{symbol}] Margin mode 'isolated' & leverage {int(leverage)}x enforced on Bybit.")
         except Exception as lev_err:
-            logger.error(f"[{symbol}] FAILED to set leverage to {leverage}x: {lev_err}")
+            logger.error(f"[{symbol}] FAILED to enforce margin mode/leverage: {lev_err}")
             try:
                 pos_check_pre = self.get_futures_position(ccxt_symbol)
                 actual_lev_pre = safe_float(pos_check_pre.get("leverage", 0), 0.0)

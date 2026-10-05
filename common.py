@@ -299,12 +299,6 @@ def verify_base_schema():
 
         cursor.execute("ALTER TABLE trade_setups ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP;")
 
-        # FIX #2: Partial unique index predicate MUST match the ON CONFLICT clause
-        # in reconciler.py exactly. The previous version was missing 'EXECUTED',
-        # causing Postgres to silently ignore the conflict target and permit
-        # duplicate OPEN rows.
-        # Optional passive check — logs a warning if the index is missing,
-        # but never runs the DDL at runtime.
         cursor.execute("""
             SELECT 1 FROM pg_indexes
             WHERE indexname = 'idx_trade_setups_open_pair'
@@ -349,7 +343,7 @@ def verify_base_schema():
                 zone_tolerance NUMERIC NOT NULL DEFAULT 0.0075,
                 min_sentiment NUMERIC NOT NULL DEFAULT 0.0,
                 risk_pct NUMERIC NOT NULL DEFAULT 1.0,
-                min_rr NUMERIC NOT NULL DEFAULT 2.5,
+                min_rr NUMERIC NOT NULL DEFAULT 3.5,
                 vp_detection_pct NUMERIC NOT NULL DEFAULT 0.07,
                 use_rsi_filter BOOLEAN DEFAULT TRUE,
                 use_candlestick_confirm BOOLEAN DEFAULT TRUE,
@@ -365,17 +359,17 @@ def verify_base_schema():
 
         param_columns = [
             "adx_period INT DEFAULT 14",
-            "adx_threshold FLOAT DEFAULT 20.0",
+            "adx_threshold FLOAT DEFAULT 25.0",
             "use_adx_filter BOOLEAN DEFAULT TRUE",
             "max_sl_pct FLOAT DEFAULT 0.02",
             "zone_tolerance NUMERIC DEFAULT 0.0075",
             "min_sentiment NUMERIC DEFAULT 0.0",
-            "min_rr NUMERIC DEFAULT 2.0",
+            "min_rr NUMERIC DEFAULT 3.5",
             "vp_detection_pct NUMERIC DEFAULT 0.07",
             "use_rsi_filter BOOLEAN DEFAULT TRUE",
             "use_candlestick_confirm BOOLEAN DEFAULT TRUE",
             "atr_period INT DEFAULT 14",
-            "atr_mult FLOAT DEFAULT 2.0",
+            "atr_mult FLOAT DEFAULT 2.5",
             "use_atr_sl BOOLEAN DEFAULT TRUE",
             "disable_htf BOOLEAN DEFAULT FALSE",
             "fitness_score NUMERIC DEFAULT 0.0",
@@ -455,7 +449,6 @@ def close_trade_manually(trade_id: int, exit_price: float, reason: str = "MANUAL
             direction, float(entry_price), float(exit_price), float(position_size), float(account_balance or 100.0)
         )
 
-        # FIX #5: finalize_trade_in_db handles cooldown — no separate call here
         finalize_trade_in_db(trade_id, exit_price, pnl_usd, pnl_pct, outcome)
 
         emoji = "🔴" if pnl_usd < 0 else "🟢"

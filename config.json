@@ -7,67 +7,35 @@
   "short_risk_multiplier": 1.0,
   "proximity_threshold_pct": 0.5,
   "adx_period": 14,
-  "adx_threshold": 20.0,
+  "adx_threshold": 25.0,
   "use_adx_filter": true,
-   "rsi_thresh": 42.2,
+  "rsi_thresh": 45.0,
   "rsi_period": 14,
-  "max_sl_pct": 0.015,
+  "max_sl_pct": 0.02,
   "min_atr_pct": 0.2,
-  "atr_mult_sl": 2.5,
+  "atr_mult_sl": 3.5,
+  "atr_mult": 3.5,
   "min_rr": 3.5,
   "scan_interval_minutes": 60,
   "alert_cooldown_hours": 4,
   "disable_htf": false,
   "enable_live_trading": true,
-  "atr_ratio_thresh": 1.0,    
-  "zone_tolerance": 0.01245,  
+  "atr_ratio_thresh": 0.85,
+  "zone_tolerance": 0.02,
   "lookback_bars": 600,
   "watchlist": [
-    "ARB/USDT:USDT",
-    "BTC/USDT:USDT",
     "UNI/USDT:USDT",
-    "ETH/USDT:USDT",
-    "CAKE/USDT:USDT",
-    "SUI/USDT:USDT",
-    "AAVE/USDT:USDT"
+	"CAKE/USDT:USDT",
+	"SOL/USDT:USDT",
+    "ARB/USDT:USDT"
   ],
-  "symbols": {
-    "ARB/USDT:USDT": {
-      "binance": "ARB/USDT:USDT",
-      "bybit": "ARBPERP"
-    },
-    "UNI/USDT:USDT": {
-      "binance": "UNI/USDT:USDT",
-      "bybit": "UNIPERP"
-    },
-    "ETH/USDT:USDT": {
-      "binance": "ETH/USDT:USDT",
-      "bybit": "ETHUSDT"
-    },
-    "CAKE/USDT:USDT": {
-      "binance": "CAKE/USDT:USDT",
-      "bybit": "CAKEPERP"
-    },
-    "SUI/USDT:USDT": {
-      "binance": "SUI/USDT:USDT",
-      "bybit": "SUIPERP"
-    },
-    "AAVE/USDT:USDT": {
-      "binance": "AAVE/USDT:USDT",
-      "bybit": "AAVEPERP"
-    },
-    "BTC/USDT:USDT": {
-      "binance": "BTC/USDT:USDT",
-      "bybit": "BTCUSDT"
-    }
-  },
   "use_mtf_tema_alignment": true,
   "htf_tema_period": 200,
   "htf_alignment_mode": "TEMA Slope",
   "use_adaptive_atr_trail": true,
-  "atr_trail_mult": 2.0,
-  "use_equity_curve_filter": true,
+  "atr_trail_mult": 1.8,
+  "use_equity_curve_filter": false,
   "eq_ma_period": 10,
-  "reduced_risk_factor": 0.3,
+  "reduced_risk_factor": 0.5,
   "max_concurrent_positions": 4
 }

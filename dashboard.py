@@ -234,7 +234,7 @@ rsi_thresh = st.sidebar.slider(
     "RSI Threshold", 
     min_value=20, 
     max_value=80, 
-    value=int(dyn_cfg.get("rsi_thresh", 42)), 
+    value=int(dyn_cfg.get("rsi_thresh", 45)), 
     key=f"rsi_t_{pair_key}"
 )
 
@@ -267,7 +267,7 @@ atr_mult = st.sidebar.slider(
     "ATR Multiplier", 
     min_value=0.5, 
     max_value=5.0, 
-    value=float(dyn_cfg.get("atr_mult", 2.5)), 
+    value=float(dyn_cfg.get("atr_mult", 3.5)), 
     step=0.1, 
     key=f"atr_m_{pair_key}"
 )
@@ -291,7 +291,7 @@ zone_tolerance_pct = st.sidebar.slider(
     "Volume Zone Proximity (%)", 
     min_value=0.1, 
     max_value=3.0, 
-    value=float(dyn_cfg.get("zone_tolerance", 0.0075)) * 100.0, 
+    value=float(dyn_cfg.get("zone_tolerance", 0.002)) * 100.0, 
     step=0.05, 
     key=f"zone_{pair_key}"
 )
