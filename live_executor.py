@@ -58,8 +58,8 @@ def resolve_and_verify_symbol(exchange: ccxt.Exchange, base_symbol: str, quote_s
         exchange.load_markets()
         
     candidates = [
-        f"{base_symbol}/{quote_symbol}:{quote_symbol}",  # Mainnet UTA format: 'ARB/USDT:USDT'
-        f"{base_symbol}/{quote_symbol}",                # Testnet format: 'ARB/USDT'
+        f"{base_symbol}/{quote_symbol}:{quote_symbol}",  # Mainnet standard: 'ARB/USDT:USDT'
+        f"{base_symbol}/{quote_symbol}",                # Testnet standard: 'ARB/USDT'
     ]
     
     for candidate in candidates:
@@ -72,7 +72,7 @@ def resolve_and_verify_symbol(exchange: ccxt.Exchange, base_symbol: str, quote_s
         if key.startswith(f"{base_symbol}/{quote_symbol}") and market.get('active', True):
             return key
             
-    raise ValueError(f"No active market found on Bybit for {base_symbol}/{quote_symbol}")
+    return f"{base_symbol}/{quote_symbol}"
 
 
 def format_ccxt_futures_symbol(symbol: str, exchange: Optional[ccxt.Exchange] = None) -> str:
