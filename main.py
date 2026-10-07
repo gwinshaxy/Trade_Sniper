@@ -37,7 +37,7 @@ from state_machine import StateMachineEngine
 from strategy import (
     evaluate_signals,
     load_symbol_config,
-    fetch_klines,  # <--- Imported from strategy module
+    fetch_klines,
     calculate_tema as calc_tema,
     calculate_atr as calc_atr
 )
@@ -66,7 +66,6 @@ logger = logging.getLogger("main_orchestrator")
 
 executor = LiveExecutionEngine()
 state_machine = StateMachineEngine(executor)
-# FIX #P0: Pass the executor to the trade manager so it can query closedPnl
 trade_manager = DynamicTradeManager(executor=executor)
 
 
@@ -112,37 +111,34 @@ async def dynamic_trade_management_loop():
                     action = result.get("action")
 
                     if action == "UPDATE_SL":
-                        new_sl = result["new_sl"]
-                        new_state = result["new_state"]
+                        new_sl = result.get("new_sl")
+                        new_state = result.get("new_state", "OPEN")
 
-                        sl_updated = await asyncio.to_thread(
-                            executor.set_position_trading_stop, pair, new_sl, 0
-                        )
+                        if new_sl is not None and new_sl > 0:
+                            sl_updated = await asyncio.to_thread(
+                                executor.set_position_trading_stop, pair, new_sl, 0
+                            )
 
-                        with conn.cursor() as cur:
-                            cur.execute("""
-                                UPDATE trade_setups
-                                SET stop_loss = %s, trade_state = %s, updated_at = CURRENT_TIMESTAMP
-                                WHERE id = %s AND status = 'EXECUTED';
-                            """, (round(new_sl, 5), new_state, trade_id))
-                            conn.commit()
+                            with conn.cursor() as cur:
+                                cur.execute("""
+                                    UPDATE trade_setups
+                                    SET stop_loss = %s, trade_state = %s, updated_at = CURRENT_TIMESTAMP
+                                    WHERE id = %s AND status = 'EXECUTED';
+                                """, (round(new_sl, 5), new_state, trade_id))
+                                conn.commit()
 
-                        msg = result["msg"]
-                        if sl_updated:
-                            msg += " (Bybit Position SL Updated)"
-                        send_telegram_notification(msg)
+                            msg = result.get("msg", f"[{pair}] SL updated to ${new_sl:.5f}")
+                            if sl_updated:
+                                msg += " (Bybit Position SL Updated)"
+                            send_telegram_notification(msg)
 
                     elif action == "FINALIZED_CLOSED_TRADE":
-                        # FIX #P0: Trade was finalized directly by the trade manager.
-                        # Send the close notification here so the operator has full visibility.
                         msg = result.get("msg", "")
                         if msg:
                             send_telegram_notification(msg)
                         continue
 
                     elif action == "SYNC_CLOSED_FROM_EXCHANGE":
-                        # Fallback path if direct finalization failed inside the
-                        # trade manager. Wake the reconciler so it retries.
                         logger.info(
                             f"[{pair}] Trade #{trade_id} closed on exchange. "
                             f"Direct finalization failed; notifying reconciler."
@@ -162,7 +158,6 @@ async def dynamic_trade_management_loop():
 
                         actual_exit_price = float(close_res.get("exit_price", target_exit))
 
-                        # Query Bybit for the real closedPnl immediately after close
                         real_closed_pnl, real_fee, verified_exit = executor.fetch_real_closed_pnl(pair)
                         if verified_exit > 0:
                             actual_exit_price = verified_exit
@@ -225,7 +220,6 @@ async def strategy_evaluation_loop():
                     release_db_connection(conn_global)
 
             if global_active_count >= MAX_CONCURRENT_POSITIONS:
-                # FIX #P3: only log on state change to reduce log noise
                 if getattr(strategy_evaluation_loop, "_last_log_state", None) != "MAX_REACHED":
                     logger.info(f"Max concurrent positions reached ({global_active_count}/{MAX_CONCURRENT_POSITIONS}). Skipping trade evaluations.")
                     strategy_evaluation_loop._last_log_state = "MAX_REACHED"
@@ -333,10 +327,6 @@ async def reconciler_background_task(executor):
 
     event_bus.subscribe("EXECUTION_EVENT", on_execution_event)
 
-    # FIX #P1: Reduced from 3600s (1 hour) to 300s (5 minutes). The private WS
-    # on testnet drops frequently (observed 6 times in the attached log), so
-    # execution events are unreliable. A 5-minute safety net ensures stuck
-    # DB records are reconciled promptly even without WS events.
     SAFETY_INTERVAL = 300
 
     while True:

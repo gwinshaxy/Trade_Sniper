@@ -83,8 +83,9 @@ def format_ccxt_futures_symbol(symbol: str, exchange: Optional[ccxt.Exchange] = 
     if not symbol:
         return ""
 
-    # Clean raw string input
-    raw = symbol.split(":")[0].replace("/", "").replace("_", "").replace("-", "").upper()
+    # Clean raw string input and remove any colon modifiers
+    clean_base = symbol.split(":")[0]
+    raw = clean_base.replace("/", "").replace("_", "").replace("-", "").upper()
     if raw.endswith("USDTUSDT"):
         raw = raw[:-4]
     
@@ -104,8 +105,8 @@ def format_ccxt_futures_symbol(symbol: str, exchange: Optional[ccxt.Exchange] = 
         except Exception as e:
             logger.warning(f"Failed to resolve market via exchange: {e}. Falling back to default format.")
 
-    if ":" in symbol:
-        return symbol
+    if hasattr(exchange, 'sandboxMode') and exchange.sandboxMode:
+        return f"{base_symbol}/{quote_symbol}"
 
     return f"{base_symbol}/{quote_symbol}:{quote_symbol}"
 
@@ -164,11 +165,10 @@ class BybitFuturesLiveExecutor:
                 mapped = symbols_map[symbol]
                 if isinstance(mapped, dict):
                     mapped = mapped.get("binance", mapped.get("bybit", symbol))
-                if ":" in str(mapped):
-                    return str(mapped)
                 symbol = str(mapped)
 
-        raw = symbol.split(":")[0].replace("/", "").replace("_", "").replace("-", "").upper()
+        clean_base = symbol.split(":")[0]
+        raw = clean_base.replace("/", "").replace("_", "").replace("-", "").upper()
         if raw.endswith("USDTUSDT"):
             raw = raw[:-4]
         
@@ -179,7 +179,7 @@ class BybitFuturesLiveExecutor:
             return resolve_and_verify_symbol(self.exchange, base_symbol, quote_symbol)
         except Exception as e:
             logger.warning(f"[{symbol}] Symbol dynamic resolution fallback to format_ccxt_futures_symbol: {e}")
-            return format_ccxt_futures_symbol(symbol)
+            return format_ccxt_futures_symbol(symbol, self.exchange)
 
     def format_ccxt_futures_symbol(self, symbol: str) -> str:
         """Instance wrapper directing to resolve_symbol for unified market verification."""
@@ -539,7 +539,6 @@ class BybitFuturesLiveExecutor:
         return await asyncio.to_thread(self.get_futures_position, symbol)
 
     def get_futures_position(self, symbol: str) -> Dict[str, Any]:
-        # Issue 1 Resolution: Use self.resolve_symbol to dynamically resolve CCXT symbol for position queries
         exchange_symbol = self.resolve_symbol(symbol)
 
         clean_target = symbol.replace("/", "").replace(":", "").replace("_", "").replace("-", "").upper()

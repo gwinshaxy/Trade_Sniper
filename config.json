@@ -24,10 +24,10 @@
   "zone_tolerance": 0.02,
   "lookback_bars": 600,
   "watchlist": [
-    "UNI/USDT:USDT",
-	"CAKE/USDT:USDT",
-	"SOL/USDT:USDT",
-    "ARB/USDT:USDT"
+    "UNI/USDT",
+	"CAKE/USDT",
+	"SOL/USDT",
+    "ARB/USDT"
   ],
   "use_mtf_tema_alignment": true,
   "htf_tema_period": 200,
