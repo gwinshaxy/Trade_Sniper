@@ -539,13 +539,8 @@ class BybitFuturesLiveExecutor:
         return await asyncio.to_thread(self.get_futures_position, symbol)
 
     def get_futures_position(self, symbol: str) -> Dict[str, Any]:
-        ccxt_symbol = self.format_ccxt_futures_symbol(symbol)
-        
-        # Configuration map fallback check for exchange symbol resolution
-        exchange_symbol = ccxt_symbol
-        if hasattr(self, 'config') and isinstance(self.config, dict):
-            symbols_map = self.config.get("symbols", {})
-            exchange_symbol = symbols_map.get(symbol, symbols_map.get(ccxt_symbol, ccxt_symbol))
+        # Issue 1 Resolution: Use self.resolve_symbol to dynamically resolve CCXT symbol for position queries
+        exchange_symbol = self.resolve_symbol(symbol)
 
         clean_target = symbol.replace("/", "").replace(":", "").replace("_", "").replace("-", "").upper()
         try:
