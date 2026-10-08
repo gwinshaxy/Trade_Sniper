@@ -110,27 +110,28 @@ async def dynamic_trade_management_loop():
                     result = trade_manager.process_trade(trade, latest_candle, live_pos_info=live_pos)
                     action = result.get("action")
 
-                    if action == "UPDATE_SL":
-                        new_sl = result.get("new_sl")
+                    # Safe initialization to avoid UnboundLocalError
+                    new_sl = result.get("new_sl") if action == "UPDATE_SL" else None
+
+                    if action == "UPDATE_SL" and new_sl is not None and new_sl > 0:
                         new_state = result.get("new_state", "OPEN")
 
-                        if new_sl is not None and new_sl > 0:
-                            sl_updated = await asyncio.to_thread(
-                                executor.set_position_trading_stop, pair, new_sl, 0
-                            )
+                        sl_updated = await asyncio.to_thread(
+                            executor.set_position_trading_stop, pair, new_sl, 0
+                        )
 
-                            with conn.cursor() as cur:
-                                cur.execute("""
-                                    UPDATE trade_setups
-                                    SET stop_loss = %s, trade_state = %s, updated_at = CURRENT_TIMESTAMP
-                                    WHERE id = %s AND status = 'EXECUTED';
-                                """, (round(new_sl, 5), new_state, trade_id))
-                                conn.commit()
+                        with conn.cursor() as cur:
+                            cur.execute("""
+                                UPDATE trade_setups
+                                SET stop_loss = %s, trade_state = %s, updated_at = CURRENT_TIMESTAMP
+                                WHERE id = %s AND status = 'EXECUTED';
+                            """, (round(new_sl, 5), new_state, trade_id))
+                            conn.commit()
 
-                            msg = result.get("msg", f"[{pair}] SL updated to ${new_sl:.5f}")
-                            if sl_updated:
-                                msg += " (Bybit Position SL Updated)"
-                            send_telegram_notification(msg)
+                        msg = result.get("msg", f"[{pair}] SL updated to ${new_sl:.5f}")
+                        if sl_updated:
+                            msg += " (Bybit Position SL Updated)"
+                        send_telegram_notification(msg)
 
                     elif action == "FINALIZED_CLOSED_TRADE":
                         msg = result.get("msg", "")
