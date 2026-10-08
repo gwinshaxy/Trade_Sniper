@@ -27,7 +27,7 @@
     "UNI/USDT",
 	"CAKE/USDT",
 	"SOL/USDT",
-    "ARB/USDT"
+    "ARBPERP"
   ],
   "use_mtf_tema_alignment": true,
   "htf_tema_period": 200,
