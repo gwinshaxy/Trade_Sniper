@@ -116,6 +116,13 @@ class StateMachineEngine:
                 f"(Ref Entry Price: ${entry_price:.5f} | Risk: {risk_pct_value}%)..."
             )
 
+            # Register symbol in grace-period cache BEFORE order execution to prevent WebSocket race condition
+            try:
+                from reconciler import mark_symbol_recently_opened
+                mark_symbol_recently_opened(symbol)
+            except Exception as grace_err:
+                logger.debug(f"[{symbol}] Pre-execution grace registration failed: {grace_err}")
+
             exec_result = await loop.run_in_executor(
                 None,
                 self.executor.order_futures_bybit,
@@ -131,15 +138,6 @@ class StateMachineEngine:
             )
 
             if exec_result.get("status") == "SUCCESS":
-                # Register symbol in grace-period cache IMMEDIATELY, before
-                # the DB insert, so the reconciler skips adoption if it fires
-                # between the WS execution event and our INSERT completing.
-                try:
-                    from reconciler import mark_symbol_recently_opened
-                    mark_symbol_recently_opened(symbol)
-                except Exception as grace_err:
-                    logger.debug(f"[{symbol}] Grace registration failed: {grace_err}")
-
                 executed_qty = exec_result["executed_qty"]
                 fill_price = exec_result["fill_price"]
                 sl_attached = exec_result.get("stop_loss_attached", False)
@@ -149,17 +147,6 @@ class StateMachineEngine:
                 if conn_db:
                     try:
                         with conn_db.cursor() as cur:
-                            # -----------------------------------------------------------------
-                            # FIX #P1: Use an ON CONFLICT upsert that matches the partial
-                            # unique index (idx_unique_open_pair) which permits only ONE
-                            # open trade per pair. This eliminates the race-condition
-                            # duplicate-key error when the reconciler's ORPHAN-adoption
-                            # path wins the insert race. We also RETURN id so the
-                            # trade_id is always populated for notifications.
-                            #
-                            # NOTE: The WHERE clause in ON CONFLICT must match the
-                            # partial index predicate exactly.
-                            # -----------------------------------------------------------------
                             cur.execute("""
                                 INSERT INTO trade_setups 
                                 (pair, direction, entry_price, stop_loss, take_profit, position_size, account_balance, risk_pct, status, trade_state, updated_at)
@@ -181,11 +168,6 @@ class StateMachineEngine:
                             conn_db.commit()
 
                         if trade_id is not None:
-                            # -----------------------------------------------------------------
-                            # FIX #8: Register the entry order ID in the reconciler's
-                            # cache so it can verify the order status before declaring
-                            # the trade a ghost.
-                            # -----------------------------------------------------------------
                             if entry_order_id:
                                 try:
                                     from reconciler import mark_trade_entry_order
@@ -209,8 +191,6 @@ class StateMachineEngine:
                     finally:
                         release_db_connection(conn_db)
             elif exec_result.get("status") == "FAILED" and "SL failed to attach" in str(exec_result.get("error", "")):
-                # SL attach failed but emergency close likely succeeded.
-                # Do NOT raise — the position is clean; just log and continue.
                 logger.warning(
                     f"[{symbol}] Order rejected post-entry: {exec_result.get('error')}. "
                     f"Position expected to be clean."
