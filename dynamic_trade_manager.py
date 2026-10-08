@@ -15,14 +15,6 @@ class DynamicTradeManager:
     """
     Handles dynamic active position management with a progressive
     breakeven + trailing stop model.
-
-    MODEL:
-      - Before BE trigger (default 1.5R): SL stays at initial level
-      - At BE trigger: SL moves to entry + small buffer
-      - At trail trigger (default 2.0R): SL begins trailing behind price (wide, 3.0× ATR)
-      - At tighten trigger (default 3.5R): SL trails tighter (1.8× ATR)
-      - Hard TP only used as a SAFETY NET for catastrophic exhaustion; the
-        primary exit is the trailing stop.
     """
 
     def __init__(
@@ -78,10 +70,6 @@ class DynamicTradeManager:
                 release_db_connection(conn)
 
     def _finalize_closed_trade(self, trade: Dict[str, Any], live_pos_info: Dict[str, Any]) -> bool:
-        """
-        Queries Bybit for the authoritative closedPnl, computes net PnL, and
-        finalizes the DB record. Returns True if finalization succeeded.
-        """
         trade_id = trade.get("id")
         pair = trade.get("pair")
         direction = trade.get("direction")
@@ -161,184 +149,157 @@ class DynamicTradeManager:
         latest_candle: Dict[str, Any],
         live_pos_info: Dict[str, Any] = None,
     ) -> Dict[str, Any]:
-        if not trade or not latest_candle:
-            return {"action": "HOLD"}
+        try:
+            if not trade or not latest_candle:
+                return {"action": "HOLD"}
 
-        trade_id = trade.get("id")
-        direction = str(trade.get("direction") or "").upper()
+            trade_id = trade.get("id")
+            direction = str(trade.get("direction") or "").upper()
 
-        entry_price = self._safe_float(trade.get("entry_price"))
-        current_sl = self._safe_float(trade.get("stop_loss"))
-        current_tp = self._safe_float(trade.get("take_profit"))
-        trade_state = trade.get("trade_state") or "OPEN"
+            entry_price = self._safe_float(trade.get("entry_price"))
+            current_sl = self._safe_float(trade.get("stop_loss"))
+            current_tp = self._safe_float(trade.get("take_profit"))
+            trade_state = trade.get("trade_state") or "OPEN"
 
-        close_price = self._safe_float(latest_candle.get("close"))
-        high_price = self._safe_float(latest_candle.get("high"), close_price)
-        low_price = self._safe_float(latest_candle.get("low"), close_price)
-        atr = self._safe_float(latest_candle.get("atr"))
+            close_price = self._safe_float(latest_candle.get("close"))
+            high_price = self._safe_float(latest_candle.get("high"), close_price)
+            low_price = self._safe_float(latest_candle.get("low"), close_price)
+            atr = self._safe_float(latest_candle.get("atr"))
 
-        if entry_price <= 0 or close_price <= 0:
-            return {"action": "HOLD"}
+            if entry_price <= 0 or close_price <= 0:
+                return {"action": "HOLD"}
 
-        is_long = direction in ["BUY", "LONG"]
-        db_needs_update = False
+            is_long = direction in ["BUY", "LONG"]
+            db_needs_update = False
 
-        # ---- Sanity: SL direction guard -------------------------------
-        if is_long:
-            if current_sl >= entry_price and trade_state == "OPEN":
-                current_sl = entry_price * 0.98
-                db_needs_update = True
-        elif not is_long:
-            if current_sl <= entry_price and current_sl > 0 and trade_state == "OPEN":
-                current_sl = entry_price * 1.02
-                db_needs_update = True
-
-        # ---- Sanity: TP direction guard -------------------------------
-        if is_long and current_tp > 0 and current_tp <= entry_price:
-            logger.error(
-                f"🚨 CORRUPT TP for #{trade_id}: LONG TP (${current_tp}) <= entry (${entry_price})."
-            )
-            current_tp = entry_price + (abs(entry_price - current_sl) * 3.0)
-            db_needs_update = True
-        elif (not is_long) and current_tp > 0 and current_tp >= entry_price:
-            logger.error(
-                f"🚨 CORRUPT TP for #{trade_id}: SHORT TP (${current_tp}) >= entry (${entry_price})."
-            )
-            current_tp = entry_price - (abs(entry_price - current_sl) * 3.0)
-            db_needs_update = True
-
-        if current_sl == 0.0 and entry_price > 0:
-            current_sl = entry_price * (1.0 - 0.02) if is_long else entry_price * (1.0 + 0.02)
-            db_needs_update = True
-
-        if current_tp == 0.0 and entry_price > 0:
-            risk = abs(entry_price - current_sl)
-            current_tp = entry_price + (risk * 4.0) if is_long else entry_price - (risk * 4.0)
-            db_needs_update = True
-
-        if db_needs_update and trade_id is not None:
-            self._update_db_sl_tp(trade_id, current_sl, current_tp)
-
-        # ---- 1. Exchange closure check --------------------------------
-        if live_pos_info and not live_pos_info.get("error") and live_pos_info.get("contracts", 0.0) <= 0.001:
-            logger.warning(
-                f"[{trade.get('pair')}] Trade #{trade_id} closed on exchange. "
-                f"Finalizing directly via DynamicTradeManager."
-            )
-            finalized = self._finalize_closed_trade(trade, live_pos_info)
-            return {
-                "action": "FINALIZED_CLOSED_TRADE" if finalized else "SYNC_CLOSED_FROM_EXCHANGE",
-                "msg": (
-                    f"✅ Trade #{trade_id} finalized (dynamic manager)."
-                    if finalized
-                    else f"⚠️ Trade #{trade_id} closed but finalization failed; reconciler will retry."
-                ),
-            }
-
-        # ---- SOLUTION 1: Disable Local Candle-Based SL/TP Hard Closures ----
-        # Rely solely on updating the native Exchange SL/TP via set_position_trading_stop.
-        """
-        if is_long:
-            if self.hard_tp_enabled and current_tp > 0 and trade_state not in ["TRAILING"] and high_price >= current_tp:
-                return {
-                    "action": "EXECUTE_CLOSE_TP",
-                    "target_price": current_tp,
-                    "msg": f"🎯 Hard TP hit for #{trade_id}. Executing market close on Bybit..."
-                }
-            if current_sl > 0 and low_price <= current_sl:
-                return {
-                    "action": "EXECUTE_CLOSE_SL",
-                    "target_price": current_sl,
-                    "msg": f"🛑 Target SL hit for #{trade_id}. Executing market close on Bybit..."
-                }
-        else:
-            if self.hard_tp_enabled and current_tp > 0 and trade_state not in ["TRAILING"] and low_price <= current_tp:
-                return {
-                    "action": "EXECUTE_CLOSE_TP",
-                    "target_price": current_tp,
-                    "msg": f"🎯 Hard TP hit for #{trade_id}. Executing market close on Bybit..."
-                }
-            if current_sl > 0 and high_price >= current_sl:
-                return {
-                    "action": "EXECUTE_CLOSE_SL",
-                    "target_price": current_sl,
-                    "msg": f"🛑 Target SL hit for #{trade_id}. Executing market close on Bybit..."
-                }
-        """
-
-        # ---- 3. Progressive breakeven + trailing ---------------------
-        if atr > 0:
-            risk_dist = abs(entry_price - current_sl) if current_sl > 0 else (entry_price * 0.02)
-
+            # ---- Sanity: SL direction guard -------------------------------
             if is_long:
-                unrealized_profit = close_price - entry_price
+                if current_sl >= entry_price and trade_state == "OPEN":
+                    current_sl = entry_price * 0.98
+                    db_needs_update = True
+            elif not is_long:
+                if current_sl <= entry_price and current_sl > 0 and trade_state == "OPEN":
+                    current_sl = entry_price * 1.02
+                    db_needs_update = True
 
-                # 3A: Move to Breakeven once +1.5R reached
-                if trade_state == "OPEN" and unrealized_profit >= (risk_dist * self.be_rr_trigger):
-                    candidate_sl = entry_price + (atr * self.be_buffer_atr)
-                    if candidate_sl > entry_price and candidate_sl > current_sl:
-                        return {
-                            "action": "UPDATE_SL",
-                            "new_sl": candidate_sl,
-                            "new_state": "BE_LOCKED",
-                            "msg": f"🔒 Trade #{trade_id} moved to Breakeven @ ${candidate_sl:.5f}"
-                        }
+            # ---- Sanity: TP direction guard -------------------------------
+            if is_long and current_tp > 0 and current_tp <= entry_price:
+                logger.error(
+                    f"🚨 CORRUPT TP for #{trade_id}: LONG TP (${current_tp}) <= entry (${entry_price})."
+                )
+                current_tp = entry_price + (abs(entry_price - current_sl) * 3.0)
+                db_needs_update = True
+            elif (not is_long) and current_tp > 0 and current_tp >= entry_price:
+                logger.error(
+                    f"🚨 CORRUPT TP for #{trade_id}: SHORT TP (${current_tp}) >= entry (${entry_price})."
+                )
+                current_tp = entry_price - (abs(entry_price - current_sl) * 3.0)
+                db_needs_update = True
 
-                # 3B: Start trailing once +2.0R reached
-                if trade_state in ["BE_LOCKED", "TRAILING"] and unrealized_profit >= (risk_dist * self.trail_rr_trigger):
-                    candidate_sl = close_price - (atr * self.trailing_mult)
-                    if candidate_sl > entry_price and candidate_sl > current_sl:
-                        return {
-                            "action": "UPDATE_SL",
-                            "new_sl": candidate_sl,
-                            "new_state": "TRAILING",
-                            "msg": f"📈 Trail activated for #{trade_id} → SL @ ${candidate_sl:.5f}"
-                        }
+            if current_sl == 0.0 and entry_price > 0:
+                current_sl = entry_price * (1.0 - 0.02) if is_long else entry_price * (1.0 + 0.02)
+                db_needs_update = True
 
-                # 3C: Tighten trail once +3.5R reached
-                if trade_state == "TRAILING" and unrealized_profit >= (risk_dist * self.tighten_rr_trigger):
-                    candidate_sl = close_price - (atr * self.tighten_mult)
-                    if candidate_sl > entry_price and candidate_sl > current_sl:
-                        return {
-                            "action": "UPDATE_SL",
-                            "new_sl": candidate_sl,
-                            "new_state": "TRAILING",
-                            "msg": f"📈 Tightened trail for #{trade_id} → SL @ ${candidate_sl:.5f}"
-                        }
-            else:  # SHORT
-                unrealized_profit = entry_price - close_price
+            if current_tp == 0.0 and entry_price > 0:
+                risk = abs(entry_price - current_sl)
+                current_tp = entry_price + (risk * 4.0) if is_long else entry_price - (risk * 4.0)
+                db_needs_update = True
 
-                # 3A: Breakeven
-                if trade_state == "OPEN" and unrealized_profit >= (risk_dist * self.be_rr_trigger):
-                    candidate_sl = entry_price - (atr * self.be_buffer_atr)
-                    if candidate_sl < entry_price and (current_sl == 0 or candidate_sl < current_sl):
-                        return {
-                            "action": "UPDATE_SL",
-                            "new_sl": candidate_sl,
-                            "new_state": "BE_LOCKED",
-                            "msg": f"🔒 Trade #{trade_id} moved to Breakeven @ ${candidate_sl:.5f}"
-                        }
+            if db_needs_update and trade_id is not None:
+                self._update_db_sl_tp(trade_id, current_sl, current_tp)
 
-                # 3B: Start trailing
-                if trade_state in ["BE_LOCKED", "TRAILING"] and unrealized_profit >= (risk_dist * self.trail_rr_trigger):
-                    candidate_sl = close_price + (atr * self.trailing_mult)
-                    if candidate_sl < entry_price and (current_sl == 0 or candidate_sl < current_sl):
-                        return {
-                            "action": "UPDATE_SL",
-                            "new_sl": candidate_sl,
-                            "new_state": "TRAILING",
-                            "msg": f"📉 Trail activated for #{trade_id} → SL @ ${candidate_sl:.5f}"
-                        }
+            # ---- 1. Exchange closure check --------------------------------
+            if live_pos_info and not live_pos_info.get("error") and live_pos_info.get("contracts", 0.0) <= 0.001:
+                logger.warning(
+                    f"[{trade.get('pair')}] Trade #{trade_id} closed on exchange. "
+                    f"Finalizing directly via DynamicTradeManager."
+                )
+                finalized = self._finalize_closed_trade(trade, live_pos_info)
+                return {
+                    "action": "FINALIZED_CLOSED_TRADE" if finalized else "SYNC_CLOSED_FROM_EXCHANGE",
+                    "msg": (
+                        f"✅ Trade #{trade_id} finalized (dynamic manager)."
+                        if finalized
+                        else f"⚠️ Trade #{trade_id} closed but finalization failed; reconciler will retry."
+                    ),
+                }
 
-                # 3C: Tighten trail
-                if trade_state == "TRAILING" and unrealized_profit >= (risk_dist * self.tighten_rr_trigger):
-                    candidate_sl = close_price + (atr * self.tighten_mult)
-                    if candidate_sl < entry_price and (current_sl == 0 or candidate_sl < current_sl):
-                        return {
-                            "action": "UPDATE_SL",
-                            "new_sl": candidate_sl,
-                            "new_state": "TRAILING",
-                            "msg": f"📉 Tightened trail for #{trade_id} → SL @ ${candidate_sl:.5f}"
-                        }
+            # ---- 2. Progressive breakeven + trailing ---------------------
+            if atr > 0:
+                risk_dist = abs(entry_price - current_sl) if current_sl > 0 else (entry_price * 0.02)
 
-        return {"action": "HOLD"}
+                if is_long:
+                    unrealized_profit = close_price - entry_price
+
+                    # Breakeven (+1.5R)
+                    if trade_state == "OPEN" and unrealized_profit >= (risk_dist * self.be_rr_trigger):
+                        candidate_sl = entry_price + (atr * self.be_buffer_atr)
+                        if candidate_sl > entry_price and candidate_sl > current_sl:
+                            return {
+                                "action": "UPDATE_SL",
+                                "new_sl": candidate_sl,
+                                "new_state": "BE_LOCKED",
+                                "msg": f"🔒 Trade #{trade_id} moved to Breakeven @ ${candidate_sl:.5f}"
+                            }
+
+                    # Trailing (+2.0R)
+                    if trade_state in ["BE_LOCKED", "TRAILING"] and unrealized_profit >= (risk_dist * self.trail_rr_trigger):
+                        candidate_sl = close_price - (atr * self.trailing_mult)
+                        if candidate_sl > entry_price and candidate_sl > current_sl:
+                            return {
+                                "action": "UPDATE_SL",
+                                "new_sl": candidate_sl,
+                                "new_state": "TRAILING",
+                                "msg": f"📈 Trail activated for #{trade_id} → SL @ ${candidate_sl:.5f}"
+                            }
+
+                    # Tighten (+3.5R)
+                    if trade_state == "TRAILING" and unrealized_profit >= (risk_dist * self.tighten_rr_trigger):
+                        candidate_sl = close_price - (atr * self.tighten_mult)
+                        if candidate_sl > entry_price and candidate_sl > current_sl:
+                            return {
+                                "action": "UPDATE_SL",
+                                "new_sl": candidate_sl,
+                                "new_state": "TRAILING",
+                                "msg": f"📈 Tightened trail for #{trade_id} → SL @ ${candidate_sl:.5f}"
+                            }
+                else:  # SHORT
+                    unrealized_profit = entry_price - close_price
+
+                    # Breakeven
+                    if trade_state == "OPEN" and unrealized_profit >= (risk_dist * self.be_rr_trigger):
+                        candidate_sl = entry_price - (atr * self.be_buffer_atr)
+                        if candidate_sl < entry_price and (current_sl == 0 or candidate_sl < current_sl):
+                            return {
+                                "action": "UPDATE_SL",
+                                "new_sl": candidate_sl,
+                                "new_state": "BE_LOCKED",
+                                "msg": f"🔒 Trade #{trade_id} moved to Breakeven @ ${candidate_sl:.5f}"
+                            }
+
+                    # Trailing
+                    if trade_state in ["BE_LOCKED", "TRAILING"] and unrealized_profit >= (risk_dist * self.trail_rr_trigger):
+                        candidate_sl = close_price + (atr * self.trailing_mult)
+                        if candidate_sl < entry_price and (current_sl == 0 or candidate_sl < current_sl):
+                            return {
+                                "action": "UPDATE_SL",
+                                "new_sl": candidate_sl,
+                                "new_state": "TRAILING",
+                                "msg": f"📉 Trail activated for #{trade_id} → SL @ ${candidate_sl:.5f}"
+                            }
+
+                    # Tighten
+                    if trade_state == "TRAILING" and unrealized_profit >= (risk_dist * self.tighten_rr_trigger):
+                        candidate_sl = close_price + (atr * self.tighten_mult)
+                        if candidate_sl < entry_price and (current_sl == 0 or candidate_sl < current_sl):
+                            return {
+                                "action": "UPDATE_SL",
+                                "new_sl": candidate_sl,
+                                "new_state": "TRAILING",
+                                "msg": f"📉 Tightened trail for #{trade_id} → SL @ ${candidate_sl:.5f}"
+                            }
+
+            return {"action": "HOLD"}
+        except Exception as err:
+            logger.error(f"Error in DynamicTradeManager.process_trade: {err}")
+            return {"action": "HOLD"}

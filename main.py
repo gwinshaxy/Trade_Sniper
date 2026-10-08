@@ -89,6 +89,11 @@ async def dynamic_trade_management_loop():
                     active_trades = [dict(zip(columns, row)) for row in cur.fetchall()]
 
                 for trade in active_trades:
+                    # Bulletproof local variable initializations per iteration
+                    new_sl = None
+                    action = None
+                    result = {}
+
                     trade_id = trade['id']
                     pair = trade['pair']
                     pos_qty = float(trade.get("position_size", 0.0))
@@ -107,10 +112,13 @@ async def dynamic_trade_management_loop():
 
                     live_pos = await executor.get_futures_position_async(pair)
 
-                    result = trade_manager.process_trade(trade, latest_candle, live_pos_info=live_pos)
-                    action = result.get("action")
+                    try:
+                        result = trade_manager.process_trade(trade, latest_candle, live_pos_info=live_pos)
+                    except Exception as pm_err:
+                        logger.error(f"[{pair}] Error inside trade_manager.process_trade for #{trade_id}: {pm_err}")
+                        result = {"action": "HOLD"}
 
-                    # Safe initialization to avoid UnboundLocalError
+                    action = result.get("action", "HOLD")
                     new_sl = result.get("new_sl") if action == "UPDATE_SL" else None
 
                     if action == "UPDATE_SL" and new_sl is not None and new_sl > 0:
