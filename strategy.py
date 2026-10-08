@@ -682,10 +682,10 @@ def load_symbol_config(symbol: str) -> Dict[str, Any]:
         "atr_ratio_thresh": 0.85,         
         "use_atr_sl": True, 
         "disable_htf": False, 
-        "spot_only": False
+        "spot_only": False,
+        "leverage": 5
     }
 
-    # Apply symbol-specific parameter overrides to default_config
     sym_override = (
         SYMBOL_PARAMETER_DEFAULTS.get(formatted_symbol) 
         or SYMBOL_PARAMETER_DEFAULTS.get(raw_symbol)
@@ -693,7 +693,6 @@ def load_symbol_config(symbol: str) -> Dict[str, Any]:
     if sym_override:
         default_config.update(sym_override)
 
-    # Database retrieval logic with slash and raw symbol matching
     if HAS_DB and os.getenv("SKIP_DB", "0") != "1":
         conn = get_db_connection()
         if conn:
@@ -713,10 +712,17 @@ def load_symbol_config(symbol: str) -> Dict[str, Any]:
                     cursor.close()
                     config = dict(zip(colnames, row)) if isinstance(row, tuple) else dict(row)
 
-                    # Merge DB values over default_config (which contains symbol overrides)
+                    # Safe parsing with explicit NoneType checks
                     for key, val in config.items():
                         if val is not None and key in default_config:
-                            default_config[key] = type(default_config[key])(val)
+                            try:
+                                target_type = type(default_config[key])
+                                if target_type == bool:
+                                    default_config[key] = bool(val)
+                                else:
+                                    default_config[key] = target_type(val)
+                            except (ValueError, TypeError):
+                                pass
 
                     return default_config
                 cursor.close()
