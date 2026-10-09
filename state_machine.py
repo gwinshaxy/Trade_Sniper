@@ -137,7 +137,7 @@ class StateMachineEngine:
                 risk_pct_value
             )
 
-            if exec_result.get("status") == "SUCCESS":
+            if exec_result.get("status") == "SUCCESS" and safe_float(exec_result.get("executed_qty", 0)) > 0.001:
                 executed_qty = exec_result["executed_qty"]
                 fill_price = exec_result["fill_price"]
                 sl_attached = exec_result.get("stop_loss_attached", False)

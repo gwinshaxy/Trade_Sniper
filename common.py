@@ -156,9 +156,11 @@ def finalize_trade_in_db(trade_id: int, exit_price: float, pnl_usd: float, pnl_p
             conn.commit()
             logger.info(f"Database Record #{trade_id} successfully finalized with state CLOSED (PnL: ${pnl_usd:.2f}, Fees: ${fee_usd:.2f}).")
 
-        # FIX #5: Sole cooldown setter — every close path routes here
-        if pair:
+        # Only set cooldown for ACTUAL settled exchange trades
+        if pair and outcome in ['WIN', 'LOSS', 'BREAKEVEN']:
             set_asset_cooldown(pair, hours=DEFAULT_COOLDOWN_HOURS)
+        else:
+            logger.info(f"[{pair}] Cooldown skipped for outcome '{outcome}' on Trade #{trade_id}.")
     except Exception as e:
         logger.error(f"Failed to finalize trade record #{trade_id} in database: {e}")
     finally:
@@ -475,17 +477,23 @@ def check_daily_circuit_breaker(max_loss_pct: float = 3.0, account_balance: floa
         return False
     try:
         cursor = conn.cursor()
+        # EXCLUDE phantom outcome types (GHOST_CLOSED, UNKNOWN, CANCELLED)
         cursor.execute("""
             SELECT SUM(pnl_usd) FROM trade_setups
             WHERE status = 'CLOSED' 
-              AND closed_at >= CURRENT_DATE;
+              AND closed_at >= CURRENT_DATE
+              AND outcome IN ('WIN', 'LOSS', 'BREAKEVEN');
         """)
         row = cursor.fetchone()
         cursor.close()
 
         daily_pnl = float(row[0]) if row and row[0] is not None else 0.0
         max_loss_usd = -1 * abs(account_balance * (max_loss_pct / 100.0))
-        return daily_pnl <= max_loss_usd
+
+        if daily_pnl <= max_loss_usd:
+            logger.warning(f"⚠️ Daily Circuit Breaker Active! Verified Daily PnL (${daily_pnl:.2f}) <= Max Loss (${max_loss_usd:.2f})")
+            return True
+        return False
     except Exception as e:
         logger.error(f"[Circuit Breaker Error]: {e}")
         return False
