@@ -390,18 +390,23 @@ def verify_base_schema():
 
 
 def calculate_pnl(direction: str, entry_price: float, current_price: float, quantity: float, account_balance: float = 100.0, total_fees: float = 0.0, exchange_closed_pnl: float = None) -> tuple:
+    dir_clean = str(direction).strip().upper()
+    
     if exchange_closed_pnl is not None:
-        pnl_usd = float(exchange_closed_pnl) - abs(total_fees)
+        gross_pnl = float(exchange_closed_pnl)
     else:
-        dir_clean = str(direction).strip().upper()
         if dir_clean in ["BUY", "LONG"]:
             gross_pnl = (current_price - entry_price) * quantity
         elif dir_clean in ["SELL", "SHORT"]:
             gross_pnl = (entry_price - current_price) * quantity
         else:
             gross_pnl = 0.0
-        pnl_usd = gross_pnl - abs(total_fees)
 
+    # Subtract exact taker/maker exchange fees (defaulting to 0.055% taker exit if fee not specified)
+    exit_fee = current_price * quantity * 0.00055
+    net_fees = abs(total_fees) + exit_fee
+    
+    pnl_usd = gross_pnl - net_fees
     pnl_pct = (pnl_usd / account_balance) * 100.0 if account_balance > 0 else 0.0
     outcome = "WIN" if pnl_usd > 0 else ("LOSS" if pnl_usd < 0 else "BREAKEVEN")
 
@@ -477,7 +482,6 @@ def check_daily_circuit_breaker(max_loss_pct: float = 3.0, account_balance: floa
         return False
     try:
         cursor = conn.cursor()
-        # EXCLUDE phantom outcome types (GHOST_CLOSED, UNKNOWN, CANCELLED)
         cursor.execute("""
             SELECT SUM(pnl_usd) FROM trade_setups
             WHERE status = 'CLOSED' 

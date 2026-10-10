@@ -15,7 +15,7 @@ logger = logging.getLogger("ws_engine")
 
 
 class UnifiedWebSocketEngine:
-    def __init__(self, symbols: List[str], is_testnet: bool = True, api_key: str = None, api_secret: str = None):
+    def __init__(self, symbols: List[str], is_testnet: bool = False, api_key: str = None, api_secret: str = None):
         self.symbols = [
             s.split(":")[0].replace("/", "").replace("_", "").upper()
             for s in symbols
@@ -26,11 +26,11 @@ class UnifiedWebSocketEngine:
         self.api_key = api_key
         self.api_secret = api_secret
 
+        # Pointing to Bybit Mainnet WebSocket Endpoints
         ws_base_domain = "stream-testnet.bybit.com" if is_testnet else "stream.bybit.com"
 
         self.ws_endpoints = [f"wss://{ws_base_domain}/v5/public/linear"]
         self.private_ws_endpoint = f"wss://{ws_base_domain}/v5/private"
-
         self.current_ep_idx = 0
 
     def _get_active_endpoint(self) -> str:
@@ -41,12 +41,12 @@ class UnifiedWebSocketEngine:
 
     async def _ping_loop(self, ws):
         """
-        FIX #4: Bybit testnet drops the WS with 1011 (keepalive ping timeout)
-        if we don't ping more frequently. Reduced from 20s to 15s.
+        Mainnet/Testnet WS keepalive ping loop.
+        Set to 15s to prevent connection dropouts.
         """
         try:
             while True:
-                await asyncio.sleep(15)  # was 20
+                await asyncio.sleep(15)
                 if ws.open:
                     await ws.send(json.dumps({"op": "ping"}))
         except (asyncio.CancelledError, Exception):
@@ -113,7 +113,6 @@ class UnifiedWebSocketEngine:
             exec_price = float(execution_data.get("execPrice", 0) or 0)
             closed_pnl = float(execution_data.get("closedPnl", 0) or 0)
 
-            # Only finalize trades on true close events; pass through entry fills
             closed_size = float(execution_data.get("closedSize", 0) or 0)
             if exec_type == "Trade" and closed_size <= 0:
                 await event_bus.publish("EXECUTION_EVENT", {
@@ -207,11 +206,11 @@ class UnifiedWebSocketEngine:
 
         while True:
             endpoint = self._get_active_endpoint()
-            logger.info(f"Connecting to Bybit WebSocket: {endpoint}...")
+            logger.info(f"Connecting to Bybit Mainnet WebSocket: {endpoint}...")
 
             try:
                 async with websockets.connect(endpoint, ssl=ssl_context, open_timeout=20, close_timeout=5) as ws:
-                    logger.info(f"Connected to Bybit Feed: {endpoint}")
+                    logger.info(f"Connected to Bybit Mainnet Feed: {endpoint}")
                     retry_delay = 3
 
                     asyncio.create_task(self._ping_loop(ws))

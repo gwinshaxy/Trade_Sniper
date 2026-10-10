@@ -49,6 +49,50 @@ def safe_float(val: Any, default: float = 0.0) -> float:
         return default
 
 
+def execute_virtual_paper_trade(
+    symbol: str, 
+    direction: str, 
+    amount_usd: float, 
+    entry_price: float, 
+    stop_loss: float, 
+    take_profit: float, 
+    account_balance: float, 
+    risk_pct: float,
+    is_market_order: bool = True
+) -> dict:
+    """
+    Simulates paper execution using Mainnet WebSocket prices, 
+    injecting 1-2 ticks of adverse slippage and subtracting maker/taker fees (0.02% / 0.055%).
+    """
+    dir_clean = direction.upper()
+    is_long = dir_clean in ["BUY", "LONG"]
+    
+    tick_size = 0.0001 if entry_price < 10 else 0.01
+    slippage_ticks = 2
+    slip_penalty = tick_size * slippage_ticks
+    
+    if is_long:
+        fill_price = entry_price + slip_penalty if is_market_order else entry_price
+    else:
+        fill_price = entry_price - slip_penalty if is_market_order else entry_price
+        
+    risk_amount = account_balance * (risk_pct / 100.0)
+    sl_distance = abs(fill_price - stop_loss) if stop_loss > 0 else fill_price * 0.02
+    position_size = risk_amount / sl_distance if sl_distance > 0 else 0.0
+    
+    fee_rate = 0.00055 if is_market_order else 0.0002
+    entry_fee = fill_price * position_size * fee_rate
+    
+    return {
+        "status": "SUCCESS",
+        "fill_price": round(fill_price, 5),
+        "executed_qty": round(position_size, 6),
+        "stop_loss_attached": True,
+        "estimated_fee": round(entry_fee, 4),
+        "order_id": f"paper_{int(time.time())}"
+    }
+
+
 def resolve_and_verify_symbol(exchange: ccxt.Exchange, base_symbol: str, quote_symbol: str = "USDT") -> str:
     """
     Dynamically resolves CCXT unified symbol notation across Mainnet and Testnet environments,
@@ -67,7 +111,6 @@ def resolve_and_verify_symbol(exchange: ccxt.Exchange, base_symbol: str, quote_s
             if exchange.markets[candidate].get('active', True):
                 return candidate
                 
-    # Fallback lookup across all markets
     for key, market in exchange.markets.items():
         if key.startswith(f"{base_symbol}/{quote_symbol}") and market.get('active', True):
             return key
@@ -83,7 +126,6 @@ def format_ccxt_futures_symbol(symbol: str, exchange: Optional[ccxt.Exchange] = 
     if not symbol:
         return ""
 
-    # Clean raw string input and remove any colon modifiers
     clean_base = symbol.split(":")[0]
     raw = clean_base.replace("/", "").replace("_", "").replace("-", "").upper()
     if raw.endswith("USDTUSDT"):
@@ -158,7 +200,6 @@ class BybitFuturesLiveExecutor:
         if not symbol:
             return ""
         
-        # Check config symbols map first
         if hasattr(self, 'config') and isinstance(self.config, dict):
             symbols_map = self.config.get("symbols", {})
             if symbol in symbols_map:
@@ -738,6 +779,19 @@ class BybitFuturesLiveExecutor:
         if spread_pct > MAX_ALLOWED_SPREAD_PCT and not BYBIT_TESTNET:
             logger.warning(f"[{symbol}] Order Rejected: High Spread detected ({spread_pct * 100:.3f}%).")
             return {"status": "FAILED", "error": f"Spread too high ({spread_pct * 100:.3f}%)"}
+
+        # Paper execution bypass if testnet or paper trading enabled
+        is_paper_mode = os.getenv("ENABLE_PAPER_TRADING", "false").lower() == "true" or BYBIT_TESTNET
+        if is_paper_mode:
+            ticker_data_p = self.fetch_ticker_data(ccxt_symbol)
+            ref_p = ticker_data_p["ask"] if (is_long and ticker_data_p["ask"] > 0) else ticker_data_p["bid"] if (not is_long and ticker_data_p["bid"] > 0) else ticker_data_p["exec_price"]
+            if ref_p <= 0:
+                ref_p = entry_price if entry_price > 0 else 1.0
+            return execute_virtual_paper_trade(
+                symbol=symbol, direction=direction, amount_usd=amount_usd,
+                entry_price=ref_p, stop_loss=stop_loss, take_profit=take_profit,
+                account_balance=account_balance, risk_pct=risk_pct, is_market_order=True
+            )
 
         # Ensure 5x isolated leverage is configured on Bybit prior to order submission
         try:

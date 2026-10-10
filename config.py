@@ -10,7 +10,7 @@ logger = logging.getLogger("trading_agent")
 
 BYBIT_API_KEY = os.getenv("BYBIT_API_KEY")
 BYBIT_SECRET_KEY = os.getenv("BYBIT_SECRET_KEY")
-BYBIT_TESTNET = os.getenv("BYBIT_TESTNET", "true").lower() == "true"
+BYBIT_TESTNET = os.getenv("BYBIT_TESTNET", "false").lower() == "true"
 
 CONFIG_FILE = "config.json"
 if os.path.exists(CONFIG_FILE):
@@ -23,7 +23,6 @@ ACCOUNT_BALANCE = STRATEGY_CONFIG.get("account_balance", 100.0)
 RISK_PCT = STRATEGY_CONFIG.get("risk_pct", 1.0)
 LEVERAGE = STRATEGY_CONFIG.get("leverage", 5)
 ENABLE_LIVE_TRADING = STRATEGY_CONFIG.get("enable_live_trading", True)
-WATCHLIST = STRATEGY_CONFIG.get("watchlist", [])
 
 ALLOW_MAINNET_LIVE = os.getenv("ALLOW_MAINNET_LIVE", "false").lower() == "true"
 if not BYBIT_TESTNET and ENABLE_LIVE_TRADING and not ALLOW_MAINNET_LIVE:
