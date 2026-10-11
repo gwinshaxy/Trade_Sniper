@@ -796,26 +796,38 @@ class BybitFuturesLiveExecutor:
         # Ensure 5x isolated leverage is configured on Bybit prior to order submission
         try:
             self.exchange.set_margin_mode("isolated", ccxt_symbol, params={"category": "linear"})
-            self.exchange.set_leverage(int(leverage), ccxt_symbol, params={"category": "linear"})
+            self.exchange.set_leverage(
+                int(leverage), 
+                ccxt_symbol, 
+                params={
+                    "category": "linear", 
+                    "buyLeverage": str(int(leverage)), 
+                    "sellLeverage": str(int(leverage))
+                }
+            )
             logger.info(f"[{symbol}] Margin mode 'isolated' & leverage {int(leverage)}x enforced on Bybit.")
         except Exception as lev_err:
-            logger.error(f"[{symbol}] FAILED to enforce margin mode/leverage: {lev_err}")
-            try:
-                pos_check_pre = self.get_futures_position(ccxt_symbol)
-                actual_lev_pre = safe_float(pos_check_pre.get("leverage", 0), 0.0)
-                if actual_lev_pre and abs(actual_lev_pre - leverage) > 0.5:
+            # Gracefully handle Bybit error 110043 ("Set leverage has not been modified")
+            if "110043" in str(lev_err):
+                logger.info(f"[{symbol}] Leverage already set to {int(leverage)}x (Code 110043 acknowledged).")
+            else:
+                logger.error(f"[{symbol}] FAILED to enforce margin mode/leverage: {lev_err}")
+                try:
+                    pos_check_pre = self.get_futures_position(ccxt_symbol)
+                    actual_lev_pre = safe_float(pos_check_pre.get("leverage", 0), 0.0)
+                    if actual_lev_pre and abs(actual_lev_pre - leverage) > 0.5:
+                        return {
+                            "status": "FAILED",
+                            "error": (
+                                f"Leverage mismatch: requested {leverage}x, "
+                                f"exchange reports {actual_lev_pre}x. Order aborted."
+                            ),
+                        }
+                except Exception as verify_err:
                     return {
                         "status": "FAILED",
-                        "error": (
-                            f"Leverage mismatch: requested {leverage}x, "
-                            f"exchange reports {actual_lev_pre}x. Order aborted."
-                        ),
+                        "error": f"Could not verify leverage after failed set_leverage: {lev_err} | verify: {verify_err}",
                     }
-            except Exception as verify_err:
-                return {
-                    "status": "FAILED",
-                    "error": f"Could not verify leverage after failed set_leverage: {lev_err} | verify: {verify_err}",
-                }
 
         if stop_loss > 0 and abs(ref_price - stop_loss) > 0:
             risk_amount_usd = account_balance * (risk_pct / 100.0)
