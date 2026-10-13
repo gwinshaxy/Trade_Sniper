@@ -208,21 +208,26 @@ class DynamicTradeManager:
             if db_needs_update and trade_id is not None:
                 self._update_db_sl_tp(trade_id, current_sl, current_tp)
 
-            # ---- 1. Exchange closure check --------------------------------
-            if live_pos_info and not live_pos_info.get("error") and live_pos_info.get("contracts", 0.0) <= 0.001:
-                logger.warning(
-                    f"[{trade.get('pair')}] Trade #{trade_id} closed on exchange. "
-                    f"Finalizing directly via DynamicTradeManager."
-                )
-                finalized = self._finalize_closed_trade(trade, live_pos_info)
-                return {
-                    "action": "FINALIZED_CLOSED_TRADE" if finalized else "SYNC_CLOSED_FROM_EXCHANGE",
-                    "msg": (
-                        f"✅ Trade #{trade_id} finalized (dynamic manager)."
-                        if finalized
-                        else f"⚠️ Trade #{trade_id} closed but finalization failed; reconciler will retry."
-                    ),
-                }
+            # ---- 1. Exchange closure check (Bypassed in Paper Mode) ----
+            import os
+            from config import BYBIT_TESTNET
+            
+            is_paper_mode = os.getenv("ENABLE_PAPER_TRADING", "false").lower() == "true" or BYBIT_TESTNET
+            if not is_paper_mode:
+                if live_pos_info and not live_pos_info.get("error") and live_pos_info.get("contracts", 0.0) <= 0.001:
+                    logger.warning(
+                        f"[{trade.get('pair')}] Trade #{trade_id} closed on exchange. "
+                        f"Finalizing directly via DynamicTradeManager."
+                    )
+                    finalized = self._finalize_closed_trade(trade, live_pos_info)
+                    return {
+                        "action": "FINALIZED_CLOSED_TRADE" if finalized else "SYNC_CLOSED_FROM_EXCHANGE",
+                        "msg": (
+                            f"✅ Trade #{trade_id} finalized (dynamic manager)."
+                            if finalized
+                            else f"⚠️ Trade #{trade_id} closed but finalization failed; reconciler will retry."
+                        ),
+                    }
 
             # ---- 2. Progressive breakeven + trailing ---------------------
             if atr > 0:

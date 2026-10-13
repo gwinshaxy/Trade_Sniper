@@ -316,6 +316,12 @@ class PositionReconciler:
                     continue
 
                 live_contracts = safe_float(pos_info.get("contracts", 0))
+                
+                # ---- Paper Mode Bypass: Ignore zero exchange contracts in paper mode ----
+                is_paper_mode = os.getenv("ENABLE_PAPER_TRADING", "false").lower() == "true" or BYBIT_TESTNET
+                if is_paper_mode:
+                    # Skip zero-contract auto-closure/ghost-checks for virtual paper trades
+                    continue
 
                 # Handle missing or zero position on exchange
                 if live_contracts < DUST_THRESHOLD:

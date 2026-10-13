@@ -642,15 +642,19 @@ def normalize_symbol(symbol: str) -> str:
 
 SYMBOL_PARAMETER_DEFAULTS: Dict[str, Dict[str, Any]] = {
     # High Beta / Mid-Caps
-    "CAKE/USDT": {"adx_threshold": 25.0, "atr_mult": 3.5, "min_rr": 3.5},
-    "UNI/USDT":  {"adx_threshold": 24.0, "atr_mult": 3.2, "min_rr": 3.0},
+    "CAKE/USDT": {"adx_threshold": 23.0, "atr_mult": 4.0, "min_rr": 3.0},
+    "UNI/USDT":  {"adx_threshold": 23.0, "atr_mult": 4.0, "min_rr": 3.0},
     "SOL/USDT":  {"adx_threshold": 27.0, "atr_mult": 4.0, "min_rr": 3.5},
     "ARB/USDT":  {"adx_threshold": 23.0, "atr_mult": 3.2, "min_rr": 3.0},
+  
+    
+    # Optimized Settings for ONDO & LINK
+    "ONDO/USDT": {"adx_threshold": 22.0, "atr_mult": 3.5, "min_rr": 2.5},
+  
     
     # Mega-Caps & Lower Volatility Pairs
     "ETH/USDT":  {"adx_threshold": 28.0, "atr_mult": 4.2, "min_rr": 2.5, "zone_tolerance": 0.015},
     "BNB/USDT":  {"adx_threshold": 28.0, "atr_mult": 4.5, "min_rr": 2.5, "zone_tolerance": 0.015},
-    "AAVE/USDT": {"adx_threshold": 26.0, "atr_mult": 4.0, "min_rr": 3.0},
     "XRP/USDT":  {"adx_threshold": 27.0, "atr_mult": 4.0, "min_rr": 3.0},
 }
 
