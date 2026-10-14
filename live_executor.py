@@ -177,6 +177,9 @@ class BybitFuturesLiveExecutor:
         if BYBIT_TESTNET:
             self.exchange.set_sandbox_mode(True)
             self.public_exchange.set_sandbox_mode(True)
+        else:
+            self.exchange.set_sandbox_mode(False)
+            self.public_exchange.set_sandbox_mode(False)
 
         try:
             self.exchange.load_markets()
@@ -184,16 +187,22 @@ class BybitFuturesLiveExecutor:
         except Exception as e:
             logger.warning(f"Could not load market structures: {e}")
 
-        self.position_mode: Optional[str] = None
-        try:
-            acct_info = self.exchange.private_get_v5_account_info()
-            self.position_mode = (
-                acct_info.get("result", {}).get("positionMode")
-                if isinstance(acct_info, dict) else None
-            )
-            logger.info(f"Bybit account position mode detected: {self.position_mode}")
-        except Exception as e:
-            logger.warning(f"Could not determine account position mode at startup: {e}")
+        # Inside BybitFuturesLiveExecutor.__init__:
+        is_paper_mode = os.getenv("ENABLE_PAPER_TRADING", "false").lower() == "true"
+
+        self.position_mode = "MergedSingle"
+        if not is_paper_mode:
+            try:
+                acct_info = self.exchange.private_get_v5_account_info()
+                self.position_mode = (
+                    acct_info.get("result", {}).get("positionMode")
+                    if isinstance(acct_info, dict) else "MergedSingle"
+                )
+                logger.info(f"Bybit account position mode detected: {self.position_mode}")
+            except Exception as e:
+                logger.warning(f"Could not determine account position mode at startup: {e}")
+        else:
+            logger.info("Running in Keyless Paper Mode: Skipping private account initialization.")
 
     def resolve_symbol(self, symbol: str) -> str:
         """Helper method using self.exchange to resolve symbol dynamically."""
@@ -580,6 +589,13 @@ class BybitFuturesLiveExecutor:
         return await asyncio.to_thread(self.get_futures_position, symbol)
 
     def get_futures_position(self, symbol: str) -> Dict[str, Any]:
+        is_paper_mode = os.getenv("ENABLE_PAPER_TRADING", "false").lower() == "true"
+        if is_paper_mode:
+            return {
+                "symbol": symbol, "side": "NONE", "contracts": 0.0,
+                "entry_price": 0.0, "stop_loss": 0.0, "take_profit": 0.0,
+                "leverage": 1.0, "unrealized_pnl": 0.0, "error": False
+            }
         exchange_symbol = self.resolve_symbol(symbol)
 
         clean_target = symbol.replace("/", "").replace(":", "").replace("_", "").replace("-", "").upper()
@@ -628,6 +644,9 @@ class BybitFuturesLiveExecutor:
             }
 
     def fetch_available_usdt_balance(self) -> float:
+        is_paper_mode = os.getenv("ENABLE_PAPER_TRADING", "false").lower() == "true"
+        if is_paper_mode:
+            return float(os.getenv("ACCOUNT_BALANCE", 100.0))
         try:
             balance = self.exchange.fetch_balance({'type': 'linear'})
             usdt_free = safe_float(balance.get('USDT', {}).get('free', 0.0))
@@ -781,7 +800,7 @@ class BybitFuturesLiveExecutor:
             return {"status": "FAILED", "error": f"Spread too high ({spread_pct * 100:.3f}%)"}
 
         # Paper execution bypass if testnet or paper trading enabled
-        is_paper_mode = os.getenv("ENABLE_PAPER_TRADING", "false").lower() == "true" or BYBIT_TESTNET
+        is_paper_mode = os.getenv("ENABLE_PAPER_TRADING", "false").lower() == "true"
         if is_paper_mode:
             ticker_data_p = self.fetch_ticker_data(ccxt_symbol)
             ref_p = ticker_data_p["ask"] if (is_long and ticker_data_p["ask"] > 0) else ticker_data_p["bid"] if (not is_long and ticker_data_p["bid"] > 0) else ticker_data_p["exec_price"]

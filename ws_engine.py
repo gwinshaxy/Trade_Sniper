@@ -199,7 +199,8 @@ class UnifiedWebSocketEngine:
         ssl_context.check_hostname = False
         ssl_context.verify_mode = ssl.CERT_NONE
 
-        if self.api_key and self.api_secret:
+        is_paper_mode = os.getenv("ENABLE_PAPER_TRADING", "false").lower() == "true"
+        if self.api_key and self.api_secret and not is_paper_mode:
             asyncio.create_task(self.start_private_listener())
 
         retry_delay = 3

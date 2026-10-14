@@ -83,6 +83,10 @@ def check_active_or_pending_orders(executor: BybitFuturesLiveExecutor, ccxt_symb
     Filters out protective (SL/TP) orders.
     Only active entry orders suppress zero-contract counters.
     """
+    is_paper_mode = os.getenv("ENABLE_PAPER_TRADING", "false").lower() == "true" or BYBIT_TESTNET
+    if is_paper_mode:
+        return False
+
     try:
         open_orders = executor.exchange.fetch_open_orders(ccxt_symbol)
         for oo in open_orders:
@@ -118,6 +122,10 @@ def check_entry_order_never_filled(
     If the entry order was cancelled/rejected/expired without filling,
     returns the terminal status so the trade is marked CANCELLED instead of ghost-closed.
     """
+    is_paper_mode = os.getenv("ENABLE_PAPER_TRADING", "false").lower() == "true" or BYBIT_TESTNET
+    if is_paper_mode:
+        return None
+
     with reconciler_lock:
         cache_entry = ENTRY_ORDER_CACHE.get(trade_id)
 
@@ -173,6 +181,10 @@ def fetch_all_live_exchange_positions(executor: BybitFuturesLiveExecutor) -> Dic
     Fetches active positions directly from Bybit.
     Filters out stale records (>60s old) and reads stopLoss/takeProfit directly from raw payloads.
     """
+    is_paper_mode = os.getenv("ENABLE_PAPER_TRADING", "false").lower() == "true" or BYBIT_TESTNET
+    if is_paper_mode:
+        return {}
+
     active_positions = {}
     now_ms = int(time.time() * 1000)
     STALE_MS = 60_000

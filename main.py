@@ -364,7 +364,7 @@ async def main():
 
     ws_engine = UnifiedWebSocketEngine(
         symbols=WATCHLIST,
-        is_testnet=BYBIT_TESTNET,
+        is_testnet=False,
         api_key=BYBIT_API_KEY,
         api_secret=BYBIT_SECRET_KEY
     )

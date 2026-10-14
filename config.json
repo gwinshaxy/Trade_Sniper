@@ -38,5 +38,5 @@
   "use_equity_curve_filter": false,
   "eq_ma_period": 10,
   "reduced_risk_factor": 0.5,
-  "max_concurrent_positions": 4
+  "max_concurrent_positions": 5
 }
