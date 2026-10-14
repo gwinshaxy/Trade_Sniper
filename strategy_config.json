@@ -27,7 +27,7 @@
     "UNI/USDT",
 	"CAKE/USDT",
 	"SOL/USDT",
-    "DOGE/USDT"
+    "DOGE/USDT",
 	"AAVE/USDT"
   ],
   "use_mtf_tema_alignment": true,
