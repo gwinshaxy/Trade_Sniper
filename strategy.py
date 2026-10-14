@@ -649,9 +649,9 @@ SYMBOL_PARAMETER_DEFAULTS: Dict[str, Dict[str, Any]] = {
     "CAKE/USDT": {"adx_threshold": 23.0, "atr_mult": 4.0, "min_rr": 3.0, "zone_tolerance": 0.02},
     
     # Relaxed, higher-frequency settings for lagging/high-beta pairs
-    "SOL/USDT":  {"adx_threshold": 27.0, "atr_mult": 4.0, "min_rr": 3.5, "zone_tolerance": 0.02},
+    "SOL/USDT":  {"adx_threshold": 30.0, "atr_mult": 3.5, "min_rr": 3.5, "zone_tolerance": 0.015},
     "DOGE/USDT": {"adx_threshold": 25.0, "atr_mult": 2.5, "min_rr": 3.0, "zone_tolerance": 0.0075},
-    "ARB/USDT":  {"adx_threshold": 23.0, "atr_mult": 3.2, "min_rr": 3.0, "zone_tolerance": 0.015},
+    "AAVE/USDT":  {"adx_threshold": 30.0, "atr_mult": 3.8, "min_rr": 3.8, "zone_tolerance": 0.015},
   
     
     # Optimized Settings for ONDO & LINK
@@ -687,7 +687,7 @@ def load_symbol_config(symbol: str) -> Dict[str, Any]:
         "lookback_bars": 600,
         "vp_va_pct": 0.70, 
         "atr_period": 14, 
-        "atr_mult": 2.5,                  
+        "atr_mult": 3.5,                  
         "atr_long_period": 100, 
         "atr_ratio_thresh": 0.85,         
         "use_atr_sl": True, 

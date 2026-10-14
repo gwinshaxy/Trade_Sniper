@@ -17,7 +17,7 @@
   "atr_mult": 3.5,
   "min_rr": 3.5,
   "scan_interval_minutes": 60,
-  "alert_cooldown_hours": 4,
+  "alert_cooldown_hours": 2,
   "disable_htf": false,
   "enable_live_trading": true,
   "atr_ratio_thresh": 0.85,
@@ -28,6 +28,7 @@
 	"CAKE/USDT",
 	"SOL/USDT",
     "DOGE/USDT"
+	"AAVE/USDT"
   ],
   "use_mtf_tema_alignment": true,
   "htf_tema_period": 200,
