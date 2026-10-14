@@ -383,14 +383,17 @@ def check_ltf_confirmation(
     return False
 
 
-def check_volume_confirmation(df: pd.DataFrame, period: int = 20) -> bool:
+def check_volume_confirmation(df: pd.DataFrame, period: int = 20, volume_threshold_pct: float = 0.80) -> bool:
     if "volume" not in df.columns or len(df) < period:
         return True
 
     vol_sma = df['volume'].rolling(period).mean().iloc[-1]
     last_volume = df['volume'].iloc[-1]
 
-    return bool(last_volume > vol_sma)
+    if np.isnan(vol_sma) or vol_sma == 0:
+        return True
+
+    return bool(last_volume >= (vol_sma * volume_threshold_pct))
 
 
 def calculate_staged_targets(
@@ -641,21 +644,24 @@ def normalize_symbol(symbol: str) -> str:
 
 
 SYMBOL_PARAMETER_DEFAULTS: Dict[str, Dict[str, Any]] = {
-    # High Beta / Mid-Caps
-    "CAKE/USDT": {"adx_threshold": 23.0, "atr_mult": 4.0, "min_rr": 3.0},
-    "UNI/USDT":  {"adx_threshold": 23.0, "atr_mult": 4.0, "min_rr": 3.0},
-    "SOL/USDT":  {"adx_threshold": 27.0, "atr_mult": 4.0, "min_rr": 3.5},
-    "ARB/USDT":  {"adx_threshold": 23.0, "atr_mult": 3.2, "min_rr": 3.0},
+    # Strict, high-precision settings for top performers
+    "UNI/USDT":  {"adx_threshold": 23.0, "atr_mult": 4.0, "min_rr": 3.0, "zone_tolerance": 0.0075},
+    "CAKE/USDT": {"adx_threshold": 23.0, "atr_mult": 4.0, "min_rr": 3.0, "zone_tolerance": 0.02},
+    
+    # Relaxed, higher-frequency settings for lagging/high-beta pairs
+    "SOL/USDT":  {"adx_threshold": 27.0, "atr_mult": 4.0, "min_rr": 3.5, "zone_tolerance": 0.02},
+    "DOGE/USDT": {"adx_threshold": 25.0, "atr_mult": 2.5, "min_rr": 3.0, "zone_tolerance": 0.0075},
+    "ARB/USDT":  {"adx_threshold": 23.0, "atr_mult": 3.2, "min_rr": 3.0, "zone_tolerance": 0.015},
   
     
     # Optimized Settings for ONDO & LINK
-    "ONDO/USDT": {"adx_threshold": 22.0, "atr_mult": 3.5, "min_rr": 2.5},
+    "ONDO/USDT": {"adx_threshold": 22.0, "atr_mult": 3.5, "min_rr": 2.5, "zone_tolerance": 0.015},
   
     
     # Mega-Caps & Lower Volatility Pairs
-    "ETH/USDT":  {"adx_threshold": 28.0, "atr_mult": 4.2, "min_rr": 2.5, "zone_tolerance": 0.015},
-    "BNB/USDT":  {"adx_threshold": 28.0, "atr_mult": 4.5, "min_rr": 2.5, "zone_tolerance": 0.015},
-    "XRP/USDT":  {"adx_threshold": 27.0, "atr_mult": 4.0, "min_rr": 3.0},
+    "ETH/USDT":  {"adx_threshold": 28.0, "atr_mult": 2.5, "min_rr": 3.0, "zone_tolerance": 0.015},
+    
+    
 }
 
 
@@ -672,7 +678,7 @@ def load_symbol_config(symbol: str) -> Dict[str, Any]:
         "use_adx_filter": True, 
         "use_rsi_filter": True, 
         "use_candlestick_confirm": True,
-        "zone_tolerance": 0.0075,           
+        "zone_tolerance": 0.015,           
         "max_sl_pct": 0.02, 
         "min_sentiment": 0.0,
         "min_rr": 3.5,                    
