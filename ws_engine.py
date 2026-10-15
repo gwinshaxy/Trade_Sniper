@@ -234,6 +234,11 @@ class UnifiedWebSocketEngine:
 
                             if last_price > 0:
                                 self.last_prices[symbol] = last_price
+                                
+                                # ---- FIX 2 & 3 Integration: Instant Paper OCO & Tick Dispatch ----
+                                from live_executor import evaluate_paper_oco_tick
+                                evaluate_paper_oco_tick(symbol, last_price)
+
                                 await event_bus.publish("TICKER_UPDATE", {
                                     "symbol": symbol,
                                     "price": last_price

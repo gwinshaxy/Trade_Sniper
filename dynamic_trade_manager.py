@@ -208,11 +208,53 @@ class DynamicTradeManager:
             if db_needs_update and trade_id is not None:
                 self._update_db_sl_tp(trade_id, current_sl, current_tp)
 
-            # ---- 1. Exchange closure check (Bypassed in Paper Mode) ----
+            # ---- 1. Exchange closure check & Paper Mode Intra-Candle SL/TP Inspection ----
             import os
             from config import BYBIT_TESTNET
             
             is_paper_mode = os.getenv("ENABLE_PAPER_TRADING", "false").lower() == "true" or BYBIT_TESTNET
+            
+            # Intra-candle SL / TP breach check for Paper Mode or strict evaluation ticks
+            if current_sl > 0 or current_tp > 0:
+                if is_long:
+                    hit_sl = low_price <= current_sl if current_sl > 0 else False
+                    hit_tp = high_price >= current_tp if current_tp > 0 else False
+                else:
+                    hit_sl = high_price >= current_sl if current_sl > 0 else False
+                    hit_tp = low_price <= current_tp if current_tp > 0 else False
+
+                if hit_sl or hit_tp:
+                    outcome_reason = "STOP_LOSS" if hit_sl and not hit_tp else ("TAKE_PROFIT" if hit_tp and not hit_sl else "SL_TP_BREACH")
+                    logger.warning(
+                        f"[{trade.get('pair')}] Trade #{trade_id} intra-candle price breach detected "
+                        f"(Low: ${low_price:.5f}, High: ${high_price:.5f}) hitting {outcome_reason}. "
+                        f"Triggering virtual closure."
+                    )
+                    exit_price = current_sl if hit_sl else current_tp
+                    position_size = self._safe_float(trade.get("position_size"))
+                    account_balance = self._safe_float(trade.get("account_balance"), 100.0)
+                    
+                    pnl_usd, pnl_pct, outcome = calculate_pnl(
+                        direction=direction,
+                        entry_price=entry_price,
+                        current_price=exit_price,
+                        quantity=position_size,
+                        account_balance=account_balance,
+                        total_fees=(entry_price * position_size * 0.00055) + (exit_price * position_size * 0.00055),
+                    )
+                    finalize_trade_in_db(
+                        trade_id=trade_id,
+                        exit_price=exit_price,
+                        pnl_usd=pnl_usd,
+                        pnl_pct=pnl_pct,
+                        outcome="WIN" if pnl_usd > 0 else "LOSS",
+                        fee_usd=(entry_price * position_size * 0.00055) + (exit_price * position_size * 0.00055),
+                    )
+                    return {
+                        "action": "FINALIZED_CLOSED_TRADE",
+                        "msg": f"✅ Virtual Trade #{trade_id} closed via intra-candle {outcome_reason} @ ${exit_price:.5f}"
+                    }
+
             if not is_paper_mode:
                 if live_pos_info and not live_pos_info.get("error") and live_pos_info.get("contracts", 0.0) <= 0.001:
                     logger.warning(

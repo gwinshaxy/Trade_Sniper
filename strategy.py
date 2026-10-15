@@ -655,12 +655,12 @@ SYMBOL_PARAMETER_DEFAULTS: Dict[str, Dict[str, Any]] = {
   
     
     # Optimized Settings for ONDO & LINK
-    "ONDO/USDT": {"adx_threshold": 22.0, "atr_mult": 3.5, "min_rr": 2.5, "zone_tolerance": 0.015},
-  
+    "ONDO/USDT": {"adx_threshold": 22.0, "atr_mult": 3.5, "min_rr": 2.8, "zone_tolerance": 0.0075},
+    "JUP/USDT":  {"adx_threshold": 23.0, "atr_mult": 4.0, "min_rr": 3.0, "zone_tolerance": 0.0075},
     
     # Mega-Caps & Lower Volatility Pairs
-    "ETH/USDT":  {"adx_threshold": 28.0, "atr_mult": 2.5, "min_rr": 3.0, "zone_tolerance": 0.015},
-    
+    "ETH/USDT":  {"adx_threshold": 30.0, "atr_mult": 2.7, "min_rr": 3.0, "zone_tolerance": 0.0075},
+    "XRP/USDT":  {"adx_threshold": 25.0, "atr_mult": 2.5, "min_rr": 3.0, "zone_tolerance": 0.0075},
     
 }
 

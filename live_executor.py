@@ -49,6 +49,9 @@ def safe_float(val: Any, default: float = 0.0) -> float:
         return default
 
 
+# Global dictionary to track active virtual paper OCO orders across tick callbacks
+PAPER_OCO_REGISTRY: Dict[str, Dict[str, Any]] = {}
+
 def execute_virtual_paper_trade(
     symbol: str, 
     direction: str, 
@@ -62,7 +65,7 @@ def execute_virtual_paper_trade(
 ) -> dict:
     """
     Simulates paper execution using Mainnet WebSocket prices, 
-    injecting 1-2 ticks of adverse slippage and subtracting maker/taker fees (0.02% / 0.055%).
+    injecting 1-2 ticks of adverse slippage, subtracting fees, and registering OCO brackets.
     """
     dir_clean = direction.upper()
     is_long = dir_clean in ["BUY", "LONG"]
@@ -82,15 +85,90 @@ def execute_virtual_paper_trade(
     
     fee_rate = 0.00055 if is_market_order else 0.0002
     entry_fee = fill_price * position_size * fee_rate
-    
+    order_id = f"paper_{int(time.time())}"
+
+    # Register simulated OCO bracket for real-time WebSocket tick evaluation
+    if stop_loss > 0 or take_profit > 0:
+        PAPER_OCO_REGISTRY[symbol] = {
+            "order_id": order_id,
+            "direction": dir_clean,
+            "is_long": is_long,
+            "entry_price": fill_price,
+            "position_size": position_size,
+            "stop_loss": stop_loss,
+            "take_profit": take_profit,
+            "account_balance": account_balance,
+            "created_at": time.time()
+        }
+        logger.info(f"[{symbol}] [PAPER OCO] Registered simulated bracket -> SL: ${stop_loss} | TP: ${take_profit}")
+
     return {
         "status": "SUCCESS",
         "fill_price": round(fill_price, 5),
         "executed_qty": round(position_size, 6),
         "stop_loss_attached": True,
         "estimated_fee": round(entry_fee, 4),
-        "order_id": f"paper_{int(time.time())}"
+        "order_id": order_id
     }
+
+
+def evaluate_paper_oco_tick(symbol: str, current_tick_price: float):
+    """
+    Evaluates real-time WebSocket tick prices against active virtual paper OCO orders.
+    Triggers automatic closure if Stop Loss or Take Profit thresholds are breached.
+    """
+    if symbol not in PAPER_OCO_REGISTRY:
+        return
+    
+    pos = PAPER_OCO_REGISTRY[symbol]
+    is_long = pos["is_long"]
+    sl = pos["stop_loss"]
+    tp = pos["take_profit"]
+    
+    hit_sl = (is_long and sl > 0 and current_tick_price <= sl) or (not is_long and sl > 0 and current_tick_price >= sl)
+    hit_tp = (is_long and tp > 0 and current_tick_price >= tp) or (not is_long and tp > 0 and current_tick_price <= tp)
+    
+    if hit_sl or hit_tp:
+        exit_price = sl if hit_sl else tp
+        outcome_type = "STOP_LOSS" if hit_sl else "TAKE_PROFIT"
+        logger.info(f"[{symbol}] ⚡ [PAPER OCO TRIGGERED] Price ${current_tick_price} breached {outcome_type} (${exit_price}). Closing virtual position.")
+        
+        # Cleanup registry entry
+        del PAPER_OCO_REGISTRY[symbol]
+        
+        # Finalize trade state in DB
+        conn = get_db_connection()
+        if conn:
+            try:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        SELECT id FROM trade_setups 
+                        WHERE UPPER(REPLACE(REPLACE(pair, '/', ''), '_', '')) = %s 
+                          AND trade_state IN ('OPEN', 'EXECUTED', 'BE_LOCKED', 'TRAILING')
+                        ORDER BY id DESC LIMIT 1;
+                    """, (symbol.replace("/", "").upper(),))
+                    row = cur.fetchone()
+                    if row:
+                        trade_id = row[0]
+                        pnl_usd, pnl_pct, outcome = calculate_pnl(
+                            direction=pos["direction"],
+                            entry_price=pos["entry_price"],
+                            current_price=exit_price,
+                            quantity=pos["position_size"],
+                            account_balance=pos["account_balance"],
+                            total_fees=pos["entry_price"] * pos["position_size"] * 0.00055 * 2
+                        )
+                        finalize_trade_in_db(
+                            trade_id=trade_id,
+                            exit_price=exit_price,
+                            pnl_usd=pnl_usd,
+                            pnl_pct=pnl_pct,
+                            outcome="WIN" if pnl_usd > 0 else "LOSS"
+                        )
+            except Exception as e:
+                logger.error(f"Failed to finalize paper OCO trade in DB: {e}")
+            finally:
+                release_db_connection(conn)
 
 
 def resolve_and_verify_symbol(exchange: ccxt.Exchange, base_symbol: str, quote_symbol: str = "USDT") -> str:
