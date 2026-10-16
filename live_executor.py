@@ -453,7 +453,20 @@ class BybitFuturesLiveExecutor:
         position_idx: Optional[int] = None,
         direction: str = "",
     ) -> bool:
+        # Paper mode bypass
+        is_paper_mode = os.getenv("ENABLE_PAPER_TRADING", "false").lower() == "true"
+        if is_paper_mode:
+            logger.info(f"[{symbol}] Paper mode active: Simulating trading stop attachment.")
+            return True
+
         try:
+            # Ensure CCXT markets are loaded before price formatting
+            if not self.exchange.markets:
+                try:
+                    self.exchange.load_markets(True)
+                except Exception as load_err:
+                    logger.warning(f"Failed to load CCXT markets on demand: {load_err}")
+
             ccxt_symbol = self.format_ccxt_futures_symbol(symbol)
             
             exchange_symbol = ccxt_symbol
@@ -986,6 +999,8 @@ class BybitFuturesLiveExecutor:
             params = {"timeInForce": "IOC"}
 
         try:
+            if not self.exchange.markets:
+                self.exchange.load_markets(True)
             formatted_qty = safe_float(self.exchange.amount_to_precision(ccxt_symbol, raw_qty))
             formatted_limit_price = safe_float(
                 self.exchange.price_to_precision(ccxt_symbol, limit_price)
