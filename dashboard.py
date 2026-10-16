@@ -186,13 +186,17 @@ run_startup_db_maintenance()
 
 @st.cache_data(ttl=5, max_entries=20)
 def fetch_trades_from_db(db_url: str) -> pd.DataFrame:
-    if not db_url:
+    conn = get_db_connection()
+    if not conn:
         return pd.DataFrame()
     try:
-        return pd.read_sql("SELECT * FROM trade_setups ORDER BY id DESC;", db_url)
+        df = pd.read_sql_query("SELECT * FROM trade_setups ORDER BY id DESC;", conn)
+        return df
     except Exception as db_err:
         logger.error(f"Error fetching trade records: {db_err}")
         return pd.DataFrame()
+    finally:
+        release_db_connection(conn)
 
 df_all_trades = fetch_trades_from_db(database_url)
 
