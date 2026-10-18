@@ -32,7 +32,7 @@ EXPECTED_MEXC_COLUMNS = [
 # ---------------------------------------------------------------------------
 EXECUTION_TIMEFRAME = "1h"       # Signal generation / entry timeframe
 MACRO_TIMEFRAME = "4h"           # HTF confluence timeframe
-HTF_TEMA_PERIOD = 200            # TEMA period for 4H macro trend
+HTF_TEMA_PERIOD = 100            # TEMA period for 4H macro trend
 
 
 # ---------------------------------------------------------------------------
@@ -845,6 +845,10 @@ def evaluate_signals(
     macro_trend_long = True
     macro_trend_short = True
 
+    # HTF Macro Confluence Logic (Fail-Safe: Default to False if data is missing/insufficient)
+    macro_trend_long = False
+    macro_trend_short = False
+
     if not disable_htf:
         try:
             if "macro_long" in df.columns and "macro_short" in df.columns:
@@ -862,19 +866,24 @@ def evaluate_signals(
                         'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'volume': 'sum'
                     }).dropna().reset_index()
 
-                    if not df_htf.empty and len(df_htf) >= HTF_TEMA_PERIOD + 2:
+                    if not df_htf.empty and len(df_htf) >= HTF_TEMA_PERIOD + 1:
                         df_htf["tema_htf"] = calculate_tema(df_htf["close"], HTF_TEMA_PERIOD)
                         
-                        htf_close_last = float(df_htf.iloc[-2]["close"])
-                        htf_tema_last = float(df_htf.iloc[-2]["tema_htf"])
-                        htf_tema_prev = float(df_htf.iloc[-3]["tema_htf"])
+                        # Reference iloc[-1] for the most recently completed 4H candle and iloc[-2] for prior bar
+                        htf_close_last = float(df_htf.iloc[-1]["close"])
+                        htf_tema_last = float(df_htf.iloc[-1]["tema_htf"])
+                        htf_tema_prev = float(df_htf.iloc[-2]["tema_htf"])
 
-                        macro_trend_long = (htf_close_last > htf_tema_last) and (htf_tema_last > htf_tema_prev)
-                        macro_trend_short = (htf_close_last < htf_tema_last) and (htf_tema_last < htf_tema_prev)
+                        macro_trend_long = (htf_close_last > htf_tema_last) and (htf_tema_last >= htf_tema_prev)
+                        macro_trend_short = (htf_close_last < htf_tema_last) and (htf_tema_last <= htf_tema_prev)
+                    else:
+                        logger.warning(f"[{symbol}] Insufficient 4H resampled bars ({len(df_htf)}) for HTF TEMA calculation. Macro trend defaulted to False.")
                 else:
                     logger.warning(f"[{symbol}] 'timestamp' column missing for HTF resampling.")
         except Exception as e:
             logger.warning(f"[{symbol}] Could not calculate HTF macro confluence: {e}")
+            macro_trend_long = False
+            macro_trend_short = False
 
     vp_data = calculate_volume_profile_gaps(
         df,

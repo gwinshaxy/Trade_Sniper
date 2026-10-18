@@ -32,7 +32,7 @@
 	"ONDO/USDT"
   ],
   "use_mtf_tema_alignment": true,
-  "htf_tema_period": 200,
+  "htf_tema_period": 100,
   "htf_alignment_mode": "TEMA Slope",
   "use_adaptive_atr_trail": true,
   "atr_trail_mult": 1.8,

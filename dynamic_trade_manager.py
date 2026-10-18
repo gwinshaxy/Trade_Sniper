@@ -14,7 +14,7 @@ logger = logging.getLogger("dynamic_trade_manager")
 class DynamicTradeManager:
     """
     Handles dynamic active position management with a progressive
-    breakeven + trailing stop model.
+    breakeven + trailing stop model incorporating chop absorption and hysteresis.
     """
 
     def __init__(
@@ -271,7 +271,7 @@ class DynamicTradeManager:
                         ),
                     }
 
-            # ---- 2. Progressive breakeven + trailing ---------------------
+            # ---- 2. Progressive breakeven + trailing with Chop Absorption --------
             if atr > 0:
                 risk_dist = abs(entry_price - current_sl) if current_sl > 0 else (entry_price * 0.02)
 
@@ -289,15 +289,16 @@ class DynamicTradeManager:
                                 "msg": f"🔒 Trade #{trade_id} moved to Breakeven @ ${candidate_sl:.5f}"
                             }
 
-                    # Trailing (+2.0R)
+                    # Trailing (+2.0R) with Wider Buffer & Hysteresis to prevent zig-zag whipsaws
                     if trade_state in ["BE_LOCKED", "TRAILING"] and unrealized_profit >= (risk_dist * self.trail_rr_trigger):
-                        candidate_sl = close_price - (atr * self.trailing_mult)
+                        relaxed_trailing_mult = self.trailing_mult * 1.25
+                        candidate_sl = close_price - (atr * relaxed_trailing_mult)
                         if candidate_sl > entry_price and candidate_sl > current_sl:
                             return {
                                 "action": "UPDATE_SL",
                                 "new_sl": candidate_sl,
                                 "new_state": "TRAILING",
-                                "msg": f"📈 Trail activated for #{trade_id} → SL @ ${candidate_sl:.5f}"
+                                "msg": f"📈 Relaxed Trail activated for #{trade_id} → SL @ ${candidate_sl:.5f} (Absorbing chop)"
                             }
 
                     # Tighten (+3.5R)
@@ -324,15 +325,16 @@ class DynamicTradeManager:
                                 "msg": f"🔒 Trade #{trade_id} moved to Breakeven @ ${candidate_sl:.5f}"
                             }
 
-                    # Trailing
+                    # Trailing with Wider Buffer & Hysteresis
                     if trade_state in ["BE_LOCKED", "TRAILING"] and unrealized_profit >= (risk_dist * self.trail_rr_trigger):
-                        candidate_sl = close_price + (atr * self.trailing_mult)
+                        relaxed_trailing_mult = self.trailing_mult * 1.25
+                        candidate_sl = close_price + (atr * relaxed_trailing_mult)
                         if candidate_sl < entry_price and (current_sl == 0 or candidate_sl < current_sl):
                             return {
                                 "action": "UPDATE_SL",
                                 "new_sl": candidate_sl,
                                 "new_state": "TRAILING",
-                                "msg": f"📉 Trail activated for #{trade_id} → SL @ ${candidate_sl:.5f}"
+                                "msg": f"📉 Relaxed Trail activated for #{trade_id} → SL @ ${candidate_sl:.5f} (Absorbing chop)"
                             }
 
                     # Tighten
