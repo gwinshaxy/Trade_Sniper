@@ -651,7 +651,7 @@ SYMBOL_PARAMETER_DEFAULTS: Dict[str, Dict[str, Any]] = {
     # Relaxed, higher-frequency settings for lagging/high-beta pairs
     "SOL/USDT":  {"adx_threshold": 30.0, "atr_mult": 3.5, "min_rr": 3.5, "zone_tolerance": 0.015},
     "DOGE/USDT": {"adx_threshold": 25.0, "atr_mult": 2.5, "min_rr": 3.0, "zone_tolerance": 0.0075},
-    "AAVE/USDT":  {"adx_threshold": 30.0, "atr_mult": 3.8, "min_rr": 3.8, "zone_tolerance": 0.015},
+    "AAVE/USDT":  {"adx_threshold": 30.0, "atr_mult": 3.8, "min_rr": 3.5, "zone_tolerance": 0.015},
   
     
     # Optimized Settings for ONDO & LINK
@@ -841,9 +841,6 @@ def evaluate_signals(
     effective_adx_threshold = float(adx_threshold)
     market_regime = determine_market_regime(current_adx, adx_threshold=effective_adx_threshold)
 
-    # HTF Macro Confluence Logic
-    macro_trend_long = True
-    macro_trend_short = True
 
     # HTF Macro Confluence Logic (Fail-Safe: Default to False if data is missing/insufficient)
     macro_trend_long = False
@@ -913,6 +910,13 @@ def evaluate_signals(
         and (overhead_gaps[0] - current_price) / current_price <= zone_tolerance
     )
 
+    # Directional Approach Vectors
+    approaching_val_from_top = (not np.isnan(val)) and near_val and (float(prev_row["close"]) >= val)
+    approaching_vah_from_under = (not np.isnan(vah)) and near_vah and (float(prev_row["close"]) <= vah)
+
+    long_zone_ok = near_tema or approaching_val_from_top or near_gap_support
+    short_zone_ok = near_tema or approaching_vah_from_under or near_gap_resistance
+
     # -----------------------------------------------------------------------
     # REGIME 1: TRENDING STRATEGY
     # -----------------------------------------------------------------------
@@ -925,7 +929,7 @@ def evaluate_signals(
             )
 
         long_rsi_valid = (not use_rsi_filter) or (current_rsi >= rsi_thresh)
-        long_zone_ok = near_tema or near_val or near_gap_support
+        #long_zone_ok = near_tema or near_val or near_gap_support
 
         if (
             (current_price > current_tema)
@@ -1004,7 +1008,7 @@ def evaluate_signals(
                 )
 
             short_rsi_valid = (not use_rsi_filter) or (current_rsi <= (100.0 - rsi_thresh))
-            short_zone_ok = near_tema or near_vah or near_gap_resistance
+            #short_zone_ok = near_tema or near_vah or near_gap_resistance
 
             if (
                 (current_price < current_tema)
