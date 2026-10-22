@@ -234,9 +234,14 @@ def format_ccxt_futures_symbol(symbol: str, exchange: Optional[ccxt.Exchange] = 
 class BybitFuturesLiveExecutor:
     def __init__(self, config: Optional[Dict[str, Any]] = None):
         self.config = config or {}
+        
+        is_paper_mode = os.getenv("ENABLE_PAPER_TRADING", "false").lower() == "true"
+        api_key = "" if is_paper_mode else BYBIT_API_KEY
+        secret_key = "" if is_paper_mode else BYBIT_SECRET_KEY
+
         self.exchange = ccxt.bybit({
-            'apiKey': BYBIT_API_KEY,
-            'secret': BYBIT_SECRET_KEY,
+            'apiKey': api_key,
+            'secret': secret_key,
             'enableRateLimit': True,
             'options': {
                 'defaultType': 'linear',

@@ -11,7 +11,7 @@ try:
 except ImportError:
     STRATEGY_CONFIG = {}
 
-DEFAULT_COOLDOWN_HOURS = STRATEGY_CONFIG.get("alert_cooldown_hours", 2)
+DEFAULT_COOLDOWN_HOURS = STRATEGY_CONFIG.get("alert_cooldown_hours", 4)
 
 base_dir = os.path.dirname(os.path.abspath(__file__))
 env_path = os.path.join(base_dir, ".env")
