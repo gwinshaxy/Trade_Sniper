@@ -356,7 +356,7 @@ def load_symbol_config(symbol: str) -> Dict[str, Any]:
         "adx_period": 14,
         "min_adx": 20.0,             # <--- Added ADX trend strength threshold
         "zone_tolerance": 0.02,
-        "volume_multiplier": 0.2,
+        "volume_multiplier": 0.75,
         "max_sl_pct": 0.03,
         "min_rr": 3.0,
         "risk_pct": 1.0,

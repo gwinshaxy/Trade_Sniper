@@ -23,7 +23,7 @@
   "enable_live_trading": true,
   "atr_ratio_thresh": 0.85,
   "zone_tolerance": 0.02,
-  "volume_multiplier": 0.2,
+  "volume_multiplier": 0.75,
   "lookback_bars": 600,
   "watchlist": [
     "UNI/USDT",
