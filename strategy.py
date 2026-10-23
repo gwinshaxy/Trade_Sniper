@@ -154,7 +154,7 @@ def check_candlestick_rejection(last_row: pd.Series, prev_row: pd.Series, direct
     return False
 
 
-def check_volume_spike(df: pd.DataFrame, period: int = 20, multiplier: float = 1.0) -> bool:
+def check_volume_spike(df: pd.DataFrame, period: int = 20, multiplier: float = 0.95) -> bool:
     """Verifies that trigger candle volume exceeds the N-period volume SMA."""
     if "volume" not in df.columns or len(df) < period:
         return True
@@ -315,28 +315,6 @@ def calculate_volume_profile_gaps(df: pd.DataFrame, num_bins: int = 100, lookbac
         "underneath_gaps": sorted([g for g in unique_gaps if g < current_price], reverse=True)
     }
 
-def calculate_adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
-    if df.empty or len(df) < period + 1:
-        return pd.Series(25.0, index=df.index)
-    
-    high, low, close = df["high"], df["low"], df["close"]
-    plus_dm = high.diff()
-    minus_dm = low.diff()
-    
-    plus_dm = np.where((plus_dm > minus_dm) & (plus_dm > 0), plus_dm, 0.0)
-    minus_dm = np.where((minus_dm > plus_dm) & (minus_dm > 0), minus_dm, 0.0)
-    
-    plus_dm_s = pd.Series(plus_dm, index=df.index)
-    minus_dm_s = pd.Series(minus_dm, index=df.index)
-    
-    tr = pd.concat([high - low, (high - close.shift(1)).abs(), (low - close.shift(1)).abs()], axis=1).max(axis=1)
-    atr = tr.ewm(alpha=1.0/period, adjust=False).mean()
-    
-    plus_di = 100 * (plus_dm_s.ewm(alpha=1.0/period, adjust=False).mean() / atr.replace(0, np.nan))
-    minus_di = 100 * (minus_dm_s.ewm(alpha=1.0/period, adjust=False).mean() / atr.replace(0, np.nan))
-    
-    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
-    return dx.ewm(alpha=1.0/period, adjust=False).mean().fillna(25.0)
 
 # ---------------------------------------------------------------------------
 # 5. SYMBOL CONFIGURATION & 200 TEMA DEFAULTS
@@ -350,13 +328,16 @@ def normalize_symbol(symbol: str) -> str:
 
 
 def load_symbol_config(symbol: str) -> Dict[str, Any]:
-    return {
+    norm_symbol = normalize_symbol(symbol)
+    
+    # Baseline configuration
+    base_config = {
         "tema_period": 200,
         "rsi_period": 14,
         "adx_period": 14,
-        "min_adx": 20.0,             # <--- Added ADX trend strength threshold
-        "zone_tolerance": 0.02,
-        "volume_multiplier": 0.75,
+        "min_adx": 15.0,
+        "zone_tolerance": 0.015,
+        "volume_multiplier": 0.95,
         "max_sl_pct": 0.03,
         "min_rr": 3.0,
         "risk_pct": 1.0,
@@ -366,6 +347,21 @@ def load_symbol_config(symbol: str) -> Dict[str, Any]:
         "spot_only": False,
         "leverage": 5
     }
+
+    # Asset-specific parameter tuning based on sweep diagnostics
+    asset_overrides = {
+        "SOL/USDT": {"zone_tolerance": 0.015, "volume_multiplier": 0.95},
+        "UNI/USDT": {"zone_tolerance": 0.02, "volume_multiplier": 1.0},
+        "NEAR/USDT": {"zone_tolerance": 0.02, "volume_multiplier": 1.0},
+        "JUP/USDT": {"zone_tolerance": 0.02, "volume_multiplier": 0.85},
+        "ARB/USDT": {"zone_tolerance": 0.015, "volume_multiplier": 0.95},
+        "MAGMA/USDT": {"zone_tolerance": 0.02, "volume_multiplier": 1.0}
+    }
+
+    if norm_symbol in asset_overrides:
+        base_config.update(asset_overrides[norm_symbol])
+
+    return base_config
 
 
 # ---------------------------------------------------------------------------
@@ -377,12 +373,11 @@ def evaluate_signals(
     symbol: str,
     account_balance: float = 100.0,
     tema_period: int = 200,
-    zone_tolerance: float = 0.02,
+    zone_tolerance: float = 0.015,
     min_rr: float = 3.0,
     risk_pct: float = 1.0,
     atr_period: int = 14,
     atr_mult: float = 3.0,
-    min_adx: Optional[float] = None,       # <--- Accept min_adx explicitly
     spot_only: bool = False,
     sentiment_score: Optional[float] = None,
     is_backtest: bool = False,
@@ -396,7 +391,7 @@ def evaluate_signals(
     }
 
     sym_cfg = load_symbol_config(symbol)
-    volume_mult = float(sym_cfg.get("volume_multiplier", 0.75))
+    volume_mult = float(sym_cfg.get("volume_multiplier", 0.95))
     
     # Requirement 5: Volume Spike Check using configurable multiplier
     if not check_volume_spike(df, period=20, multiplier=volume_mult):
@@ -407,21 +402,12 @@ def evaluate_signals(
     df = df.copy()
     df["tema"] = calculate_tema(df["close"], tema_period)
     df["atr"] = calculate_atr(df, atr_period)
-    df["adx"] = calculate_adx(df, period=int(sym_cfg.get("adx_period", 14)))
 
     last_row = df.iloc[-1]
     prev_row = df.iloc[-2]
     current_price = float(last_row["close"])
     current_tema = float(last_row["tema"])
     current_atr = float(last_row["atr"])
-    current_adx = float(last_row["adx"])
-
-    # Single Unified ADX Threshold Check
-    adx_threshold = float(min_adx if min_adx is not None else kwargs.get("min_adx", sym_cfg.get("min_adx", 20.0)))
-
-    if current_adx < adx_threshold:
-        no_signal["reason"] = f"ADX Gate: Trend strength ({current_adx:.1f}) below minimum threshold ({adx_threshold})"
-        return no_signal
 
     vp_data = calculate_volume_profile_gaps(df, lookback_bars=500)
     poc, vah, val = vp_data["poc"], vp_data["vah"], vp_data["val"]
