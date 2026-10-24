@@ -12,7 +12,7 @@
   "use_adx_filter": true,
   "rsi_thresh": 45.0,
   "rsi_period": 14,
-  "max_sl_pct": 0.02,
+  "max_sl_pct": 0.6,
   "min_atr_pct": 0.2,
   "atr_mult_sl": 3.5,
   "atr_mult": 3.0,

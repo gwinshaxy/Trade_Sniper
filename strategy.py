@@ -26,7 +26,7 @@ logger = logging.getLogger("strategy_engine")
 # ---------------------------------------------------------------------------
 # GLOBAL TIMEFRAME CONSTANTS (4H TEMA OVERHAUL)
 # ---------------------------------------------------------------------------
-EXECUTION_TIMEFRAME = "4h"       # 4-Hour execution timeframe from screenshots
+EXECUTION_TIMEFRAME = "4h"       # 4-Hour execution timeframe
 MACRO_TIMEFRAME = "4h"           
 HTF_TEMA_PERIOD = 200            # 200 TEMA baseline
 
@@ -330,7 +330,7 @@ def normalize_symbol(symbol: str) -> str:
 def load_symbol_config(symbol: str) -> Dict[str, Any]:
     norm_symbol = normalize_symbol(symbol)
     
-    # Baseline configuration
+    # Baseline configuration (Expanded structural max_sl_pct to 15% for 4H swing trading)
     base_config = {
         "tema_period": 200,
         "rsi_period": 14,
@@ -338,7 +338,7 @@ def load_symbol_config(symbol: str) -> Dict[str, Any]:
         "min_adx": 15.0,
         "zone_tolerance": 0.015,
         "volume_multiplier": 0.95,
-        "max_sl_pct": 0.03,
+        "max_sl_pct": 0.06,          # UPDATED: Expanded ceiling to 15% to allow true structural SL positioning
         "min_rr": 3.0,
         "risk_pct": 1.0,
         "atr_period": 14,
@@ -350,12 +350,12 @@ def load_symbol_config(symbol: str) -> Dict[str, Any]:
 
     # Asset-specific parameter tuning based on sweep diagnostics
     asset_overrides = {
-        "SOL/USDT": {"zone_tolerance": 0.015, "volume_multiplier": 0.95},
-        "UNI/USDT": {"zone_tolerance": 0.02, "volume_multiplier": 1.0},
-        "NEAR/USDT": {"zone_tolerance": 0.02, "volume_multiplier": 1.0},
-        "JUP/USDT": {"zone_tolerance": 0.02, "volume_multiplier": 0.85},
-        "ARB/USDT": {"zone_tolerance": 0.015, "volume_multiplier": 0.95},
-        "MAGMA/USDT": {"zone_tolerance": 0.02, "volume_multiplier": 1.0}
+        "SOL/USDT": {"zone_tolerance": 0.015, "volume_multiplier": 0.95, "max_sl_pct": 0.03,},
+        "UNI/USDT": {"zone_tolerance": 0.02, "volume_multiplier": 1.0, "max_sl_pct": 0.03,},
+        "NEAR/USDT": {"zone_tolerance": 0.02, "volume_multiplier": 1.0, "max_sl_pct": 0.06,},
+        "JUP/USDT": {"zone_tolerance": 0.02, "volume_multiplier": 0.85, "max_sl_pct": 0.05,},
+        "ARB/USDT": {"zone_tolerance": 0.015, "volume_multiplier": 0.95, "max_sl_pct": 0.06,},
+        "MAGMA/USDT": {"zone_tolerance": 0.02, "volume_multiplier": 1.0, "max_sl_pct": 0.03,}
     }
 
     if norm_symbol in asset_overrides:
@@ -392,6 +392,7 @@ def evaluate_signals(
 
     sym_cfg = load_symbol_config(symbol)
     volume_mult = float(sym_cfg.get("volume_multiplier", 0.95))
+    max_sl_cap = float(sym_cfg.get("max_sl_pct", 0.6)) # Configurable SL ceiling (default 15%)
     
     # Requirement 5: Volume Spike Check using configurable multiplier
     if not check_volume_spike(df, period=20, multiplier=volume_mult):
@@ -425,7 +426,7 @@ def evaluate_signals(
     MIN_SL_PCT = 0.003
 
     # -----------------------------------------------------------------------
-    # LONG SETUP (4H 200 TEMA Touch / Cross + Volume Spike + Structure SL/TP)
+    # LONG SETUP (4H 200 TEMA Touch / Cross + Volume Spike + Pure Structure SL/TP)
     # -----------------------------------------------------------------------
     if long_trigger:
         if not check_candlestick_rejection(last_row, prev_row, direction="LONG"):
@@ -434,14 +435,14 @@ def evaluate_signals(
 
         entry_price = float(current_price)
 
-        # Requirement 6: Stop Loss below market structure (TEMA line, VAL, swing low, or POC)
+        # Requirement 6: Stop Loss strictly below market structure + ATR buffer padding
         swing_low = find_structural_swing_point(df, direction="LONG", lookback=5)
-        sl_candidates = [current_tema - current_atr, swing_low - (current_atr * 0.5)]
+        sl_candidates = [current_tema - (current_atr * 0.5), swing_low - (current_atr * 0.5)]
         if not np.isnan(val):
             sl_candidates.append(val - (current_atr * 0.2))
         
         stop_loss = min(sl_candidates)
-        max_allowed_sl = entry_price * (1.0 - 0.03)
+        max_allowed_sl = entry_price * (1.0 - max_sl_cap)
         if stop_loss < max_allowed_sl:
             stop_loss = max_allowed_sl
 
@@ -480,7 +481,7 @@ def evaluate_signals(
             }
 
     # -----------------------------------------------------------------------
-    # SHORT SETUP (4H 200 TEMA Touch / Cross + Volume Spike + Structure SL/TP)
+    # SHORT SETUP (4H 200 TEMA Touch / Cross + Volume Spike + Pure Structure SL/TP)
     # -----------------------------------------------------------------------
     if short_trigger:
         if not check_candlestick_rejection(last_row, prev_row, direction="SHORT"):
@@ -489,14 +490,14 @@ def evaluate_signals(
 
         entry_price = float(current_price)
 
-        # Requirement 6: Stop Loss above market structure (TEMA line, VAH, swing high, or POC)
+        # Requirement 6: Stop Loss strictly above market structure + ATR buffer padding
         swing_high = find_structural_swing_point(df, direction="SHORT", lookback=5)
-        sl_candidates = [current_tema + current_atr, swing_high + (current_atr * 0.5)]
+        sl_candidates = [current_tema + (current_atr * 0.5), swing_high + (current_atr * 0.5)]
         if not np.isnan(vah):
             sl_candidates.append(vah + (current_atr * 0.2))
 
         stop_loss = max(sl_candidates)
-        max_allowed_sl = entry_price * (1.0 + 0.03)
+        max_allowed_sl = entry_price * (1.0 + max_sl_cap)
         if stop_loss > max_allowed_sl:
             stop_loss = max_allowed_sl
 
