@@ -3,115 +3,122 @@ import time
 import math
 import asyncio
 import logging
-import requests
+import json
 import ccxt
 import numpy as np
 import pandas as pd
-from typing import Dict, Any, Optional, Tuple, List
+from typing import Dict, Any, Optional, List
 
-try:
-    from google import genai
-    HAS_GENAI = True
-except ImportError:
-    HAS_GENAI = False
-
-try:
-    from common import get_db_connection, release_db_connection
-    HAS_DB = True
-except ImportError:
-    HAS_DB = False
-
-logger = logging.getLogger("strategy_engine")
+logger = logging.getLogger("scalp_strategy_engine")
 
 # ---------------------------------------------------------------------------
-# GLOBAL TIMEFRAME CONSTANTS (4H TEMA OVERHAUL)
+# GLOBAL SCALPING TIMEFRAME & PARAMETERS
 # ---------------------------------------------------------------------------
-EXECUTION_TIMEFRAME = "4h"       # 4-Hour execution timeframe
-MACRO_TIMEFRAME = "4h"           
-HTF_TEMA_PERIOD = 200            # 200 TEMA baseline
+EXECUTION_TIMEFRAME = "15m"      # Configurable to "5m" or "15m"
+FAST_EMA_PERIOD = 20
+SLOW_EMA_PERIOD = 50
+RSI_PERIOD = 14
+ADX_PERIOD = 14
+ATR_PERIOD = 14                  # Added for ATR tracking support
+MIN_ADX_THRESHOLD = 20.0         # Filters out ranging/choppy markets
+MAX_ADX_THRESHOLD = 42.0         # Upper ADX ceiling filter (prevents late-stage trend entry)
+TARGET_PROFIT_PCT = 0.02         # 2% target market movement (1% to 3% range)
+MAX_SL_PCT = 0.010               # Calibrated stop loss percentage
 
 
 # ---------------------------------------------------------------------------
-# 1. AI FINANCIAL SENTIMENT INTEGRATION
+# 1. TOP 40 VOLUME SCANNER & CONFIG HELPERS
 # ---------------------------------------------------------------------------
 
-def get_ai_sentiment_score(text: str, api_key: Optional[str] = None) -> float:
-    if not HAS_GENAI:
-        logger.warning("Google GenAI SDK not installed. Defaulting sentiment to neutral (0.5).")
-        return 0.5
-
-    key = api_key or os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
-    if not key:
-        return 0.5
-
+def fetch_top_volume_symbols(limit: int = 40) -> List[str]:
+    """Scans Binance or Bybit USDT linear futures for the top N coins by 24h quote volume."""
     try:
-        client = genai.Client(api_key=key)
-        prompt = (
-            "Analyze the following crypto/financial text and rate sentiment from 0.0 (extremely bearish) "
-            "to 1.0 (extremely bullish). Return ONLY a single numeric float between 0.0 and 1.0.\n\n"
-            f"Text: {text}"
-        )
-        response = client.models.generate_content(model="gemini-2.5-flash", contents=prompt)
-        return max(0.0, min(1.0, float(response.text.strip())))
+        exchange = ccxt.binanceusdm({'enableRateLimit': True})
+        tickers = exchange.fetch_tickers()
+        
+        usdt_futures = []
+        for symbol, data in tickers.items():
+            if '/USDT:USDT' in symbol or (symbol.endswith('USDT') and ':' not in symbol):
+                quote_volume = data.get('quoteVolume', 0) or 0
+                clean_sym = symbol.split(':')[0]
+                if not clean_sym.endswith('USDT'):
+                    clean_sym = f"{clean_sym}/USDT"
+                usdt_futures.append((clean_sym, quote_volume))
+                
+        # Sort descending by 24h volume
+        usdt_futures.sort(key=lambda x: x[1], reverse=True)
+        top_symbols = [item[0] for item in usdt_futures[:limit]]
+        logger.info(f"Successfully fetched top {len(top_symbols)} volume symbols.")
+        return top_symbols
     except Exception as e:
-        logger.error(f"Failed to fetch AI sentiment score: {e}")
-        return 0.5
+        logger.error(f"Failed to scan top volume symbols: {e}")
+        # Fallback default scalping list
+        return ["BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT", "DOGE/USDT", "ADA/USDT", "AVAX/USDT", "LINK/USDT"]
 
 
-# ---------------------------------------------------------------------------
-# 2. MULTI-EXCHANGE KLINE DATA FETCHING
-# ---------------------------------------------------------------------------
+def load_symbol_config(symbol: str = "") -> dict:
+    """Loads configuration settings for symbols from strategy_config.json with safe defaults."""
+    default_config = {
+        "account_balance": 100.0,
+        "risk_pct": 1.0,
+        "leverage": 5,
+        "tema_period": 200,
+        "rsi_period": 14,
+        "rsi_thresh": 42.0,
+        "adx_period": 14,
+        "adx_threshold": 20.0,
+        "use_adx_filter": True,
+        "max_sl_pct": 0.01,
+        "atr_period": 14,
+        "atr_mult": 2.0,
+        "use_atr_sl": True,
+        "disable_htf": False
+    }
+    if os.path.exists("strategy_config.json"):
+        try:
+            with open("strategy_config.json", "r") as f:
+                data = json.load(f)
+                if isinstance(data, dict):
+                    default_config.update(data)
+        except Exception as e:
+            logger.warning(f"Could not load strategy_config.json: {e}")
+    return default_config
 
-def format_ccxt_futures_symbol(symbol: str) -> str:
-    clean = symbol.replace("/", "").replace("_", "").replace("-", "").upper()
-    if not clean.endswith(":USDT"):
-        return f"{clean[:-4]}/USDT:USDT" if clean.endswith("USDT") else symbol
-    return symbol
 
-
-def fetch_klines(symbol: str, interval: str = EXECUTION_TIMEFRAME, limit: int = 500) -> pd.DataFrame:
-    ccxt_symbol = format_ccxt_futures_symbol(symbol)
+def fetch_klines(symbol: str, interval: str = "15m", limit: int = 600) -> pd.DataFrame:
+    """Fetches historical kline OHLCV data for live orchestration loops."""
     try:
-        bybit_ex = ccxt.bybit({'enableRateLimit': True, 'options': {'defaultType': 'linear'}})
-        ohlcv = bybit_ex.fetch_ohlcv(ccxt_symbol, timeframe=interval, limit=limit)
-        if ohlcv:
-            df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-            return df
+        exchange = ccxt.binanceusdm({'enableRateLimit': True})
+        clean_symbol = symbol.split(':')[0]
+        if not clean_symbol.endswith('USDT') and '/' not in clean_symbol:
+            clean_symbol = f"{clean_symbol}/USDT"
+            
+        ohlcv = exchange.fetch_ohlcv(clean_symbol, timeframe=interval, limit=limit)
+        if not ohlcv:
+            return pd.DataFrame()
+            
+        df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+        df = df.drop_duplicates(subset=['timestamp']).sort_values('timestamp').reset_index(drop=True)
+        return df
     except Exception as e:
-        logger.warning(f"[{symbol}] Bybit kline fetch failed: {e}")
-
-    try:
-        binance_ex = ccxt.binanceusdm()
-        ohlcv = binance_ex.fetch_ohlcv(symbol.split(':')[0], timeframe=interval, limit=limit)
-        if ohlcv:
-            df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-            return df
-    except Exception as e:
-        logger.warning(f"[{symbol}] Binance kline fetch failed: {e}")
-
-    return pd.DataFrame()
-
-
-async def fetch_klines_async(symbol: str, interval: str = EXECUTION_TIMEFRAME, limit: int = 500) -> pd.DataFrame:
-    return await asyncio.to_thread(fetch_klines, symbol, interval, limit)
+        logger.error(f"Failed to fetch klines for {symbol}: {e}")
+        return pd.DataFrame()
 
 
 # ---------------------------------------------------------------------------
-# 3. TECHNICAL INDICATORS & STRUCTURAL HELPERS
+# 2. TECHNICAL INDICATORS FOR SCALPING
 # ---------------------------------------------------------------------------
 
 def calculate_ema(series: pd.Series, period: int) -> pd.Series:
     return series.ewm(span=period, adjust=False).mean()
 
-
 def calculate_tema(series: pd.Series, period: int) -> pd.Series:
+    """Calculates Triple Exponential Moving Average (TEMA)."""
     ema1 = calculate_ema(series, period)
     ema2 = calculate_ema(ema1, period)
     ema3 = calculate_ema(ema2, period)
     return (3 * ema1) - (3 * ema2) + ema3
-
 
 def calculate_rsi(series: pd.Series, period: int = 14) -> pd.Series:
     delta = series.diff()
@@ -120,42 +127,37 @@ def calculate_rsi(series: pd.Series, period: int = 14) -> pd.Series:
     rs = gain / loss.replace(0, np.nan)
     return (100.0 - (100.0 / (1.0 + rs))).fillna(50.0)
 
-
 def calculate_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    """Calculates Average True Range (ATR) for trailing stop management."""
     if df.empty or len(df) < period + 1:
         return pd.Series(0.0, index=df.index)
     high, low, prev_close = df["high"], df["low"], df["close"].shift(1)
     tr = pd.concat([high - low, (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(axis=1)
     return tr.ewm(alpha=1.0 / period, adjust=False).mean().fillna(0.0)
 
+def calculate_adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    """Calculates Average Directional Index (ADX) to measure trend strength."""
+    high, low, close = df['high'], df['low'], df['close']
+    plus_dm = high.diff()
+    minus_dm = low.diff()
+    
+    plus_dm = np.where((plus_dm > minus_dm) & (plus_dm > 0), plus_dm, 0.0)
+    minus_dm = np.where((minus_dm > plus_dm) & (minus_dm > 0), minus_dm, 0.0)
+    
+    tr1 = high - low
+    tr2 = (high - close.shift(1)).abs()
+    tr3 = (low - close.shift(1)).abs()
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    
+    atr = tr.rolling(period).mean()
+    plus_di = 100 * pd.Series(plus_dm).rolling(period).mean() / atr
+    minus_di = 100 * pd.Series(minus_dm).rolling(period).mean() / atr
+    
+    dx = (100 * (plus_di - minus_di).abs() / (plus_di + minus_di)).fillna(0)
+    return dx.rolling(period).mean().fillna(0)
 
-def check_candlestick_rejection(last_row: pd.Series, prev_row: pd.Series, direction: str) -> bool:
-    open_p, close_p = float(last_row["open"]), float(last_row["close"])
-    high_p, low_p = float(last_row["high"]), float(last_row["low"])
-    prev_open, prev_close = float(prev_row["open"]), float(prev_row["close"])
-
-    body = abs(close_p - open_p)
-    candle_range = max(high_p - low_p, 1e-8)
-    upper_wick = high_p - max(open_p, close_p)
-    lower_wick = min(open_p, close_p) - low_p
-
-    if direction in ["BUY", "LONG"]:
-        is_pinbar = (lower_wick >= 2.0 * body) and (lower_wick / candle_range >= 0.40)
-        is_engulfing = (close_p > open_p) and (close_p > prev_open) and (close_p > float(prev_row["high"]))
-        is_strong_close = (close_p > open_p) and (body / candle_range >= 0.50)
-        return bool(is_pinbar or is_engulfing or is_strong_close)
-
-    elif direction in ["SELL", "SHORT"]:
-        is_pinbar = (upper_wick >= 2.0 * body) and (upper_wick / candle_range >= 0.40)
-        is_engulfing = (close_p < open_p) and (close_p < prev_open) and (close_p < float(prev_row["low"]))
-        is_strong_close = (close_p < open_p) and (body / candle_range >= 0.50)
-        return bool(is_pinbar or is_engulfing or is_strong_close)
-
-    return False
-
-
-def check_volume_spike(df: pd.DataFrame, period: int = 20, multiplier: float = 0.95) -> bool:
-    """Verifies that trigger candle volume exceeds the N-period volume SMA."""
+def check_volume_spike(df: pd.DataFrame, period: int = 20, multiplier: float = 1.15) -> bool:
+    """Ensures trigger volume is significantly higher than the average volume."""
     if "volume" not in df.columns or len(df) < period:
         return True
     vol_sma = df['volume'].rolling(period).mean().iloc[-1]
@@ -165,427 +167,121 @@ def check_volume_spike(df: pd.DataFrame, period: int = 20, multiplier: float = 0
     return bool(last_volume >= (vol_sma * multiplier))
 
 
-def find_structural_swing_point(df: pd.DataFrame, direction: str, lookback: int = 5) -> float:
-    if df.empty or len(df) < lookback + 2:
-        return float(df.iloc[-1]["close"])
-    recent_df = df.tail(lookback)
-    if direction in ["BUY", "LONG"]:
-        return float(recent_df["low"].min())
-    else:
-        return float(recent_df["high"].max())
-
-
-def calculate_staged_targets(
-    direction: str,
-    entry_price: float,
-    stop_loss: float,
-    farthest_tp: float,
-    tp1_rr: float = 1.5
-) -> Dict[str, float]:
-    sl_distance = abs(entry_price - stop_loss)
-    if direction in ["BUY", "LONG"]:
-        tp1 = entry_price + (sl_distance * tp1_rr)
-        tp2 = max(farthest_tp, tp1)
-    else:
-        tp1 = entry_price - (sl_distance * tp1_rr)
-        tp2 = min(farthest_tp, tp1)
-
-    return {
-        "tp1": round(tp1, 3),
-        "tp1_ratio": 0.30,
-        "tp2": round(tp2, 7),
-        "tp2_ratio": 0.70
-    }
-
-
-def calculate_dynamic_trailing_stop(
-    direction: str,
-    entry_price: float,
-    current_price: float,
-    highest_price_since_entry: float,
-    lowest_price_since_entry: float,
-    current_atr: float,
-    atr_mult: float = 3.0,
-    tp1_hit: bool = False
-) -> float:
-    sl_distance = current_atr * atr_mult
-    if direction in ["BUY", "LONG"]:
-        trailing_sl = highest_price_since_entry - sl_distance
-        if tp1_hit:
-            trailing_sl = max(trailing_sl, entry_price)
-        return float(max(trailing_sl, entry_price - sl_distance))
-    else:
-        trailing_sl = lowest_price_since_entry + sl_distance
-        if tp1_hit:
-            trailing_sl = min(trailing_sl, entry_price)
-        return float(min(trailing_sl, entry_price + sl_distance))
-
-
-def check_time_based_invalidation(bars_in_trade: int, max_bars: int = 36, pnl_pct: float = 0.0) -> bool:
-    return bool(bars_in_trade >= max_bars and pnl_pct < 0.01)
-
-
 # ---------------------------------------------------------------------------
-# 4. VOLUME PROFILE & GAPS
+# 3. SCALPING SIGNAL EVALUATION ENGINE (20/50 EMA + Trend/Momentum Filters)
 # ---------------------------------------------------------------------------
 
-def compute_volume_profile(df: pd.DataFrame, num_bins: int = 100, lookback_bars: int = 500, va_pct: float = 0.70):
-    if df.empty or len(df) < 5 or "volume" not in df.columns:
-        return np.nan, np.nan, np.nan
-
-    df_range = df.tail(min(len(df), lookback_bars))
-    lows, highs, vols = df_range["low"].values, df_range["high"].values, df_range["volume"].values
-    pLST, pHST = float(np.min(lows)), float(np.max(highs))
-    if pLST >= pHST or np.isnan(pLST) or np.isnan(pHST):
-        return np.nan, np.nan, np.nan
-
-    pSTP = (pHST - pLST) / num_bins
-    if pSTP <= 0:
-        return np.nan, np.nan, np.nan
-
-    vD_vt = np.zeros(num_bins, dtype=np.float64)
-    ranges = np.maximum(highs - lows, 1e-8)
-    sSI = np.maximum(np.floor((lows - pLST) / pSTP).astype(int), 0)
-    eSI = np.minimum(np.floor((highs - pLST) / pSTP).astype(int), num_bins - 1)
-
-    for i in range(len(df_range)):
-        lL, lH, lV, lR = lows[i], highs[i], vols[i], ranges[i]
-        for pLI in range(sSI[i], eSI[i] + 1):
-            pL = pLST + pLI * pSTP
-            vPOR = 1.0 if (lL >= pL and lH <= pL + pSTP) else (pSTP / lR)
-            vD_vt[pLI] += lV * max(vPOR, 0.0)
-
-    pcL = int(np.argmax(vD_vt))
-    poc = round(pLST + (pcL + 0.5) * pSTP, 2)
-
-    ttV = max(np.sum(vD_vt), 1e-10) * va_pct
-    va = vD_vt[pcL]
-    laP, lbP = pcL, pcL
-    while va < ttV and (lbP > 0 or laP < num_bins - 1):
-        vaP = vD_vt[laP + 1] if laP < num_bins - 1 else 0.0
-        vbP = vD_vt[lbP - 1] if lbP > 0 else 0.0
-        if vaP >= vbP:
-            va += vaP
-            laP += 1
-        else:
-            va += vbP
-            lbP -= 1
-
-    return float(poc), float(round(pLST + (laP + 1.0) * pSTP, 2)), float(round(pLST + (lbP + 0.0) * pSTP, 2))
-
-
-def calculate_volume_profile_gaps(df: pd.DataFrame, num_bins: int = 100, lookback_bars: int = 500, detection_pct: float = 0.07) -> Dict[str, Any]:
-    empty_res = {"poc": np.nan, "vah": np.nan, "val": np.nan, "overhead_gaps": [], "underneath_gaps": []}
-    if df.empty or "volume" not in df.columns:
-        return empty_res
-
-    poc, vah, val = compute_volume_profile(df, num_bins=num_bins, lookback_bars=lookback_bars)
-    df_range = df.tail(min(len(df), lookback_bars))
-    lows, highs, vols = df_range["low"].values, df_range["high"].values, df_range["volume"].values
-    pLST, pHST = float(np.min(lows)), float(np.max(highs))
-    if pLST >= pHST:
-        return empty_res
-
-    pSTP = (pHST - pLST) / num_bins
-    vD_vt = np.zeros(num_bins, dtype=np.float64)
-    ranges = np.maximum(highs - lows, 1e-8)
-    sSI = np.maximum(np.floor((lows - pLST) / pSTP).astype(int), 0)
-    eSI = np.minimum(np.floor((highs - pLST) / pSTP).astype(int), num_bins - 1)
-
-    for i in range(len(df_range)):
-        for pLI in range(sSI[i], eSI[i] + 1):
-            pL = pLST + pLI * pSTP
-            vPOR = 1.0 if (lows[i] >= pL and highs[i] <= pL + pSTP) else (pSTP / ranges[i])
-            vD_vt[pLI] += vols[i] * max(vPOR, 0.0)
-
-    noN = max(int(num_bins * detection_pct), 1)
-    gap_prices = []
-    for i in range(noN, num_bins - noN):
-        if np.all(vD_vt[i] < vD_vt[i - noN : i]) and np.all(vD_vt[i] < vD_vt[i + 1 : i + 1 + noN]):
-            gap_prices.append(round(pLST + (i + 0.5) * pSTP, 2))
-
-    current_price = float(df.iloc[-1]["close"])
-    unique_gaps = list(dict.fromkeys(gap_prices))
-
-    return {
-        "poc": poc,
-        "vah": vah,
-        "val": val,
-        "overhead_gaps": sorted([g for g in unique_gaps if g > current_price]),
-        "underneath_gaps": sorted([g for g in unique_gaps if g < current_price], reverse=True)
-    }
-
-
-# ---------------------------------------------------------------------------
-# 5. SYMBOL CONFIGURATION & 200 TEMA DEFAULTS
-# ---------------------------------------------------------------------------
-
-def normalize_symbol(symbol: str) -> str:
-    if not symbol:
-        return ""
-    s = str(symbol).replace('"', "").replace("'", "").strip().upper()
-    return f"{s[:-4]}/{s[-4:]}" if s.endswith("USDT") and "/" not in s else s
-
-
-def load_symbol_config(symbol: str) -> Dict[str, Any]:
-    norm_symbol = normalize_symbol(symbol)
-    
-    # Baseline configuration (Expanded structural max_sl_pct to 15% for 4H swing trading)
-    base_config = {
-        "tema_period": 200,
-        "rsi_period": 14,
-        "adx_period": 14,
-        "min_adx": 15.0,
-        "zone_tolerance": 0.015,
-        "volume_multiplier": 0.95,
-        "max_sl_pct": 0.06,          # UPDATED: Expanded ceiling to 15% to allow true structural SL positioning
-        "min_rr": 3.0,
-        "risk_pct": 1.0,
-        "atr_period": 14,
-        "atr_mult": 3.0,
-        "disable_htf": True,
-        "spot_only": False,
-        "leverage": 5
-    }
-
-    # Asset-specific parameter tuning based on sweep diagnostics
-    asset_overrides = {
-        "SOL/USDT": {"zone_tolerance": 0.015, "volume_multiplier": 0.95, "max_sl_pct": 0.03,},
-        "UNI/USDT": {"zone_tolerance": 0.02, "volume_multiplier": 1.0, "max_sl_pct": 0.03,},
-        "NEAR/USDT": {"zone_tolerance": 0.02, "volume_multiplier": 1.0, "max_sl_pct": 0.06,},
-        "JUP/USDT": {"zone_tolerance": 0.02, "volume_multiplier": 0.85, "max_sl_pct": 0.05,},
-        "ARB/USDT": {"zone_tolerance": 0.015, "volume_multiplier": 0.95, "max_sl_pct": 0.06,},
-        "MAGMA/USDT": {"zone_tolerance": 0.02, "volume_multiplier": 1.0, "max_sl_pct": 0.03,}
-    }
-
-    if norm_symbol in asset_overrides:
-        base_config.update(asset_overrides[norm_symbol])
-
-    return base_config
-
-
-# ---------------------------------------------------------------------------
-# 6. STREAMLINED 4H 200-TEMA SIGNAL EVALUATION ENGINE
-# ---------------------------------------------------------------------------
-
-def evaluate_signals(
+def evaluate_scalp_signals(
     df: pd.DataFrame,
     symbol: str,
     account_balance: float = 100.0,
-    tema_period: int = 200,
-    zone_tolerance: float = 0.015,
-    min_rr: float = 3.0,
     risk_pct: float = 1.0,
-    atr_period: int = 14,
-    atr_mult: float = 3.0,
-    spot_only: bool = False,
-    sentiment_score: Optional[float] = None,
-    is_backtest: bool = False,
-    timeframe: str = EXECUTION_TIMEFRAME,
     **kwargs
 ) -> Dict[str, Any]:
     no_signal = {
         "action": "HOLD", "symbol": symbol, "direction": "NONE",
         "entry_price": 0.0, "stop_loss": 0.0, "take_profit": 0.0,
-        "atr": 0.0, "position_size": 0.0, "reason": "No condition met"
+        "reason": "No condition met"
     }
 
-    sym_cfg = load_symbol_config(symbol)
-    volume_mult = float(sym_cfg.get("volume_multiplier", 0.95))
-    max_sl_cap = float(sym_cfg.get("max_sl_pct", 0.6)) # Configurable SL ceiling (default 15%)
-    
-    # Requirement 5: Volume Spike Check using configurable multiplier
-    if not check_volume_spike(df, period=20, multiplier=volume_mult):
-        no_signal["reason"] = f"Volume Gate: Trigger candle volume below {volume_mult}x 20-period Volume SMA"
+    if df.empty or len(df) < 60:
+        no_signal["reason"] = "Insufficient kline data"
         return no_signal
 
-    # Pre-compute Indicators
+    # Compute Indicators
     df = df.copy()
-    df["tema"] = calculate_tema(df["close"], tema_period)
-    df["atr"] = calculate_atr(df, atr_period)
+    df["ema_fast"] = calculate_ema(df["close"], FAST_EMA_PERIOD)
+    df["ema_slow"] = calculate_ema(df["close"], SLOW_EMA_PERIOD)
+    df["rsi"] = calculate_rsi(df["close"], RSI_PERIOD)
+    df["adx"] = calculate_adx(df, ADX_PERIOD)
+    df["atr"] = calculate_atr(df, ATR_PERIOD)
 
     last_row = df.iloc[-1]
     prev_row = df.iloc[-2]
+    
     current_price = float(last_row["close"])
-    current_tema = float(last_row["tema"])
-    current_atr = float(last_row["atr"])
+    fast_ema = float(last_row["ema_fast"])
+    slow_ema = float(last_row["ema_slow"])
+    prev_fast = float(prev_row["ema_fast"])
+    prev_slow = float(prev_row["ema_slow"])
+    
+    current_rsi = float(last_row["rsi"])
+    current_adx = float(last_row["adx"])
 
-    vp_data = calculate_volume_profile_gaps(df, lookback_bars=500)
-    poc, vah, val = vp_data["poc"], vp_data["vah"], vp_data["val"]
-    overhead_gaps, underneath_gaps = vp_data["overhead_gaps"], vp_data["underneath_gaps"]
+    # 1. Momentum and ADX Bandpass Filter (20 <= ADX <= 42)
+    if current_adx < MIN_ADX_THRESHOLD:
+        no_signal["reason"] = f"Trend Filter: ADX ({current_adx:.1f}) too low (market is chopping)"
+        return no_signal
 
-    # TEMA Touch / Proximity & Crossover Mechanics
-    distance_to_tema_pct = abs(current_price - current_tema) / current_tema
-    near_tema = distance_to_tema_pct <= zone_tolerance
-    crossed_above_tema = (float(prev_row["close"]) <= float(prev_row["tema"])) and (current_price > current_tema)
-    crossed_below_tema = (float(prev_row["close"]) >= float(prev_row["tema"])) and (current_price < current_tema)
+    if current_adx > MAX_ADX_THRESHOLD:
+        no_signal["reason"] = f"Exhaustion Filter: ADX ({current_adx:.1f}) exceeds ceiling threshold ({MAX_ADX_THRESHOLD})"
+        return no_signal
 
-    long_trigger = (current_price >= current_tema) and (near_tema or crossed_above_tema)
-    short_trigger = (current_price <= current_tema) and (near_tema or crossed_below_tema) and not spot_only
+    if not check_volume_spike(df, period=20, multiplier=1.15):
+        no_signal["reason"] = "Volume Gate: Insufficient volume spike on execution candle"
+        return no_signal
 
-    MIN_SL_PCT = 0.003
+    # 2. EMA Crossover Mechanics (20 crosses 50)
+    bullish_crossover = (prev_fast <= prev_slow) and (fast_ema > slow_ema)
+    bearish_crossover = (prev_fast >= prev_slow) and (fast_ema < slow_ema)
 
     # -----------------------------------------------------------------------
-    # LONG SETUP (4H 200 TEMA Touch / Cross + Volume Spike + Pure Structure SL/TP)
+    # LONG SCALP SETUP
     # -----------------------------------------------------------------------
-    if long_trigger:
-        if not check_candlestick_rejection(last_row, prev_row, direction="LONG"):
-            no_signal["reason"] = "Long Gate: Missing bullish candlestick confirmation at 200 TEMA"
-            return no_signal
-
-        entry_price = float(current_price)
-
-        # Requirement 6: Stop Loss strictly below market structure + ATR buffer padding
-        swing_low = find_structural_swing_point(df, direction="LONG", lookback=5)
-        sl_candidates = [current_tema - (current_atr * 0.5), swing_low - (current_atr * 0.5)]
-        if not np.isnan(val):
-            sl_candidates.append(val - (current_atr * 0.2))
+    if bullish_crossover and current_rsi > 50.0 and current_rsi < 75.0:
+        entry_price = current_price
+        stop_loss = entry_price * (1.0 - MAX_SL_PCT)
+        take_profit = entry_price * (1.0 + TARGET_PROFIT_PCT)
         
-        stop_loss = min(sl_candidates)
-        max_allowed_sl = entry_price * (1.0 - max_sl_cap)
-        if stop_loss < max_allowed_sl:
-            stop_loss = max_allowed_sl
-
         sl_distance = entry_price - stop_loss
-        if sl_distance < (entry_price * MIN_SL_PCT):
-            stop_loss = entry_price - (current_atr * atr_mult)
-            sl_distance = entry_price - stop_loss
+        risk_amt = float(account_balance) * (risk_pct / 100.0)
+        position_size = round(risk_amt / sl_distance, 6) if sl_distance > 0 else 0.0
+        computed_rr = (take_profit - entry_price) / sl_distance
 
-        # Requirement 7: Take Profit placed at market structure including Volume Gaps & VAH/POC
-        min_tp = entry_price + (sl_distance * min_rr)
-        tp_candidates = [float(g) for g in overhead_gaps if float(g) >= min_tp]
-        for ref in (vah, poc):
-            if ref is not None and not np.isnan(ref) and float(ref) >= min_tp:
-                tp_candidates.append(float(ref))
-
-        farthest_tp = max(tp_candidates) if tp_candidates else min_tp
-        computed_rr = (farthest_tp - entry_price) / sl_distance
-
-        if computed_rr >= min_rr:
-            risk_amt = float(account_balance) * (risk_pct / 100.0)
-            position_size = round(risk_amt / sl_distance, 6) if sl_distance > 0 else 0.0
-            staged_targets = calculate_staged_targets("LONG", entry_price, stop_loss, farthest_tp)
-
-            return {
-                "action": "BUY", "order_type": "LIMIT", "symbol": symbol, "direction": "LONG",
-                "regime": "4H_TEMA_200",
-                "entry_price": float(round(entry_price, 5)),
-                "stop_loss": float(round(stop_loss, 5)),
-                "take_profit": float(round(farthest_tp, 5)),
-                "tp1": staged_targets["tp1"], "tp1_ratio": staged_targets["tp1_ratio"],
-                "tp2": staged_targets["tp2"], "tp2_ratio": staged_targets["tp2_ratio"],
-                "max_bar_duration": 36, "atr": float(round(current_atr, 4)),
-                "rr_ratio": float(computed_rr), "risk_pct": float(risk_pct),
-                "position_size": float(position_size),
-                "reason": f"4H 200-TEMA Long: SL={stop_loss:.4f}, TP={farthest_tp:.4f}, R:R={computed_rr:.2f}"
-            }
+        return {
+            "action": "BUY", "order_type": "MARKET", "symbol": symbol, "direction": "LONG",
+            "regime": "EMA_SCALP_5M_15M",
+            "entry_price": float(round(entry_price, 4)),
+            "stop_loss": float(round(stop_loss, 4)),
+            "take_profit": float(round(take_profit, 4)),
+            "rr_ratio": float(round(computed_rr, 2)),
+            "position_size": float(position_size),
+            "entry_rsi": float(round(current_rsi, 2)),
+            "entry_adx": float(round(current_adx, 2)),
+            "reason": f"Bullish EMA Cross + RSI ({current_rsi:.1f}) + ADX ({current_adx:.1f}): TP={take_profit}"
+        }
 
     # -----------------------------------------------------------------------
-    # SHORT SETUP (4H 200 TEMA Touch / Cross + Volume Spike + Pure Structure SL/TP)
+    # SHORT SCALP SETUP
     # -----------------------------------------------------------------------
-    if short_trigger:
-        if not check_candlestick_rejection(last_row, prev_row, direction="SHORT"):
-            no_signal["reason"] = "Short Gate: Missing bearish candlestick confirmation at 200 TEMA"
-            return no_signal
-
-        entry_price = float(current_price)
-
-        # Requirement 6: Stop Loss strictly above market structure + ATR buffer padding
-        swing_high = find_structural_swing_point(df, direction="SHORT", lookback=5)
-        sl_candidates = [current_tema + (current_atr * 0.5), swing_high + (current_atr * 0.5)]
-        if not np.isnan(vah):
-            sl_candidates.append(vah + (current_atr * 0.2))
-
-        stop_loss = max(sl_candidates)
-        max_allowed_sl = entry_price * (1.0 + max_sl_cap)
-        if stop_loss > max_allowed_sl:
-            stop_loss = max_allowed_sl
-
+    if bearish_crossover and current_rsi < 50.0 and current_rsi > 25.0:
+        entry_price = current_price
+        stop_loss = entry_price * (1.0 + MAX_SL_PCT)
+        take_profit = entry_price * (1.0 - TARGET_PROFIT_PCT)
+        
         sl_distance = stop_loss - entry_price
-        if sl_distance < (entry_price * MIN_SL_PCT):
-            stop_loss = entry_price + (current_atr * atr_mult)
-            sl_distance = stop_loss - entry_price
+        risk_amt = float(account_balance) * (risk_pct / 100.0)
+        position_size = round(risk_amt / sl_distance, 6) if sl_distance > 0 else 0.0
+        computed_rr = (entry_price - take_profit) / sl_distance
 
-        # Requirement 7: Take Profit placed at market structure including Volume Gaps & VAL/POC
-        min_tp = entry_price - (sl_distance * min_rr)
-        tp_candidates = [float(g) for g in underneath_gaps if float(g) <= min_tp]
-        for ref in (val, poc):
-            if ref is not None and not np.isnan(ref) and float(ref) <= min_tp:
-                tp_candidates.append(float(ref))
+        return {
+            "action": "SELL", "order_type": "MARKET", "symbol": symbol, "direction": "SHORT",
+            "regime": "EMA_SCALP_5M_15M",
+            "entry_price": float(round(entry_price, 4)),
+            "stop_loss": float(round(stop_loss, 4)),
+            "take_profit": float(round(take_profit, 4)),
+            "rr_ratio": float(round(computed_rr, 2)),
+            "position_size": float(position_size),
+            "entry_rsi": float(round(current_rsi, 2)),
+            "entry_adx": float(round(current_adx, 2)),
+            "reason": f"Bearish EMA Cross + RSI ({current_rsi:.1f}) + ADX ({current_adx:.1f}): TP={take_profit}"
+        }
 
-        farthest_tp = min(tp_candidates) if tp_candidates else min_tp
-        computed_rr = (entry_price - farthest_tp) / sl_distance
-
-        if computed_rr >= min_rr:
-            risk_amt = float(account_balance) * (risk_pct / 100.0)
-            position_size = round(risk_amt / sl_distance, 6) if sl_distance > 0 else 0.0
-            staged_targets = calculate_staged_targets("SHORT", entry_price, stop_loss, farthest_tp)
-
-            return {
-                "action": "SELL", "order_type": "LIMIT", "symbol": symbol, "direction": "SHORT",
-                "regime": "4H_TEMA_200",
-                "entry_price": float(round(entry_price, 5)),
-                "stop_loss": float(round(stop_loss, 5)),
-                "take_profit": float(round(farthest_tp, 5)),
-                "tp1": staged_targets["tp1"], "tp1_ratio": staged_targets["tp1_ratio"],
-                "tp2": staged_targets["tp2"], "tp2_ratio": staged_targets["tp2_ratio"],
-                "max_bar_duration": 36, "atr": float(round(current_atr, 4)),
-                "rr_ratio": float(computed_rr), "risk_pct": float(risk_pct),
-                "position_size": float(position_size),
-                "reason": f"4H 200-TEMA Short: SL={stop_loss:.4f}, TP={farthest_tp:.4f}, R:R={computed_rr:.2f}"
-            }
-
-    no_signal["reason"] = "No valid 200-TEMA touch/crossover with volume spike and candle confirmation"
+    no_signal["reason"] = "No valid 20/50 EMA crossover with momentum filters met"
     return no_signal
 
 
 # ---------------------------------------------------------------------------
-# 7. EVENT-DRIVEN STRATEGY ENGINE CLASS
+# MODULE-LEVEL ALIASES FOR MAIN.PY COMPATIBILITY
 # ---------------------------------------------------------------------------
-
-class StrategyEngine:
-    def __init__(self, symbol: str, config: Optional[Any] = None, event_bus: Optional[Any] = None):
-        self.symbol = symbol
-        self.config = config
-        self.event_bus = event_bus
-
-    def generate_signal(
-        self,
-        df: pd.DataFrame,
-        current_price: Optional[float] = None,
-        position_side: str = "LONG",
-        params: Optional[dict] = None
-    ) -> Dict[str, Any]:
-        if df.empty or len(df) < 50:
-            return {"signal": "HOLD", "action": "HOLD"}
-
-        params = params or {}
-        evaluated_res = evaluate_signals(
-            df=df,
-            symbol=self.symbol,
-            account_balance=float(params.get("account_balance", 100.0)),
-            min_rr=float(params.get("min_rr", 3.0)),
-            spot_only=(position_side.upper() == "LONG_ONLY")
-        )
-
-        action = evaluated_res.get("action", "HOLD")
-        evaluated_res["signal"] = action
-        evaluated_res["side"] = evaluated_res.get("direction", "NONE")
-        return evaluated_res
-
-
-def generate_live_signal(
-    symbol: str,
-    account_balance: float = 100.0,
-    execution_timeframe: str = EXECUTION_TIMEFRAME,
-    limit: int = 500,
-    **kwargs
-) -> Dict[str, Any]:
-    df = fetch_klines(symbol=symbol, interval=execution_timeframe, limit=limit)
-    if df.empty:
-        return {
-            "action": "HOLD", "symbol": symbol, "direction": "NONE",
-            "entry_price": 0.0, "stop_loss": 0.0, "take_profit": 0.0,
-            "atr": 0.0, "position_size": 0.0, "reason": "Failed to fetch 4H klines"
-        }
-    return evaluate_signals(df, symbol, account_balance=account_balance, timeframe=execution_timeframe, **kwargs)
+evaluate_signals = evaluate_scalp_signals

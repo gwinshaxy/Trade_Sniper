@@ -25,7 +25,7 @@ from event_bus import event_bus
 DUST_THRESHOLD = 0.001
 RETRY_THRESHOLD = 3
 GRACE_PERIOD_SECONDS = 120.0  # Time allowed for API & order engines to settle
-GHOST_MIN_SUSTAINED_ZERO_SECONDS = 900  # 15 minutes before confirming ghost state
+GHOST_MIN_SUSTAINED_ZERO_SECONDS = 300  # 15 minutes before confirming ghost state
 
 # Thread safety locks & tracking caches
 reconciler_lock = threading.Lock()

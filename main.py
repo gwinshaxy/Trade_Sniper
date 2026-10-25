@@ -15,6 +15,7 @@ os.environ.pop("https_proxy", None)
 
 import asyncio
 import logging
+import json
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -52,17 +53,37 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s"
 )
 
-raw_symbols = os.getenv("TRADING_SYMBOLS") or os.getenv("WATCHLIST") or "XRP/USDT,LINK/USDT,SOL/USDT,BNB/USDT"
-WATCHLIST = [s.strip() for s in raw_symbols.split(",") if s.strip()]
+logger = logging.getLogger("main_orchestrator")
 
-TIMEFRAME = os.getenv("TIMEFRAME", "4h")
+
+def load_vetted_watchlist(json_file: str = "vetted_symbols.json") -> list:
+    """Automatically loads vetted symbols from dynamic asset filter JSON output."""
+    if os.path.exists(json_file):
+        try:
+            with open(json_file, "r") as f:
+                data = json.load(f)
+                symbols = data.get("vetted_symbols", [])
+                if symbols:
+                    logger.info(f"Successfully loaded {len(symbols)} vetted symbols from '{json_file}': {symbols}")
+                    return symbols
+        except Exception as e:
+            logger.warning(f"Failed to load vetted symbols from {json_file}: {e}")
+    
+    # Fallback to environment variables or default list if vetting file is missing
+    logger.warning("vetted_symbols.json not found or empty. Falling back to environment watchlist.")
+    raw_symbols = os.getenv("TRADING_SYMBOLS") or os.getenv("WATCHLIST") or "XRP/USDT,LINK/USDT,SOL/USDT,BNB/USDT"
+    return [s.strip() for s in raw_symbols.split(",") if s.strip()]
+
+
+# Load active trading symbols dynamically from vetted pool
+WATCHLIST = load_vetted_watchlist()
+
+TIMEFRAME = os.getenv("TIMEFRAME", "15m")
 POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", "60"))
 ACCOUNT_RISK_PCT = float(os.getenv("ACCOUNT_RISK_PCT", "1.0"))
 FALLBACK_BALANCE = float(os.getenv("ACCOUNT_BALANCE", "100.0"))
 
 MAX_CONCURRENT_POSITIONS = int(os.getenv("MAX_CONCURRENT_POSITIONS", "5"))
-
-logger = logging.getLogger("main_orchestrator")
 
 executor = LiveExecutionEngine()
 state_machine = StateMachineEngine(executor)
@@ -89,7 +110,6 @@ async def dynamic_trade_management_loop():
                     active_trades = [dict(zip(columns, row)) for row in cur.fetchall()]
 
                 for trade in active_trades:
-                    # Bulletproof local variable initializations per iteration
                     new_sl = None
                     action = None
                     result = {}
@@ -98,7 +118,7 @@ async def dynamic_trade_management_loop():
                     pair = trade['pair']
                     pos_qty = float(trade.get("position_size", 0.0))
 
-                    df_active = await asyncio.to_thread(fetch_klines, symbol=pair, interval="1h", limit=300)
+                    df_active = await asyncio.to_thread(fetch_klines, symbol=pair, interval="15m", limit=300)
 
                     if df_active is None or df_active.empty or len(df_active) < 200:
                         logger.warning(f"[{pair}] K-line data insufficient/empty for active trade #{trade_id}. Skipping iteration.")
