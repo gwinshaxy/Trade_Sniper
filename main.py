@@ -64,7 +64,6 @@ def load_vetted_watchlist(json_file: str = "vetted_symbols.json") -> list:
                 data = json.load(f)
                 symbols = data.get("vetted_symbols", [])
                 if symbols:
-                    logger.info(f"Successfully loaded {len(symbols)} vetted symbols from '{json_file}': {symbols}")
                     return symbols
         except Exception as e:
             logger.warning(f"Failed to load vetted symbols from {json_file}: {e}")
@@ -74,9 +73,6 @@ def load_vetted_watchlist(json_file: str = "vetted_symbols.json") -> list:
     raw_symbols = os.getenv("TRADING_SYMBOLS") or os.getenv("WATCHLIST") or "XRP/USDT,LINK/USDT,SOL/USDT,BNB/USDT"
     return [s.strip() for s in raw_symbols.split(",") if s.strip()]
 
-
-# Load active trading symbols dynamically from vetted pool
-WATCHLIST = load_vetted_watchlist()
 
 TIMEFRAME = os.getenv("TIMEFRAME", "15m")
 POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", "60"))
@@ -227,6 +223,9 @@ async def strategy_evaluation_loop():
     logger.info("Bybit Futures Strategy Signal Evaluator initialized.")
     while True:
         try:
+            # Dynamically load the latest vetted watchlist on every loop iteration
+            watchlist = load_vetted_watchlist()
+
             live_balance = await asyncio.to_thread(executor.fetch_available_usdt_balance)
             active_usdt_balance = live_balance if live_balance > 1.0 else FALLBACK_BALANCE
 
@@ -259,7 +258,7 @@ async def strategy_evaluation_loop():
 
             allocated_margin_per_trade = active_usdt_balance / MAX_CONCURRENT_POSITIONS
 
-            for symbol in WATCHLIST:
+            for symbol in watchlist:
                 if check_asset_cooldown(symbol):
                     logger.info(f"[{symbol}] Asset is in active cooldown. Skipping evaluation.")
                     continue
@@ -382,8 +381,10 @@ async def main():
 
     from ws_engine import UnifiedWebSocketEngine
 
+    initial_watchlist = load_vetted_watchlist()
+
     ws_engine = UnifiedWebSocketEngine(
-        symbols=WATCHLIST,
+        symbols=initial_watchlist,
         is_testnet=False,
         api_key=BYBIT_API_KEY,
         api_secret=BYBIT_SECRET_KEY

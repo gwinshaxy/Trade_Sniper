@@ -18,13 +18,6 @@ load_dotenv(override=True)
 os.environ["CLOUDFLARE_WORKER_URL"] = "https://bybit-proxy.gspark4u.workers.dev"
 CLOUDFLARE_WORKER_URL = os.environ["CLOUDFLARE_WORKER_URL"]
 
-# Step 1: Clear environment proxy settings causing 407 Proxy Auth errors
-#for proxy_var in ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"]:
-    #os.environ.pop(proxy_var, None)
-
-#os.environ["NO_PROXY"] = "localhost,127.0.0.1,.supabase.co,api.binance.com,api.mexc.com,api.telegram.org"
-#os.environ["no_proxy"] = os.environ["NO_PROXY"]
-
 query_params = st.query_params
 if "assetlinks" in query_params or st.context.headers.get("Path") == "/.well-known/assetlinks.json":
     try:
@@ -142,8 +135,6 @@ from common import (
 )
 from live_executor import LiveExecutionEngine
 
-# FIX #3: Import STRATEGY_CONFIG once at module load so the leverage input
-# can be pre-populated from config.json instead of a hard-coded default.
 try:
     from config import STRATEGY_CONFIG as _STRAT_CFG
 except ImportError:
@@ -216,7 +207,12 @@ config_target_pair = selected_pair
 pair_key = config_target_pair.replace("/", "")
 dyn_cfg = strategy.load_symbol_config(config_target_pair)
 
-lookback_bars = st.sidebar.number_input("Lookback Bars (Range)", value=600, min_value=100, max_value=1000, step=50, key=f"lookback_{pair_key}")
+lookback_bars = st.sidebar.number_input("Lookback Bars (Range)", value=500, min_value=50, max_value=1000, step=50, key=f"lookback_{pair_key}")
+
+st.sidebar.markdown("---")
+st.sidebar.subheader("📊 Chart Indicator Toggles")
+show_20_ema = st.sidebar.checkbox("Show 20 EMA (Fast)", value=True, key=f"ema20_{pair_key}")
+show_50_ema = st.sidebar.checkbox("Show 50 EMA (Slow)", value=True, key=f"ema50_{pair_key}")
 
 tema_period = st.sidebar.number_input(
     "TEMA Period", 
@@ -327,7 +323,6 @@ disable_htf = st.sidebar.checkbox(
 st.sidebar.markdown("---")
 direction = st.sidebar.selectbox("Order Direction", ["BUY", "SELL"])
 
-# FIX #3: Read leverage from config.json / STRATEGY_CONFIG instead of hard-coded 5
 _default_leverage = int(_STRAT_CFG.get("leverage", 5)) if isinstance(_STRAT_CFG, dict) else 5
 leverage = st.sidebar.number_input(
     "Leverage",
@@ -368,7 +363,6 @@ if st.sidebar.button("🚀 Execute Live Futures Order via Bybit API", use_contai
             if res.get("status") == "SUCCESS":
                 fill_price = res["fill_price"]
                 executed_qty = res["executed_qty"]
-                # FIX #8: capture the entry order ID for reconciler registration
                 manual_entry_order_id = res.get("order_id")
 
                 conn_exec = get_db_connection()
@@ -376,7 +370,6 @@ if st.sidebar.button("🚀 Execute Live Futures Order via Bybit API", use_contai
                 if conn_exec:
                     try:
                         with conn_exec.cursor() as cur:
-                            # FIX #8: RETURNING id so the trade_id is captured
                             cur.execute("""
                                 INSERT INTO trade_setups 
                                 (pair, direction, entry_price, stop_loss, take_profit, position_size, status, trade_state, account_balance, risk_pct)
@@ -387,9 +380,6 @@ if st.sidebar.button("🚀 Execute Live Futures Order via Bybit API", use_contai
                             manual_trade_id = row[0] if row else None
                             conn_exec.commit()
 
-                        # FIX #8: register entry order ID with the reconciler so
-                        # it can verify the order status before declaring the
-                        # trade a ghost.
                         if manual_trade_id and manual_entry_order_id:
                             try:
                                 from reconciler import mark_trade_entry_order
@@ -437,12 +427,14 @@ col_hdr, col_tf = st.columns([3, 1])
 with col_hdr:
     st.subheader("📈 Real-Time Interactive Chart & Volume Profile")
 with col_tf:
-    selected_timeframe = st.selectbox("Select Timeframe:", ["5m", "15m", "30m", "1h", "4h", "1d"], index=3, key="chart_timeframe_select")
+    timeframe_options = ["5m", "15m", "30m", "1h", "4h", "1d"]
+    default_tf_index = timeframe_options.index("15m") if "15m" in timeframe_options else 1
+    selected_timeframe = st.selectbox("Select Timeframe:", timeframe_options, index=default_tf_index, key="chart_timeframe_select")
 
 chart_symbol = selected_pair
 
 try:
-    df_ohlc = strategy.fetch_klines(symbol=chart_symbol, interval=selected_timeframe, limit=lookback_bars)
+    df_ohlc = strategy.fetch_klines(symbol=chart_symbol, interval=selected_timeframe, limit=min(lookback_bars, 500))
 except Exception as fetch_err:
     df_ohlc = None
     st.error(f"API Fetch Error: {fetch_err}")
@@ -465,7 +457,10 @@ if df_ohlc is not None and not df_ohlc.empty:
             if col in df_ohlc.columns:
                 df_ohlc[col] = pd.to_numeric(df_ohlc[col], errors='coerce')
 
+        # Calculate indicators
         df_ohlc['tema_custom'] = strategy.calculate_tema(df_ohlc['close'], period=min(tema_period, len(df_ohlc)))
+        df_ohlc['ema_20'] = strategy.calculate_ema(df_ohlc['close'], 20)
+        df_ohlc['ema_50'] = strategy.calculate_ema(df_ohlc['close'], 50)
         
         if hasattr(strategy, 'calculate_volume_profile_gaps'):
             vp_res = strategy.calculate_volume_profile_gaps(df_ohlc, num_bins=100, lookback_bars=lookback_bars)
@@ -481,6 +476,9 @@ if df_ohlc is not None and not df_ohlc.empty:
         max_chart_p = float(df_ohlc['high'].max())
 
         df_chart = df_ohlc.copy()
+        df_chart['time'] = pd.to_datetime(df_chart['time'])
+        
+        # Format timestamps as standard string representations which lightweight-charts expects for intraday scaling
         if selected_timeframe in ['1d']:
             df_chart['time'] = df_chart['time'].dt.strftime('%Y-%m-%d')
         else:
@@ -495,10 +493,24 @@ if df_ohlc is not None and not df_ohlc.empty:
         ohlcv_data = df_chart[['time', 'open', 'high', 'low', 'close', 'volume']].dropna()
         chart.set(ohlcv_data)
 
+        # Plot 20 EMA if enabled
+        if show_20_ema:
+            ema20_df = df_chart[['time', 'ema_20']].dropna().rename(columns={'ema_20': '20 EMA'})
+            if not ema20_df.empty:
+                line_20 = chart.create_line(name='20 EMA', color="#2962ff", width=2)
+                line_20.set(ema20_df)
+
+        # Plot 50 EMA if enabled
+        if show_50_ema:
+            ema50_df = df_chart[['time', 'ema_50']].dropna().rename(columns={'ema_50': '50 EMA'})
+            if not ema50_df.empty:
+                line_50 = chart.create_line(name='50 EMA', color="#ff9800", width=2)
+                line_50.set(ema50_df)
+
         line_name = f"{tema_period} TEMA"
         tema_df = df_chart[['time', 'tema_custom']].dropna().rename(columns={'tema_custom': line_name})
         if not tema_df.empty:
-            tema_line = chart.create_line(name=line_name, color="orange", width=2)
+            tema_line = chart.create_line(name=line_name, color="#ab47bc", width=1)
             tema_line.set(tema_df)
 
         if vah is not None and pd.notnull(vah) and not np.isnan(vah) and vah > 0:
@@ -688,7 +700,7 @@ with col_log:
         "[INFO] Database connection established...",
         "[INFO] Live Execution Engine bound to Bybit Futures API via Cloudflare Worker Proxy.",
         "[INFO] Pending setups tab synchronized with PostgreSQL.",
-        "[STATUS] Monitoring futures strategy triggers and active positions."
+        "[STATUS] Monitoring 20/50 EMA scalping strategy triggers and active positions."
     ]
     for log_item in log_messages:
         st.code(log_item, language="text")

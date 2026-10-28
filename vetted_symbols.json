@@ -1,60 +1,138 @@
 {
-    "timestamp": 1792935247.9456038,
-    "vetted_count": 7,
+    "timestamp": 1793051600.624667,
+    "vetted_count": 5,
     "vetted_symbols": [
-        "BTC/USDT",
         "SOL/USDT",
+		"UNI/USDT",
         "XRP/USDT",
-        "SOXL/USDT",
-        "BMT/USDT",
-        "UNI/USDT",
-        "LIGHT/USDT"
+		"HYPE/USDT",
+		"BNB/USDT",
+		"SUI/USDT",
+		"ADA/USDT",
+        "CRCL/USDT",
+		"NEAR/USDT",
+		"BLESS/USDT",
+		"1000PEPE/USDT",
+		"XAG/USDT",
+		"BTC/USDT"
     ],
     "details": [
         {
             "symbol": "BTC/USDT",
-            "net_pnl": 146.97,
-            "profit_factor": 2.61,
-            "win_rate_pct": 50.0,
-            "total_trades": 6,
-            "status": "PASSED"
+            "net_pnl": 14.24,
+            "profit_factor": 1.08,
+            "win_rate_pct": 20.0,
+            "total_trades": 5,
+            "status": "FAILED"
         },
         {
             "symbol": "ETH/USDT",
-            "net_pnl": -179.53,
-            "profit_factor": 0.27,
-            "win_rate_pct": 14.29,
-            "total_trades": 7,
+            "net_pnl": -128.97,
+            "profit_factor": 0.34,
+            "win_rate_pct": 16.67,
+            "total_trades": 6,
+            "status": "FAILED"
+        },
+        {
+            "symbol": "SOXL/USDT",
+            "net_pnl": -50.74,
+            "profit_factor": 0.78,
+            "win_rate_pct": 33.33,
+            "total_trades": 3,
+            "status": "FAILED"
+        },
+        {
+            "symbol": "SNDK/USDT",
+            "net_pnl": -143.71,
+            "profit_factor": 0.0,
+            "win_rate_pct": 0.0,
+            "total_trades": 2,
             "status": "FAILED"
         },
         {
             "symbol": "ZEC/USDT",
-            "net_pnl": -721.78,
-            "profit_factor": 0.13,
+            "net_pnl": -792.84,
+            "profit_factor": 0.12,
             "win_rate_pct": 20.0,
             "total_trades": 10,
             "status": "FAILED"
         },
         {
+            "symbol": "XAU/USDT",
+            "net_pnl": -116.77,
+            "profit_factor": 0.08,
+            "win_rate_pct": 33.33,
+            "total_trades": 6,
+            "status": "FAILED"
+        },
+        {
             "symbol": "SOL/USDT",
-            "net_pnl": 494.75,
-            "profit_factor": 3.02,
-            "win_rate_pct": 66.67,
-            "total_trades": 9,
+            "net_pnl": 481.11,
+            "profit_factor": 2.86,
+            "win_rate_pct": 60.0,
+            "total_trades": 10,
             "status": "PASSED"
         },
         {
-            "symbol": "JCT/USDT",
-            "net_pnl": 210.38,
-            "profit_factor": 1.45,
+            "symbol": "SKHYNIX/USDT",
+            "net_pnl": -116.08,
+            "profit_factor": 0.0,
+            "win_rate_pct": 0.0,
+            "total_trades": 1,
+            "status": "FAILED"
+        },
+        {
+            "symbol": "CL/USDT",
+            "net_pnl": -5.14,
+            "profit_factor": 0.98,
+            "win_rate_pct": 28.57,
+            "total_trades": 7,
+            "status": "FAILED"
+        },
+        {
+            "symbol": "SPCX/USDT",
+            "net_pnl": -288.51,
+            "profit_factor": 0.37,
+            "win_rate_pct": 33.33,
+            "total_trades": 6,
+            "status": "FAILED"
+        },
+        {
+            "symbol": "KORU/USDT",
+            "net_pnl": -154.54,
+            "profit_factor": 0.54,
             "win_rate_pct": 25.0,
-            "total_trades": 8,
+            "total_trades": 4,
+            "status": "FAILED"
+        },
+        {
+            "symbol": "XAG/USDT",
+            "net_pnl": -129.89,
+            "profit_factor": 0.62,
+            "win_rate_pct": 44.44,
+            "total_trades": 9,
+            "status": "FAILED"
+        },
+        {
+            "symbol": "MU/USDT",
+            "net_pnl": -215.62,
+            "profit_factor": 0.0,
+            "win_rate_pct": 0.0,
+            "total_trades": 3,
+            "status": "FAILED"
+        },
+        {
+            "symbol": "HYPE/USDT",
+            "net_pnl": -10.03,
+            "profit_factor": 0.96,
+            "win_rate_pct": 42.86,
+            "total_trades": 7,
             "status": "FAILED"
         },
         {
             "symbol": "XRP/USDT",
-            "net_pnl": 138.56,
-            "profit_factor": 1.79,
+            "net_pnl": 155.75,
+            "profit_factor": 1.9,
             "win_rate_pct": 66.67,
             "total_trades": 6,
             "status": "PASSED"
@@ -68,203 +146,91 @@
             "status": "FAILED"
         },
         {
-            "symbol": "ORDER/USDT",
-            "net_pnl": -595.15,
-            "profit_factor": 0.09,
-            "win_rate_pct": 14.29,
+            "symbol": "BZ/USDT",
+            "net_pnl": -300.26,
+            "profit_factor": 0.41,
+            "win_rate_pct": 28.57,
             "total_trades": 7,
             "status": "FAILED"
         },
         {
-            "symbol": "IRYS/USDT",
-            "net_pnl": -186.51,
-            "profit_factor": 0.0,
-            "win_rate_pct": 0.0,
+            "symbol": "SKHY/USDT",
+            "net_pnl": -45.29,
+            "profit_factor": 0.61,
+            "win_rate_pct": 50.0,
             "total_trades": 2,
             "status": "FAILED"
         },
         {
-            "symbol": "SNDK/USDT",
-            "net_pnl": -78.55,
-            "profit_factor": 0.7,
+            "symbol": "SNXX/USDT",
+            "net_pnl": -151.59,
+            "profit_factor": 0.23,
             "win_rate_pct": 25.0,
             "total_trades": 4,
             "status": "FAILED"
         },
         {
-            "symbol": "APR/USDT",
-            "net_pnl": -315.15,
-            "profit_factor": 0.17,
-            "win_rate_pct": 20.0,
-            "total_trades": 5,
-            "status": "FAILED"
-        },
-        {
-            "symbol": "SOXL/USDT",
-            "net_pnl": 66.11,
-            "profit_factor": 1.57,
-            "win_rate_pct": 50.0,
-            "total_trades": 2,
-            "status": "PASSED"
-        },
-        {
-            "symbol": "BNB/USDT",
-            "net_pnl": -6.46,
-            "profit_factor": 0.97,
-            "win_rate_pct": 37.5,
-            "total_trades": 8,
-            "status": "FAILED"
-        },
-        {
-            "symbol": "XAU/USDT",
-            "net_pnl": -116.77,
-            "profit_factor": 0.08,
-            "win_rate_pct": 33.33,
+            "symbol": "DOOD/USDT",
+            "net_pnl": -164.45,
+            "profit_factor": 0.41,
+            "win_rate_pct": 16.67,
             "total_trades": 6,
             "status": "FAILED"
         },
         {
-            "symbol": "DOGE/USDT",
-            "net_pnl": -132.18,
-            "profit_factor": 0.0,
-            "win_rate_pct": 0.0,
-            "total_trades": 2,
-            "status": "FAILED"
-        },
-        {
-            "symbol": "HYPE/USDT",
-            "net_pnl": -10.03,
-            "profit_factor": 0.96,
-            "win_rate_pct": 42.86,
-            "total_trades": 7,
-            "status": "FAILED"
-        },
-        {
-            "symbol": "1000PEPE/USDT",
-            "net_pnl": -115.24,
-            "profit_factor": 0.0,
-            "win_rate_pct": 0.0,
-            "total_trades": 7,
-            "status": "FAILED"
-        },
-        {
-            "symbol": "T/USDT",
-            "net_pnl": 66.64,
-            "profit_factor": 1.58,
+            "symbol": "SOXS/USDT",
+            "net_pnl": 29.03,
+            "profit_factor": 1.19,
             "win_rate_pct": 33.33,
             "total_trades": 3,
             "status": "FAILED"
         },
         {
-            "symbol": "WLD/USDT",
-            "net_pnl": -772.42,
-            "profit_factor": 0.04,
-            "win_rate_pct": 11.11,
-            "total_trades": 9,
+            "symbol": "Q/USDT",
+            "net_pnl": -456.91,
+            "profit_factor": 0.0,
+            "win_rate_pct": 0.0,
+            "total_trades": 4,
             "status": "FAILED"
         },
         {
             "symbol": "ENA/USDT",
-            "net_pnl": -210.99,
-            "profit_factor": 0.4,
+            "net_pnl": -102.54,
+            "profit_factor": 0.71,
             "win_rate_pct": 40.0,
             "total_trades": 5,
             "status": "FAILED"
         },
         {
-            "symbol": "BIRB/USDT",
-            "net_pnl": -14.8,
-            "profit_factor": 0.96,
-            "win_rate_pct": 42.86,
-            "total_trades": 7,
-            "status": "FAILED"
-        },
-        {
-            "symbol": "SUI/USDT",
-            "net_pnl": -79.93,
-            "profit_factor": 0.38,
-            "win_rate_pct": 33.33,
-            "total_trades": 3,
-            "status": "FAILED"
-        },
-        {
-            "symbol": "SPY/USDT",
-            "net_pnl": -85.31,
-            "profit_factor": 0.56,
-            "win_rate_pct": 22.22,
+            "symbol": "BNB/USDT",
+            "net_pnl": -8.18,
+            "profit_factor": 0.97,
+            "win_rate_pct": 44.44,
             "total_trades": 9,
             "status": "FAILED"
         },
         {
-            "symbol": "CL/USDT",
-            "net_pnl": -121.01,
-            "profit_factor": 0.72,
-            "win_rate_pct": 25.0,
+            "symbol": "JCT/USDT",
+            "net_pnl": -182.74,
+            "profit_factor": 0.71,
+            "win_rate_pct": 12.5,
             "total_trades": 8,
             "status": "FAILED"
         },
         {
-            "symbol": "BMT/USDT",
-            "net_pnl": 115.15,
-            "profit_factor": 1.27,
+            "symbol": "CRCL/USDT",
+            "net_pnl": 110.74,
+            "profit_factor": 2.55,
             "win_rate_pct": 50.0,
-            "total_trades": 8,
+            "total_trades": 6,
             "status": "PASSED"
         },
         {
-            "symbol": "XAG/USDT",
-            "net_pnl": -81.85,
-            "profit_factor": 0.74,
-            "win_rate_pct": 50.0,
-            "total_trades": 8,
-            "status": "FAILED"
-        },
-        {
-            "symbol": "SKHYNIX/USDT",
-            "net_pnl": -116.08,
+            "symbol": "1000PEPE/USDT",
+            "net_pnl": -99.39,
             "profit_factor": 0.0,
             "win_rate_pct": 0.0,
-            "total_trades": 1,
-            "status": "FAILED"
-        },
-        {
-            "symbol": "UNI/USDT",
-            "net_pnl": 302.74,
-            "profit_factor": 21.41,
-            "win_rate_pct": 66.67,
-            "total_trades": 3,
-            "status": "PASSED"
-        },
-        {
-            "symbol": "ADA/USDT",
-            "net_pnl": -27.39,
-            "profit_factor": 0.94,
-            "win_rate_pct": 42.86,
-            "total_trades": 7,
-            "status": "FAILED"
-        },
-        {
-            "symbol": "MU/USDT",
-            "net_pnl": -215.62,
-            "profit_factor": 0.0,
-            "win_rate_pct": 0.0,
-            "total_trades": 3,
-            "status": "FAILED"
-        },
-        {
-            "symbol": "KORU/USDT",
-            "net_pnl": -268.67,
-            "profit_factor": 0.4,
-            "win_rate_pct": 20.0,
-            "total_trades": 5,
-            "status": "FAILED"
-        },
-        {
-            "symbol": "MSTR/USDT",
-            "net_pnl": -225.27,
-            "profit_factor": 0.15,
-            "win_rate_pct": 40.0,
-            "total_trades": 5,
+            "total_trades": 6,
             "status": "FAILED"
         },
         {
@@ -276,59 +242,83 @@
             "status": "FAILED"
         },
         {
-            "symbol": "LIGHT/USDT",
-            "net_pnl": 270.32,
-            "profit_factor": 3.31,
-            "win_rate_pct": 75.0,
-            "total_trades": 4,
+            "symbol": "MSTR/USDT",
+            "net_pnl": 172.82,
+            "profit_factor": 16.51,
+            "win_rate_pct": 50.0,
+            "total_trades": 2,
             "status": "PASSED"
         },
         {
-            "symbol": "SPCX/USDT",
-            "net_pnl": -288.51,
-            "profit_factor": 0.37,
-            "win_rate_pct": 33.33,
-            "total_trades": 6,
+            "symbol": "QNT/USDT",
+            "net_pnl": -228.45,
+            "profit_factor": 0.5,
+            "win_rate_pct": 42.86,
+            "total_trades": 7,
             "status": "FAILED"
         },
         {
-            "symbol": "MAGMA/USDT",
-            "net_pnl": 71.95,
-            "profit_factor": 1.18,
-            "win_rate_pct": 37.5,
-            "total_trades": 8,
+            "symbol": "BULLA/USDT",
+            "net_pnl": -288.49,
+            "profit_factor": 0.39,
+            "win_rate_pct": 20.0,
+            "total_trades": 5,
             "status": "FAILED"
         },
         {
-            "symbol": "PUMP/USDT",
-            "net_pnl": -118.69,
-            "profit_factor": 0.44,
+            "symbol": "DOGE/USDT",
+            "net_pnl": -245.12,
+            "profit_factor": 0.02,
             "win_rate_pct": 25.0,
             "total_trades": 4,
             "status": "FAILED"
         },
         {
-            "symbol": "TAO/USDT",
-            "net_pnl": -36.27,
-            "profit_factor": 0.94,
-            "win_rate_pct": 37.5,
-            "total_trades": 8,
+            "symbol": "NVDA/USDT",
+            "net_pnl": -21.91,
+            "profit_factor": 0.0,
+            "win_rate_pct": 0.0,
+            "total_trades": 2,
             "status": "FAILED"
         },
         {
-            "symbol": "CAP/USDT",
-            "net_pnl": -176.85,
+            "symbol": "TSLA/USDT",
+            "net_pnl": -18.96,
             "profit_factor": 0.49,
             "win_rate_pct": 25.0,
             "total_trades": 4,
             "status": "FAILED"
         },
         {
-            "symbol": "LINK/USDT",
-            "net_pnl": -143.03,
-            "profit_factor": 0.59,
-            "win_rate_pct": 50.0,
-            "total_trades": 6,
+            "symbol": "QQQ/USDT",
+            "net_pnl": -74.25,
+            "profit_factor": 0.1,
+            "win_rate_pct": 33.33,
+            "total_trades": 3,
+            "status": "FAILED"
+        },
+        {
+            "symbol": "META/USDT",
+            "net_pnl": -109.28,
+            "profit_factor": 0.62,
+            "win_rate_pct": 14.29,
+            "total_trades": 7,
+            "status": "FAILED"
+        },
+        {
+            "symbol": "UNITREE/USDT",
+            "net_pnl": 90.49,
+            "profit_factor": 1.31,
+            "win_rate_pct": 44.44,
+            "total_trades": 9,
+            "status": "PASSED"
+        },
+        {
+            "symbol": "WLD/USDT",
+            "net_pnl": -664.59,
+            "profit_factor": 0.04,
+            "win_rate_pct": 12.5,
+            "total_trades": 8,
             "status": "FAILED"
         }
     ]

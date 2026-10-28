@@ -19,18 +19,16 @@ FAST_EMA_PERIOD = 20
 SLOW_EMA_PERIOD = 50
 RSI_PERIOD = 14
 ADX_PERIOD = 14
-ATR_PERIOD = 14                  # Added for ATR tracking support
-MIN_ADX_THRESHOLD = 20.0         # Filters out ranging/choppy markets
-MAX_ADX_THRESHOLD = 42.0         # Upper ADX ceiling filter (prevents late-stage trend entry)
-TARGET_PROFIT_PCT = 0.02         # 2% target market movement (1% to 3% range)
-MAX_SL_PCT = 0.010               # Calibrated stop loss percentage
+MIN_ADX_THRESHOLD = 22.0         # Filters out ranging/choppy markets
+TARGET_PROFIT_PCT = 0.03         # 2% target market movement (1% to 3% range)
+MAX_SL_PCT = 0.015               # Tight 1.0% stop loss for scalping leverage
 
 
 # ---------------------------------------------------------------------------
 # 1. TOP 40 VOLUME SCANNER & CONFIG HELPERS
 # ---------------------------------------------------------------------------
 
-def fetch_top_volume_symbols(limit: int = 40) -> List[str]:
+def fetch_top_volume_symbols(limit: int = 10) -> List[str]:
     """Scans Binance or Bybit USDT linear futures for the top N coins by 24h quote volume."""
     try:
         exchange = ccxt.binanceusdm({'enableRateLimit': True})
@@ -54,8 +52,8 @@ def fetch_top_volume_symbols(limit: int = 40) -> List[str]:
         logger.error(f"Failed to scan top volume symbols: {e}")
         # Fallback default scalping list
         return ["BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT", "DOGE/USDT", "ADA/USDT", "AVAX/USDT", "LINK/USDT"]
-
-
+        
+        
 def load_symbol_config(symbol: str = "") -> dict:
     """Loads configuration settings for symbols from strategy_config.json with safe defaults."""
     default_config = {
@@ -68,7 +66,7 @@ def load_symbol_config(symbol: str = "") -> dict:
         "adx_period": 14,
         "adx_threshold": 20.0,
         "use_adx_filter": True,
-        "max_sl_pct": 0.01,
+        "max_sl_pct": 0.010,
         "atr_period": 14,
         "atr_mult": 2.0,
         "use_atr_sl": True,
@@ -86,14 +84,27 @@ def load_symbol_config(symbol: str = "") -> dict:
 
 
 def fetch_klines(symbol: str, interval: str = "15m", limit: int = 600) -> pd.DataFrame:
-    """Fetches historical kline OHLCV data for live orchestration loops."""
+    """Fetches historical kline OHLCV data for live orchestration loops and charts."""
     try:
         exchange = ccxt.binanceusdm({'enableRateLimit': True})
-        clean_symbol = symbol.split(':')[0]
-        if not clean_symbol.endswith('USDT') and '/' not in clean_symbol:
-            clean_symbol = f"{clean_symbol}/USDT"
-            
-        ohlcv = exchange.fetch_ohlcv(clean_symbol, timeframe=interval, limit=limit)
+        
+        # Clean and format symbol correctly for Binance USDS-M Futures
+        clean_symbol = symbol.split(':')[0].strip()
+        if not clean_symbol.endswith('/USDT'):
+            if clean_symbol.endswith('USDT'):
+                clean_symbol = clean_symbol[:-4] + '/USDT'
+            else:
+                clean_symbol = f"{clean_symbol}/USDT"
+                
+        # Append linear futures contract suffix if supported by CCXT
+        futures_symbol = f"{clean_symbol}:USDT"
+        
+        try:
+            ohlcv = exchange.fetch_ohlcv(futures_symbol, timeframe=interval, limit=limit)
+        except Exception:
+            # Fallback to standard symbol format if colon notation fails
+            ohlcv = exchange.fetch_ohlcv(clean_symbol, timeframe=interval, limit=limit)
+
         if not ohlcv:
             return pd.DataFrame()
             
@@ -102,7 +113,7 @@ def fetch_klines(symbol: str, interval: str = "15m", limit: int = 600) -> pd.Dat
         df = df.drop_duplicates(subset=['timestamp']).sort_values('timestamp').reset_index(drop=True)
         return df
     except Exception as e:
-        logger.error(f"Failed to fetch klines for {symbol}: {e}")
+        logger.error(f"Failed to fetch klines for {symbol} on {interval}: {e}")
         return pd.DataFrame()
 
 
@@ -188,49 +199,44 @@ def evaluate_scalp_signals(
         no_signal["reason"] = "Insufficient kline data"
         return no_signal
 
-    # Compute Indicators
     df = df.copy()
-    df["ema_fast"] = calculate_ema(df["close"], FAST_EMA_PERIOD)
-    df["ema_slow"] = calculate_ema(df["close"], SLOW_EMA_PERIOD)
+    df["ema_fast"] = calculate_ema(df["close"], FAST_EMA_PERIOD) # 20 EMA
+    df["ema_slow"] = calculate_ema(df["close"], SLOW_EMA_PERIOD) # 50 EMA
     df["rsi"] = calculate_rsi(df["close"], RSI_PERIOD)
     df["adx"] = calculate_adx(df, ADX_PERIOD)
-    df["atr"] = calculate_atr(df, ATR_PERIOD)
+    df["atr"] = calculate_atr(df, period=14)
 
     last_row = df.iloc[-1]
-    prev_row = df.iloc[-2]
-    
     current_price = float(last_row["close"])
+    open_price = float(last_row["open"])
     fast_ema = float(last_row["ema_fast"])
     slow_ema = float(last_row["ema_slow"])
-    prev_fast = float(prev_row["ema_fast"])
-    prev_slow = float(prev_row["ema_slow"])
-    
     current_rsi = float(last_row["rsi"])
     current_adx = float(last_row["adx"])
+    current_atr = float(last_row["atr"])
 
-    # 1. Momentum and ADX Bandpass Filter (20 <= ADX <= 42)
+    # 1. Trend & Choppy Market Filter (ADX)
     if current_adx < MIN_ADX_THRESHOLD:
-        no_signal["reason"] = f"Trend Filter: ADX ({current_adx:.1f}) too low (market is chopping)"
+        no_signal["reason"] = f"Trend Filter: ADX ({current_adx:.1f}) too low"
         return no_signal
 
-    if current_adx > MAX_ADX_THRESHOLD:
-        no_signal["reason"] = f"Exhaustion Filter: ADX ({current_adx:.1f}) exceeds ceiling threshold ({MAX_ADX_THRESHOLD})"
-        return no_signal
-
+    # 2. Volume Expansion Check
     if not check_volume_spike(df, period=20, multiplier=1.15):
-        no_signal["reason"] = "Volume Gate: Insufficient volume spike on execution candle"
+        no_signal["reason"] = "Volume Gate: Insufficient volume expansion"
         return no_signal
 
-    # 2. EMA Crossover Mechanics (20 crosses 50)
-    bullish_crossover = (prev_fast <= prev_slow) and (fast_ema > slow_ema)
-    bearish_crossover = (prev_fast >= prev_slow) and (fast_ema < slow_ema)
+    # 3. Pullback Proximity & Price Action Confirmation
+    ema_distance_pct = abs(current_price - fast_ema) / fast_ema
+    is_near_ema = ema_distance_pct <= 0.005  # slightly relaxed proximity
 
     # -----------------------------------------------------------------------
-    # LONG SCALP SETUP
+    # LONG SETUP (Uptrend + Pullback + Bullish Confirmation Candle)
     # -----------------------------------------------------------------------
-    if bullish_crossover and current_rsi > 50.0 and current_rsi < 75.0:
+    is_bullish_rejection = current_price > open_price  # Green confirmation candle
+    if fast_ema > slow_ema and is_near_ema and is_bullish_rejection and (50.0 <= current_rsi < 72.0):
         entry_price = current_price
-        stop_loss = entry_price * (1.0 - MAX_SL_PCT)
+        # ATR-based stop loss below recent swing or 1.5x ATR buffer
+        stop_loss = entry_price - (1.2 * current_atr)
         take_profit = entry_price * (1.0 + TARGET_PROFIT_PCT)
         
         sl_distance = entry_price - stop_loss
@@ -240,23 +246,22 @@ def evaluate_scalp_signals(
 
         return {
             "action": "BUY", "order_type": "MARKET", "symbol": symbol, "direction": "LONG",
-            "regime": "EMA_SCALP_5M_15M",
+            "regime": "EMA_PULLBACK_CONFIRMED",
             "entry_price": float(round(entry_price, 4)),
             "stop_loss": float(round(stop_loss, 4)),
             "take_profit": float(round(take_profit, 4)),
             "rr_ratio": float(round(computed_rr, 2)),
             "position_size": float(position_size),
-            "entry_rsi": float(round(current_rsi, 2)),
-            "entry_adx": float(round(current_adx, 2)),
-            "reason": f"Bullish EMA Cross + RSI ({current_rsi:.1f}) + ADX ({current_adx:.1f}): TP={take_profit}"
+            "reason": f"Uptrend Pullback + Bullish Rejection: TP={take_profit}"
         }
 
     # -----------------------------------------------------------------------
-    # SHORT SCALP SETUP
+    # SHORT SETUP (Downtrend + Bounce + Bearish Confirmation Candle)
     # -----------------------------------------------------------------------
-    if bearish_crossover and current_rsi < 50.0 and current_rsi > 25.0:
+    is_bearish_rejection = current_price < open_price  # Red confirmation candle
+    if fast_ema < slow_ema and is_near_ema and is_bearish_rejection and (28.0 < current_rsi <= 50.0):
         entry_price = current_price
-        stop_loss = entry_price * (1.0 + MAX_SL_PCT)
+        stop_loss = entry_price + (1.5 * current_atr)
         take_profit = entry_price * (1.0 - TARGET_PROFIT_PCT)
         
         sl_distance = stop_loss - entry_price
@@ -266,21 +271,18 @@ def evaluate_scalp_signals(
 
         return {
             "action": "SELL", "order_type": "MARKET", "symbol": symbol, "direction": "SHORT",
-            "regime": "EMA_SCALP_5M_15M",
+            "regime": "EMA_PULLBACK_CONFIRMED",
             "entry_price": float(round(entry_price, 4)),
             "stop_loss": float(round(stop_loss, 4)),
             "take_profit": float(round(take_profit, 4)),
             "rr_ratio": float(round(computed_rr, 2)),
             "position_size": float(position_size),
-            "entry_rsi": float(round(current_rsi, 2)),
-            "entry_adx": float(round(current_adx, 2)),
-            "reason": f"Bearish EMA Cross + RSI ({current_rsi:.1f}) + ADX ({current_adx:.1f}): TP={take_profit}"
+            "reason": f"Downtrend Bounce + Bearish Rejection: TP={take_profit}"
         }
 
-    no_signal["reason"] = "No valid 20/50 EMA crossover with momentum filters met"
+    no_signal["reason"] = "No valid confirmed pullback or volume setup met"
     return no_signal
-
-
+    
 # ---------------------------------------------------------------------------
 # MODULE-LEVEL ALIASES FOR MAIN.PY COMPATIBILITY
 # ---------------------------------------------------------------------------
