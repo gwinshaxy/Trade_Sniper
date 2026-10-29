@@ -895,13 +895,22 @@ class BybitFuturesLiveExecutor:
             logger.warning(f"[{symbol}] Order Rejected: High Spread detected ({spread_pct * 100:.3f}%).")
             return {"status": "FAILED", "error": f"Spread too high ({spread_pct * 100:.3f}%)"}
 
-        # Paper execution bypass if testnet or paper trading enabled
+        # In order_futures_bybit (Paper Mode Section)
         is_paper_mode = os.getenv("ENABLE_PAPER_TRADING", "false").lower() == "true"
         if is_paper_mode:
             ticker_data_p = self.fetch_ticker_data(ccxt_symbol)
-            ref_p = ticker_data_p["ask"] if (is_long and ticker_data_p["ask"] > 0) else ticker_data_p["bid"] if (not is_long and ticker_data_p["bid"] > 0) else ticker_data_p["exec_price"]
+            ref_p = ticker_data_p["exec_price"] if ticker_data_p["exec_price"] > 0 else (
+                ticker_data_p["ask"] if (is_long and ticker_data_p["ask"] > 0) else ticker_data_p["bid"]
+            )
+            
+            # If live ticker fetch failed for prefixed symbols, query klines for the latest live close instead of static signal entry
             if ref_p <= 0:
-                ref_p = entry_price if entry_price > 0 else 1.0
+                latest_df = fetch_klines(symbol, interval="15m", limit=5)
+                if not latest_df.empty:
+                    ref_p = float(latest_df["close"].iloc[-1])
+                else:
+                    ref_p = entry_price if entry_price > 0 else 1.0
+
             return execute_virtual_paper_trade(
                 symbol=symbol, direction=direction, amount_usd=amount_usd,
                 entry_price=ref_p, stop_loss=stop_loss, take_profit=take_profit,
