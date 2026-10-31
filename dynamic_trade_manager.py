@@ -14,16 +14,16 @@ logger = logging.getLogger("dynamic_trade_manager")
 class DynamicTradeManager:
     """
     Handles dynamic active position management with a progressive
-    breakeven + trailing stop model incorporating chop absorption and hysteresis.
+    breakeven + trailing stop model recalibrated for 2.0%-2.5% 15m scalping targets.
     """
 
     def __init__(
         self,
-        trailing_mult: float = 3.0,
-        be_rr_trigger: float = 1.5,
-        trail_rr_trigger: float = 2.0,
-        tighten_rr_trigger: float = 3.5,
-        tighten_mult: float = 1.8,
+        trailing_mult: float = 2.0,
+        be_rr_trigger: float = 0.6,
+        trail_rr_trigger: float = 0.9,
+        tighten_rr_trigger: float = 1.3,
+        tighten_mult: float = 1.2,
         be_buffer_atr: float = 0.1,
         hard_tp_enabled: bool = True,
         allow_partial_tp: bool = False,
@@ -187,13 +187,13 @@ class DynamicTradeManager:
                 logger.error(
                     f"🚨 CORRUPT TP for #{trade_id}: LONG TP (${current_tp}) <= entry (${entry_price})."
                 )
-                current_tp = entry_price + (abs(entry_price - current_sl) * 3.0)
+                current_tp = entry_price + (abs(entry_price - current_sl) * 2.0)
                 db_needs_update = True
             elif (not is_long) and current_tp > 0 and current_tp >= entry_price:
                 logger.error(
                     f"🚨 CORRUPT TP for #{trade_id}: SHORT TP (${current_tp}) >= entry (${entry_price})."
                 )
-                current_tp = entry_price - (abs(entry_price - current_sl) * 3.0)
+                current_tp = entry_price - (abs(entry_price - current_sl) * 2.0)
                 db_needs_update = True
 
             if current_sl == 0.0 and entry_price > 0:
@@ -202,7 +202,7 @@ class DynamicTradeManager:
 
             if current_tp == 0.0 and entry_price > 0:
                 risk = abs(entry_price - current_sl)
-                current_tp = entry_price + (risk * 4.0) if is_long else entry_price - (risk * 4.0)
+                current_tp = entry_price + (risk * 2.2) if is_long else entry_price - (risk * 2.2)
                 db_needs_update = True
 
             if db_needs_update and trade_id is not None:
@@ -214,7 +214,6 @@ class DynamicTradeManager:
             
             is_paper_mode = os.getenv("ENABLE_PAPER_TRADING", "false").lower() == "true" or BYBIT_TESTNET
             
-            # Intra-candle SL / TP breach check for Paper Mode or strict evaluation ticks
             if current_sl > 0 or current_tp > 0:
                 if is_long:
                     hit_sl = low_price <= current_sl if current_sl > 0 else False
@@ -271,14 +270,14 @@ class DynamicTradeManager:
                         ),
                     }
 
-            # ---- 2. Progressive breakeven + trailing with Chop Absorption --------
+            # ---- 2. Progressive breakeven + trailing tailored for 15m scalps --------
             if atr > 0:
                 risk_dist = abs(entry_price - current_sl) if current_sl > 0 else (entry_price * 0.02)
 
                 if is_long:
                     unrealized_profit = close_price - entry_price
 
-                    # Breakeven (+1.5R)
+                    # Breakeven (~0.6R trigger)
                     if trade_state == "OPEN" and unrealized_profit >= (risk_dist * self.be_rr_trigger):
                         candidate_sl = entry_price + (atr * self.be_buffer_atr)
                         if candidate_sl > entry_price and candidate_sl > current_sl:
@@ -289,19 +288,18 @@ class DynamicTradeManager:
                                 "msg": f"🔒 Trade #{trade_id} moved to Breakeven @ ${candidate_sl:.5f}"
                             }
 
-                    # Trailing (+2.0R) with Wider Buffer & Hysteresis to prevent zig-zag whipsaws
+                    # Trailing (~0.9R trigger)
                     if trade_state in ["BE_LOCKED", "TRAILING"] and unrealized_profit >= (risk_dist * self.trail_rr_trigger):
-                        relaxed_trailing_mult = self.trailing_mult * 1.25
-                        candidate_sl = close_price - (atr * relaxed_trailing_mult)
+                        candidate_sl = close_price - (atr * self.trailing_mult)
                         if candidate_sl > entry_price and candidate_sl > current_sl:
                             return {
                                 "action": "UPDATE_SL",
                                 "new_sl": candidate_sl,
                                 "new_state": "TRAILING",
-                                "msg": f"📈 Relaxed Trail activated for #{trade_id} → SL @ ${candidate_sl:.5f} (Absorbing chop)"
+                                "msg": f"📈 Scalp Trail activated for #{trade_id} → SL @ ${candidate_sl:.5f}"
                             }
 
-                    # Tighten (+3.5R)
+                    # Tightening (~1.3R trigger)
                     if trade_state == "TRAILING" and unrealized_profit >= (risk_dist * self.tighten_rr_trigger):
                         candidate_sl = close_price - (atr * self.tighten_mult)
                         if candidate_sl > entry_price and candidate_sl > current_sl:
@@ -309,7 +307,7 @@ class DynamicTradeManager:
                                 "action": "UPDATE_SL",
                                 "new_sl": candidate_sl,
                                 "new_state": "TRAILING",
-                                "msg": f"📈 Tightened trail for #{trade_id} → SL @ ${candidate_sl:.5f}"
+                                "msg": f"📈 Tightened scalp trail for #{trade_id} → SL @ ${candidate_sl:.5f}"
                             }
                 else:  # SHORT
                     unrealized_profit = entry_price - close_price
@@ -325,19 +323,18 @@ class DynamicTradeManager:
                                 "msg": f"🔒 Trade #{trade_id} moved to Breakeven @ ${candidate_sl:.5f}"
                             }
 
-                    # Trailing with Wider Buffer & Hysteresis
+                    # Trailing
                     if trade_state in ["BE_LOCKED", "TRAILING"] and unrealized_profit >= (risk_dist * self.trail_rr_trigger):
-                        relaxed_trailing_mult = self.trailing_mult * 1.25
-                        candidate_sl = close_price + (atr * relaxed_trailing_mult)
+                        candidate_sl = close_price + (atr * self.trailing_mult)
                         if candidate_sl < entry_price and (current_sl == 0 or candidate_sl < current_sl):
                             return {
                                 "action": "UPDATE_SL",
                                 "new_sl": candidate_sl,
                                 "new_state": "TRAILING",
-                                "msg": f"📉 Relaxed Trail activated for #{trade_id} → SL @ ${candidate_sl:.5f} (Absorbing chop)"
+                                "msg": f"📉 Scalp Trail activated for #{trade_id} → SL @ ${candidate_sl:.5f}"
                             }
 
-                    # Tighten
+                    # Tightening
                     if trade_state == "TRAILING" and unrealized_profit >= (risk_dist * self.tighten_rr_trigger):
                         candidate_sl = close_price + (atr * self.tighten_mult)
                         if candidate_sl < entry_price and (current_sl == 0 or candidate_sl < current_sl):
@@ -345,7 +342,7 @@ class DynamicTradeManager:
                                 "action": "UPDATE_SL",
                                 "new_sl": candidate_sl,
                                 "new_state": "TRAILING",
-                                "msg": f"📉 Tightened trail for #{trade_id} → SL @ ${candidate_sl:.5f}"
+                                "msg": f"📉 Tightened scalp trail for #{trade_id} → SL @ ${candidate_sl:.5f}"
                             }
 
             return {"action": "HOLD"}

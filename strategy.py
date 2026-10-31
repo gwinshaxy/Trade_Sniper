@@ -20,7 +20,9 @@ EMA_TREND_PERIOD = 200
 VOLUME_SMA_PERIOD = 20
 RSI_PERIOD = 14
 ADX_PERIOD = 14
-MIN_ADX_THRESHOLD = 22.0         # Filters out ranging/choppy markets
+MIN_ADX_THRESHOLD = 22.0         # Existing ADX threshold
+CHOP_PERIOD = 14                 # Choppiness Index lookback period
+MAX_CHOP_THRESHOLD = 61.8        # Upper limit: filters out choppy/sideways markets if CHOP > 58
 TARGET_PROFIT_PCT = 0.025        # Fixed 2.5% target profit
 ATR_SL_MULTIPLIER = 2.0          # Dynamic ATR multiplier for initial stop loss
 ROUND_TRIP_FEE_PCT = 0.0010      # 0.10% covers taker entry + exit fees
@@ -96,31 +98,6 @@ def fetch_top_volume_symbols(limit: int = 10) -> List[str]:
         return ["BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT", "DOGE/USDT", "ADA/USDT", "AVAX/USDT", "LINK/USDT"]
 
 
-def load_symbol_config(symbol: str = "") -> dict:
-    default_config = {
-        "account_balance": 100.0,
-        "risk_pct": 1.0,
-        "leverage": 5,
-        "dema_period": 9,
-        "ema_50_period": 50,
-        "ema_200_period": 200,
-        "rsi_period": 14,
-        "adx_period": 14,
-        "adx_threshold": 20.0,
-        "target_profit_pct": 0.025,
-        "use_ema_200_filter": True,
-    }
-    if os.path.exists("strategy_config.json"):
-        try:
-            with open("strategy_config.json", "r") as f:
-                data = json.load(f)
-                if isinstance(data, dict):
-                    default_config.update(data)
-        except Exception as e:
-            logger.warning(f"Could not load strategy_config.json: {e}")
-    return default_config
-
-
 def fetch_klines(symbol: str, interval: str = "15m", limit: int = 600) -> pd.DataFrame:
     try:
         exchange = ccxt.binanceusdm({'enableRateLimit': True})
@@ -192,8 +169,41 @@ def calculate_adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
     return dx.rolling(period).mean().fillna(0)
 
 
+def calculate_choppiness_index(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    """
+    Calculates the Choppiness Index (CHOP).
+    CHOP = 100 * LOG10( SUM(ATR, n) / (MAX_HIGH(n) - MIN_LOW(n)) ) / LOG10(n)
+    """
+    if df.empty or len(df) < period:
+        return pd.Series(50.0, index=df.index)
+    
+    high = df['high']
+    low = df['low']
+    close = df['close']
+    
+    # 1. True Range for each bar
+    tr1 = high - low
+    tr2 = (high - close.shift(1)).abs()
+    tr3 = (low - close.shift(1)).abs()
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    
+    # 2. Sum of ATR over period
+    sum_atr = tr.rolling(window=period).sum()
+    
+    # 3. Highest High and Lowest Low over period
+    highest_high = high.rolling(window=period).max()
+    lowest_low = low.rolling(window=period).min()
+    
+    # 4. CHOP Formula
+    range_hl = highest_high - lowest_low
+    range_hl = range_hl.replace(0, np.nan)  # avoid division by zero
+    
+    chop = 100.0 * np.log10(sum_atr / range_hl) / np.log10(period)
+    return chop.fillna(50.0)
+
+
 # ---------------------------------------------------------------------------
-# 3. SCALPING SIGNAL EVALUATION ENGINE (Strict Simultaneous Crossover & Volume Spike)
+# 3. SCALPING SIGNAL EVALUATION ENGINE (With CHOP Filter)
 # ---------------------------------------------------------------------------
 
 def evaluate_scalp_signals(
@@ -202,6 +212,7 @@ def evaluate_scalp_signals(
     account_balance: float = 100.0,
     risk_pct: float = 1.0,
     use_ema_200_filter: bool = False,
+    use_chop_filter: bool = True,
     **kwargs
 ) -> Dict[str, Any]:
     no_signal = {
@@ -225,6 +236,7 @@ def evaluate_scalp_signals(
     df["vol_sma20"] = df["volume"].rolling(VOLUME_SMA_PERIOD).mean()
     df["rsi"] = calculate_rsi(df["close"], RSI_PERIOD)
     df["adx"] = calculate_adx(df, ADX_PERIOD)
+    df["chop"] = calculate_choppiness_index(df, CHOP_PERIOD)
     df["atr"] = calculate_atr(df, period=14)
 
     last_row = df.iloc[-1]
@@ -243,10 +255,17 @@ def evaluate_scalp_signals(
     
     current_rsi = float(last_row["rsi"])
     current_adx = float(last_row["adx"])
+    current_chop = float(last_row["chop"])
     current_atr = float(last_row["atr"])
 
+    # Filter 1: ADX Trend Filter
     if current_adx < MIN_ADX_THRESHOLD:
         no_signal["reason"] = f"Trend Filter: ADX ({current_adx:.1f}) below threshold {MIN_ADX_THRESHOLD}"
+        return no_signal
+
+    # Filter 2: Choppiness Index Filter (CHOP > MAX_CHOP_THRESHOLD indicates choppy range)
+    if use_chop_filter and current_chop > MAX_CHOP_THRESHOLD:
+        no_signal["reason"] = f"Choppiness Filter: CHOP ({current_chop:.1f}) above limit {MAX_CHOP_THRESHOLD}"
         return no_signal
 
     # 1. Base Crossover Detection
@@ -278,13 +297,13 @@ def evaluate_scalp_signals(
 
         return {
             "action": "BUY", "order_type": "MARKET", "symbol": symbol, "direction": "LONG",
-            "regime": "DEMA_EMA_STRICT_CROSS_VOL",
+            "regime": "DEMA_EMA_STRICT_CROSS_VOL_CHOP",
             "entry_price": format_price(entry_price),
             "stop_loss": format_price(stop_loss),
             "take_profit": format_price(take_profit),
             "rr_ratio": float(round(computed_rr, 2)),
             "position_size": float(position_size),
-            "reason": f"Simultaneous Bullish Cross + Volume Spike + RSI ({current_rsi:.1f})"
+            "reason": f"Simultaneous Bullish Cross + Vol + RSI ({current_rsi:.1f}) + CHOP ({current_chop:.1f})"
         }
 
     # -----------------------------------------------------------------------
@@ -304,13 +323,13 @@ def evaluate_scalp_signals(
 
         return {
             "action": "SELL", "order_type": "MARKET", "symbol": symbol, "direction": "SHORT",
-            "regime": "DEMA_EMA_STRICT_CROSS_VOL",
+            "regime": "DEMA_EMA_STRICT_CROSS_VOL_CHOP",
             "entry_price": format_price(entry_price),
             "stop_loss": format_price(stop_loss),
             "take_profit": format_price(take_profit),
             "rr_ratio": float(round(computed_rr, 2)),
             "position_size": float(position_size),
-            "reason": f"Simultaneous Bearish Cross + Volume Spike + RSI ({current_rsi:.1f})"
+            "reason": f"Simultaneous Bearish Cross + Vol + RSI ({current_rsi:.1f}) + CHOP ({current_chop:.1f})"
         }
 
     no_signal["reason"] = "No valid simultaneous crossover and volume spike matching filter conditions"
