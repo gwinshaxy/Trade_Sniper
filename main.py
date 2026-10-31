@@ -39,7 +39,7 @@ from strategy import (
     evaluate_signals,
     load_symbol_config,
     fetch_klines,
-    calculate_tema as calc_tema,
+    calculate_dema as calc_tema,
     calculate_atr as calc_atr
 )
 from dynamic_trade_manager import DynamicTradeManager

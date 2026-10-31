@@ -1,7 +1,6 @@
 import os
 import time
 import math
-import asyncio
 import logging
 import json
 import ccxt
@@ -14,14 +13,17 @@ logger = logging.getLogger("scalp_strategy_engine")
 # ---------------------------------------------------------------------------
 # GLOBAL SCALPING TIMEFRAME & DEFAULT PARAMETERS
 # ---------------------------------------------------------------------------
-EXECUTION_TIMEFRAME = "15m"      # Configurable to "5m" or "15m"
-FAST_EMA_PERIOD = 9
-SLOW_EMA_PERIOD = 21
+EXECUTION_TIMEFRAME = "15m"      # 15m default execution
+DEMA_FAST_PERIOD = 9
+EMA_MEDIUM_PERIOD = 50
+EMA_TREND_PERIOD = 200
+VOLUME_SMA_PERIOD = 20
 RSI_PERIOD = 14
 ADX_PERIOD = 14
-MIN_ADX_THRESHOLD = 20.0         # Filters out ranging/choppy markets
-TARGET_PROFIT_PCT = 0.025        # 2.5% baseline target market movement
-MAX_SL_PCT = 0.010               # 1.0% baseline stop loss
+MIN_ADX_THRESHOLD = 22.0         # Filters out ranging/choppy markets
+TARGET_PROFIT_PCT = 0.025        # Fixed 2.5% target profit
+ATR_SL_MULTIPLIER = 2.0          # Dynamic ATR multiplier for initial stop loss
+ROUND_TRIP_FEE_PCT = 0.0010      # 0.10% covers taker entry + exit fees
 
 
 # ---------------------------------------------------------------------------
@@ -29,31 +31,25 @@ MAX_SL_PCT = 0.010               # 1.0% baseline stop loss
 # ---------------------------------------------------------------------------
 
 def get_symbol_overrides(symbol: str) -> dict:
-    """
-    Returns asset-specific configuration overrides for TP and SL percentages.
-    Fallback values use the global TARGET_PROFIT_PCT and MAX_SL_PCT.
-    """
     clean_sym = symbol.split(':')[0].upper()
     if not clean_sym.endswith('/USDT') and '/' not in clean_sym:
         clean_sym = f"{clean_sym}/USDT"
 
-    # Default overrides matching global parameters
     config = {
         "target_profit_pct": TARGET_PROFIT_PCT,
-        "max_sl_pct": MAX_SL_PCT
+        "atr_multiplier": ATR_SL_MULTIPLIER
     }
 
-    # Asset-specific parameter custom tuning table
     overrides_table = {
-        "HYPE/USDT": {"target_profit_pct": 0.030, "max_sl_pct": 0.012},
-        "CRCL/USDT": {"target_profit_pct": 0.03, "max_sl_pct": 0.008},
-        "NVDA/USDT": {"target_profit_pct": 0.035, "max_sl_pct": 0.012},
-        "BNB/USDT":  {"target_profit_pct": 0.025, "max_sl_pct": 0.007},
-        "SOL/USDT":  {"target_profit_pct": 0.020, "max_sl_pct": 0.010},
-        "ADA/USDT":  {"target_profit_pct": 0.025, "max_sl_pct": 0.010},
-        "1000PEPE/USDT":  {"target_profit_pct": 0.020, "max_sl_pct": 0.012},
-        "UNI/USDT":  {"target_profit_pct": 0.020, "max_sl_pct": 0.010},
-        "NEAR/USDT": {"target_profit_pct": 0.025, "max_sl_pct": 0.008},
+        "HYPE/USDT": {"target_profit_pct": 0.020, "atr_multiplier": 2.0},
+        "LINK/USDT": {"target_profit_pct": 0.030, "atr_multiplier": 1.5},
+        "CRCL/USDT": {"target_profit_pct": 0.025, "atr_multiplier": 1.5},
+        "DOGE/USDT":  {"target_profit_pct": 0.025, "atr_multiplier": 1.5},
+        "ETH/USDT":  {"target_profit_pct": 0.025, "atr_multiplier": 1.5},
+        "SKHYNIX/USDT": {"target_profit_pct": 0.025, "atr_multiplier": 2.0},
+        "SNXX/USDT": {"target_profit_pct": 0.025, "atr_multiplier": 1.5},
+        "MU/USDT":  {"target_profit_pct": 0.025, "atr_multiplier": 1.5},
+        "NEAR/USDT": {"target_profit_pct": 0.025, "atr_multiplier": 2.0},
     }
 
     if clean_sym in overrides_table:
@@ -63,10 +59,6 @@ def get_symbol_overrides(symbol: str) -> dict:
 
 
 def format_price(price: float) -> float:
-    """
-    Dynamically rounds prices based on magnitude to prevent rounding errors
-    on low-priced assets (e.g., sub-cent tokens like BLESS/USDT).
-    """
     if price <= 0:
         return 0.0
     elif price < 0.0001:
@@ -82,7 +74,6 @@ def format_price(price: float) -> float:
 
 
 def fetch_top_volume_symbols(limit: int = 10) -> List[str]:
-    """Scans Binance or Bybit USDT linear futures for the top N coins by 24h quote volume."""
     try:
         exchange = ccxt.binanceusdm({'enableRateLimit': True})
         tickers = exchange.fetch_tickers()
@@ -103,24 +94,21 @@ def fetch_top_volume_symbols(limit: int = 10) -> List[str]:
     except Exception as e:
         logger.error(f"Failed to scan top volume symbols: {e}")
         return ["BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT", "DOGE/USDT", "ADA/USDT", "AVAX/USDT", "LINK/USDT"]
-        
-        
+
+
 def load_symbol_config(symbol: str = "") -> dict:
     default_config = {
         "account_balance": 100.0,
         "risk_pct": 1.0,
         "leverage": 5,
-        "tema_period": 200,
+        "dema_period": 9,
+        "ema_50_period": 50,
+        "ema_200_period": 200,
         "rsi_period": 14,
-        "rsi_thresh": 42.0,
         "adx_period": 14,
         "adx_threshold": 20.0,
-        "use_adx_filter": True,
-        "max_sl_pct": 0.010,
-        "atr_period": 14,
-        "atr_mult": 2.0,
-        "use_atr_sl": True,
-        "disable_htf": True
+        "target_profit_pct": 0.025,
+        "use_ema_200_filter": True,
     }
     if os.path.exists("strategy_config.json"):
         try:
@@ -154,17 +142,18 @@ def fetch_klines(symbol: str, interval: str = "15m", limit: int = 600) -> pd.Dat
 
 
 # ---------------------------------------------------------------------------
-# 2. TECHNICAL INDICATORS FOR SCALPING
+# 2. TECHNICAL INDICATORS
 # ---------------------------------------------------------------------------
 
 def calculate_ema(series: pd.Series, period: int) -> pd.Series:
     return series.ewm(span=period, adjust=False).mean()
 
-def calculate_tema(series: pd.Series, period: int) -> pd.Series:
-    ema1 = calculate_ema(series, period)
-    ema2 = calculate_ema(ema1, period)
-    ema3 = calculate_ema(ema2, period)
-    return (3 * ema1) - (3 * ema2) + ema3
+
+def calculate_dema(series: pd.Series, period: int = 9) -> pd.Series:
+    e1 = calculate_ema(series, period)
+    e2 = calculate_ema(e1, period)
+    return 2 * e1 - e2
+
 
 def calculate_rsi(series: pd.Series, period: int = 14) -> pd.Series:
     delta = series.diff()
@@ -173,12 +162,14 @@ def calculate_rsi(series: pd.Series, period: int = 14) -> pd.Series:
     rs = gain / loss.replace(0, np.nan)
     return (100.0 - (100.0 / (1.0 + rs))).fillna(50.0)
 
+
 def calculate_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
     if df.empty or len(df) < period + 1:
         return pd.Series(0.0, index=df.index)
     high, low, prev_close = df["high"], df["low"], df["close"].shift(1)
     tr = pd.concat([high - low, (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(axis=1)
     return tr.ewm(alpha=1.0 / period, adjust=False).mean().fillna(0.0)
+
 
 def calculate_adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
     high, low, close = df['high'], df['low'], df['close']
@@ -200,18 +191,9 @@ def calculate_adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
     dx = (100 * (plus_di - minus_di).abs() / (plus_di + minus_di)).fillna(0)
     return dx.rolling(period).mean().fillna(0)
 
-def check_volume_spike(df: pd.DataFrame, period: int = 20, multiplier: float = 1.15) -> bool:
-    if "volume" not in df.columns or len(df) < period:
-        return True
-    vol_sma = df['volume'].rolling(period).mean().iloc[-1]
-    last_volume = df['volume'].iloc[-1]
-    if np.isnan(vol_sma) or vol_sma == 0:
-        return True
-    return bool(last_volume >= (vol_sma * multiplier))
-
 
 # ---------------------------------------------------------------------------
-# 3. SCALPING SIGNAL EVALUATION ENGINE (20/50 EMA + Trend/Momentum Filters)
+# 3. SCALPING SIGNAL EVALUATION ENGINE (Strict Simultaneous Crossover & Volume Spike)
 # ---------------------------------------------------------------------------
 
 def evaluate_scalp_signals(
@@ -219,6 +201,7 @@ def evaluate_scalp_signals(
     symbol: str,
     account_balance: float = 100.0,
     risk_pct: float = 1.0,
+    use_ema_200_filter: bool = False,
     **kwargs
 ) -> Dict[str, Any]:
     no_signal = {
@@ -227,96 +210,111 @@ def evaluate_scalp_signals(
         "reason": "No condition met"
     }
 
-    if df.empty or len(df) < 60:
-        no_signal["reason"] = "Insufficient kline data"
+    if df.empty or len(df) < 200:
+        no_signal["reason"] = "Insufficient kline data for 200 EMA calculation"
         return no_signal
 
     asset_cfg = get_symbol_overrides(symbol)
     target_profit_pct = asset_cfg["target_profit_pct"]
-    max_sl_pct = asset_cfg["max_sl_pct"]
+    atr_mult = asset_cfg["atr_multiplier"]
 
     df = df.copy()
-    df["ema_fast"] = calculate_ema(df["close"], FAST_EMA_PERIOD)
-    df["ema_slow"] = calculate_ema(df["close"], SLOW_EMA_PERIOD)
+    df["dema_9"] = calculate_dema(df["close"], DEMA_FAST_PERIOD)
+    df["ema_50"] = calculate_ema(df["close"], EMA_MEDIUM_PERIOD)
+    df["ema_200"] = calculate_ema(df["close"], EMA_TREND_PERIOD)
+    df["vol_sma20"] = df["volume"].rolling(VOLUME_SMA_PERIOD).mean()
     df["rsi"] = calculate_rsi(df["close"], RSI_PERIOD)
     df["adx"] = calculate_adx(df, ADX_PERIOD)
+    df["atr"] = calculate_atr(df, period=14)
 
     last_row = df.iloc[-1]
     prev_row = df.iloc[-2]
     
     current_price = float(last_row["close"])
-    fast_ema = float(last_row["ema_fast"])
-    slow_ema = float(last_row["ema_slow"])
-    prev_fast = float(prev_row["ema_fast"])
-    prev_slow = float(prev_row["ema_slow"])
+    dema_9 = float(last_row["dema_9"])
+    ema_50 = float(last_row["ema_50"])
+    ema_200 = float(last_row["ema_200"])
+    
+    prev_dema = float(prev_row["dema_9"])
+    prev_ema50 = float(prev_row["ema_50"])
+    
+    current_volume = float(last_row["volume"])
+    vol_sma20 = float(last_row["vol_sma20"])
     
     current_rsi = float(last_row["rsi"])
     current_adx = float(last_row["adx"])
+    current_atr = float(last_row["atr"])
 
     if current_adx < MIN_ADX_THRESHOLD:
-        no_signal["reason"] = f"Trend Filter: ADX ({current_adx:.1f}) too low (market is chopping)"
+        no_signal["reason"] = f"Trend Filter: ADX ({current_adx:.1f}) below threshold {MIN_ADX_THRESHOLD}"
         return no_signal
 
-    if not check_volume_spike(df, period=20, multiplier=1.15):
-        no_signal["reason"] = "Volume Gate: Insufficient volume spike on execution candle"
-        return no_signal
+    # 1. Base Crossover Detection
+    bullish_crossover = (prev_dema <= prev_ema50) and (dema_9 > ema_50)
+    bearish_crossover = (prev_dema >= prev_ema50) and (dema_9 < ema_50)
 
-    bullish_crossover = (prev_fast <= prev_slow) and (fast_ema > slow_ema)
-    bearish_crossover = (prev_fast >= prev_slow) and (fast_ema < slow_ema)
+    # 2. Strict Directional Volume Spikes on the EXACT Crossover Bar
+    is_bullish_volume_spike = (last_row["close"] > last_row["open"]) and (current_volume >= vol_sma20 * 1.5)
+    is_bearish_volume_spike = (last_row["close"] < last_row["open"]) and (current_volume >= vol_sma20 * 1.5)
+
+    # 3. Combined Entry Gate: Crossover AND Volume Spike MUST co-occur on the current bar
+    valid_long_trigger = bullish_crossover and is_bullish_volume_spike
+    valid_short_trigger = bearish_crossover and is_bearish_volume_spike
 
     # -----------------------------------------------------------------------
     # LONG SCALP SETUP
     # -----------------------------------------------------------------------
-    if bullish_crossover and current_rsi > 50.0 and current_rsi < 75.0:
+    trend_condition_long = (not use_ema_200_filter) or (current_price > ema_200)
+
+    if valid_long_trigger and trend_condition_long and (55.0 < current_rsi < 70.0):
         entry_price = current_price
-        stop_loss = entry_price * (1.0 - max_sl_pct)
+        stop_loss = entry_price - (current_atr * atr_mult)
         take_profit = entry_price * (1.0 + target_profit_pct)
         
         sl_distance = entry_price - stop_loss
         risk_amt = float(account_balance) * (risk_pct / 100.0)
         position_size = round(risk_amt / sl_distance, 6) if sl_distance > 0 else 0.0
-        computed_rr = (take_profit - entry_price) / sl_distance
+        computed_rr = (take_profit - entry_price) / sl_distance if sl_distance > 0 else 0.0
 
         return {
             "action": "BUY", "order_type": "MARKET", "symbol": symbol, "direction": "LONG",
-            "regime": "EMA_SCALP_5M_15M",
+            "regime": "DEMA_EMA_STRICT_CROSS_VOL",
             "entry_price": format_price(entry_price),
             "stop_loss": format_price(stop_loss),
             "take_profit": format_price(take_profit),
             "rr_ratio": float(round(computed_rr, 2)),
             "position_size": float(position_size),
-            "reason": f"Bullish EMA Cross + RSI ({current_rsi:.1f}): TP={format_price(take_profit)} (SL={max_sl_pct * 100:.2f}%)"
+            "reason": f"Simultaneous Bullish Cross + Volume Spike + RSI ({current_rsi:.1f})"
         }
 
     # -----------------------------------------------------------------------
     # SHORT SCALP SETUP
     # -----------------------------------------------------------------------
-    if bearish_crossover and current_rsi < 50.0 and current_rsi > 25.0:
+    trend_condition_short = (not use_ema_200_filter) or (current_price < ema_200)
+
+    if valid_short_trigger and trend_condition_short and (25.0 < current_rsi < 50.0):
         entry_price = current_price
-        stop_loss = entry_price * (1.0 + max_sl_pct)
+        stop_loss = entry_price + (current_atr * atr_mult)
         take_profit = entry_price * (1.0 - target_profit_pct)
         
         sl_distance = stop_loss - entry_price
         risk_amt = float(account_balance) * (risk_pct / 100.0)
         position_size = round(risk_amt / sl_distance, 6) if sl_distance > 0 else 0.0
-        computed_rr = (entry_price - take_profit) / sl_distance
+        computed_rr = (entry_price - take_profit) / sl_distance if sl_distance > 0 else 0.0
 
         return {
             "action": "SELL", "order_type": "MARKET", "symbol": symbol, "direction": "SHORT",
-            "regime": "EMA_SCALP_5M_15M",
+            "regime": "DEMA_EMA_STRICT_CROSS_VOL",
             "entry_price": format_price(entry_price),
             "stop_loss": format_price(stop_loss),
             "take_profit": format_price(take_profit),
             "rr_ratio": float(round(computed_rr, 2)),
             "position_size": float(position_size),
-            "reason": f"Bearish EMA Cross + RSI ({current_rsi:.1f}): TP={format_price(take_profit)} (SL={max_sl_pct * 100:.2f}%)"
+            "reason": f"Simultaneous Bearish Cross + Volume Spike + RSI ({current_rsi:.1f})"
         }
 
-    no_signal["reason"] = "No valid 20/50 EMA crossover with momentum filters met"
+    no_signal["reason"] = "No valid simultaneous crossover and volume spike matching filter conditions"
     return no_signal
 
 
-# ---------------------------------------------------------------------------
-# MODULE-LEVEL ALIASES FOR MAIN.PY COMPATIBILITY
-# ---------------------------------------------------------------------------
 evaluate_signals = evaluate_scalp_signals

@@ -1,15 +1,17 @@
 {
     "timestamp": 1793051600.624667,
-    "vetted_count": 5,
+    "vetted_count": 10,
     "vetted_symbols": [
-        "SOL/USDT",
-		"UNI/USDT",
-        "NVDA/USDT",
+        "LINK/USDT",
+		"DOGE/USDT",
+		"NVDA/USDT",
 		"HYPE/USDT",
-		"BNB/USDT",
-		"ENA/USDT",
-		"ADA/USDT",
-        "CRCL/USDT"
+		"ETH/USDT",
+		"SKHYNIX/USDT",
+		"SNXX/USDT",
+		"MU/USDT",
+		"NEAR/USDT",
+		"CRCL/USDT"
     ],
     "details": [
         {
