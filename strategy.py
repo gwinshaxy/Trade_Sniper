@@ -335,5 +335,8 @@ def evaluate_scalp_signals(
     no_signal["reason"] = "No valid simultaneous crossover and volume spike matching filter conditions"
     return no_signal
 
+def load_symbol_config(symbol: str) -> dict:
+    """Alias for get_symbol_overrides to support legacy main.py imports."""
+    return get_symbol_overrides(symbol)
 
 evaluate_signals = evaluate_scalp_signals
