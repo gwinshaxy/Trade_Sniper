@@ -13,6 +13,24 @@ logger = logging.getLogger("scalp_strategy_engine")
 # ---------------------------------------------------------------------------
 # GLOBAL SCALPING TIMEFRAME & DEFAULT PARAMETERS
 # ---------------------------------------------------------------------------
+EXECUTION_TIMEFRAME = "15m"      # 15m default execution
+DEMA_FAST_PERIOD = 9
+EMA_MEDIUM_PERIOD = 50
+EMA_TREND_PERIOD = 200
+VOLUME_SMA_PERIOD = 20
+RSI_PERIOD = 14
+ADX_PERIOD = 14
+MIN_ADX_THRESHOLD = 22.0         # ADX threshold
+CHOP_PERIOD = 14                 # Choppiness Index lookback period
+MAX_CHOP_THRESHOLD = 58.0        # Upper limit: filters out choppy/sideways markets
+TARGET_RR_RATIO = 1.8            # Approach A: Default 1.8x Risk-Reward Dynamic Target
+ATR_SL_MULTIPLIER = 2.0          # Tighter 1.5x ATR initial stop loss to prevent noise clipping
+ROUND_TRIP_FEE_PCT = 0.0010      # 0.10% covers taker entry + exit fees
+
+
+# ---------------------------------------------------------------------------
+# GLOBAL SCALPING TIMEFRAME & DEFAULT PARAMETERS
+# ---------------------------------------------------------------------------
 EXECUTION_TIMEFRAME = "15m"      
 TARGET_RR_RATIO = 1.8            
 ATR_SL_MULTIPLIER = 2.0          # Optimal baseline for 15m scalping
