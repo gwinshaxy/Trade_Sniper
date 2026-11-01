@@ -13,16 +13,20 @@ logger = logging.getLogger("dynamic_trade_manager")
 
 class DynamicTradeManager:
     """
-    Handles dynamic active position management with a progressive
-    breakeven + trailing stop model recalibrated for 2.0%-2.5% 15m scalping targets.
+    Handles dynamic active position management featuring:
+    - Breakeven lock (~0.6R)
+    - 1.0R Profit-Securing Lock (~1.0R)
+    - ATR Trailing Stop & Tightening Model (~1.4R+)
     """
 
     def __init__(
         self,
-        trailing_mult: float = 2.0,
+        trailing_mult: float = 1.8,
         be_rr_trigger: float = 0.6,
-        trail_rr_trigger: float = 0.9,
-        tighten_rr_trigger: float = 1.3,
+        profit_lock_rr_trigger: float = 1.0,  # Secures profit once 1.0R gain is reached
+        profit_lock_buffer: float = 0.3,      # Locks in +0.3R guaranteed profit
+        trail_rr_trigger: float = 1.4,
+        tighten_rr_trigger: float = 1.8,
         tighten_mult: float = 1.2,
         be_buffer_atr: float = 0.1,
         hard_tp_enabled: bool = True,
@@ -32,6 +36,8 @@ class DynamicTradeManager:
     ):
         self.trailing_mult = trailing_mult
         self.be_rr_trigger = be_rr_trigger
+        self.profit_lock_rr_trigger = profit_lock_rr_trigger
+        self.profit_lock_buffer = profit_lock_buffer
         self.trail_rr_trigger = trail_rr_trigger
         self.tighten_rr_trigger = tighten_rr_trigger
         self.tighten_mult = tighten_mult
@@ -96,10 +102,6 @@ class DynamicTradeManager:
             exit_price = self._safe_float(live_pos_info.get("mark_price"), 0.0) if live_pos_info else 0.0
             if exit_price <= 0:
                 exit_price = entry_price
-            logger.warning(
-                f"[{pair}] Trade #{trade_id} closed but no verified exit price. "
-                f"Using ${exit_price:.5f} for finalization."
-            )
 
         if real_closed_pnl is not None:
             pnl_usd, pnl_pct, outcome = calculate_pnl(
@@ -184,31 +186,16 @@ class DynamicTradeManager:
 
             # ---- Sanity: TP direction guard -------------------------------
             if is_long and current_tp > 0 and current_tp <= entry_price:
-                logger.error(
-                    f"🚨 CORRUPT TP for #{trade_id}: LONG TP (${current_tp}) <= entry (${entry_price})."
-                )
-                current_tp = entry_price + (abs(entry_price - current_sl) * 2.0)
+                current_tp = entry_price + (abs(entry_price - current_sl) * 1.8)
                 db_needs_update = True
             elif (not is_long) and current_tp > 0 and current_tp >= entry_price:
-                logger.error(
-                    f"🚨 CORRUPT TP for #{trade_id}: SHORT TP (${current_tp}) >= entry (${entry_price})."
-                )
-                current_tp = entry_price - (abs(entry_price - current_sl) * 2.0)
-                db_needs_update = True
-
-            if current_sl == 0.0 and entry_price > 0:
-                current_sl = entry_price * (1.0 - 0.02) if is_long else entry_price * (1.0 + 0.02)
-                db_needs_update = True
-
-            if current_tp == 0.0 and entry_price > 0:
-                risk = abs(entry_price - current_sl)
-                current_tp = entry_price + (risk * 2.2) if is_long else entry_price - (risk * 2.2)
+                current_tp = entry_price - (abs(entry_price - current_sl) * 1.8)
                 db_needs_update = True
 
             if db_needs_update and trade_id is not None:
                 self._update_db_sl_tp(trade_id, current_sl, current_tp)
 
-            # ---- 1. Exchange closure check & Paper Mode Intra-Candle SL/TP Inspection ----
+            # ---- 1. Intra-candle SL/TP Inspection (Paper Mode / Testnet) ----
             import os
             from config import BYBIT_TESTNET
             
@@ -226,8 +213,7 @@ class DynamicTradeManager:
                     outcome_reason = "STOP_LOSS" if hit_sl and not hit_tp else ("TAKE_PROFIT" if hit_tp and not hit_sl else "SL_TP_BREACH")
                     logger.warning(
                         f"[{trade.get('pair')}] Trade #{trade_id} intra-candle price breach detected "
-                        f"(Low: ${low_price:.5f}, High: ${high_price:.5f}) hitting {outcome_reason}. "
-                        f"Triggering virtual closure."
+                        f"(Low: ${low_price:.5f}, High: ${high_price:.5f}) hitting {outcome_reason}."
                     )
                     exit_price = current_sl if hit_sl else current_tp
                     position_size = self._safe_float(trade.get("position_size"))
@@ -254,30 +240,14 @@ class DynamicTradeManager:
                         "msg": f"✅ Virtual Trade #{trade_id} closed via intra-candle {outcome_reason} @ ${exit_price:.5f}"
                     }
 
-            if not is_paper_mode:
-                if live_pos_info and not live_pos_info.get("error") and live_pos_info.get("contracts", 0.0) <= 0.001:
-                    logger.warning(
-                        f"[{trade.get('pair')}] Trade #{trade_id} closed on exchange. "
-                        f"Finalizing directly via DynamicTradeManager."
-                    )
-                    finalized = self._finalize_closed_trade(trade, live_pos_info)
-                    return {
-                        "action": "FINALIZED_CLOSED_TRADE" if finalized else "SYNC_CLOSED_FROM_EXCHANGE",
-                        "msg": (
-                            f"✅ Trade #{trade_id} finalized (dynamic manager)."
-                            if finalized
-                            else f"⚠️ Trade #{trade_id} closed but finalization failed; reconciler will retry."
-                        ),
-                    }
-
-            # ---- 2. Progressive breakeven + trailing tailored for 15m scalps --------
+            # ---- 2. Progressive Breakeven, Profit Locking & Trailing --------
             if atr > 0:
                 risk_dist = abs(entry_price - current_sl) if current_sl > 0 else (entry_price * 0.02)
 
                 if is_long:
                     unrealized_profit = close_price - entry_price
 
-                    # Breakeven (~0.6R trigger)
+                    # 1. Breakeven Trigger (~0.6R)
                     if trade_state == "OPEN" and unrealized_profit >= (risk_dist * self.be_rr_trigger):
                         candidate_sl = entry_price + (atr * self.be_buffer_atr)
                         if candidate_sl > entry_price and candidate_sl > current_sl:
@@ -288,8 +258,19 @@ class DynamicTradeManager:
                                 "msg": f"🔒 Trade #{trade_id} moved to Breakeven @ ${candidate_sl:.5f}"
                             }
 
-                    # Trailing (~0.9R trigger)
-                    if trade_state in ["BE_LOCKED", "TRAILING"] and unrealized_profit >= (risk_dist * self.trail_rr_trigger):
+                    # 2. 1.0R Profit-Securing Lock Trigger (~1.0R gain)
+                    if trade_state in ["OPEN", "BE_LOCKED"] and unrealized_profit >= (risk_dist * self.profit_lock_rr_trigger):
+                        candidate_sl = entry_price + (risk_dist * self.profit_lock_buffer)
+                        if candidate_sl > current_sl:
+                            return {
+                                "action": "UPDATE_SL",
+                                "new_sl": candidate_sl,
+                                "new_state": "PROFIT_LOCKED",
+                                "msg": f"💰 Trade #{trade_id} crossed 1.0R gain! Locked in profit @ ${candidate_sl:.5f}"
+                            }
+
+                    # 3. Trailing Stop Trigger (~1.4R)
+                    if trade_state in ["BE_LOCKED", "PROFIT_LOCKED", "TRAILING"] and unrealized_profit >= (risk_dist * self.trail_rr_trigger):
                         candidate_sl = close_price - (atr * self.trailing_mult)
                         if candidate_sl > entry_price and candidate_sl > current_sl:
                             return {
@@ -299,7 +280,7 @@ class DynamicTradeManager:
                                 "msg": f"📈 Scalp Trail activated for #{trade_id} → SL @ ${candidate_sl:.5f}"
                             }
 
-                    # Tightening (~1.3R trigger)
+                    # 4. Tightening Trigger (~1.8R)
                     if trade_state == "TRAILING" and unrealized_profit >= (risk_dist * self.tighten_rr_trigger):
                         candidate_sl = close_price - (atr * self.tighten_mult)
                         if candidate_sl > entry_price and candidate_sl > current_sl:
@@ -312,7 +293,7 @@ class DynamicTradeManager:
                 else:  # SHORT
                     unrealized_profit = entry_price - close_price
 
-                    # Breakeven
+                    # 1. Breakeven Trigger
                     if trade_state == "OPEN" and unrealized_profit >= (risk_dist * self.be_rr_trigger):
                         candidate_sl = entry_price - (atr * self.be_buffer_atr)
                         if candidate_sl < entry_price and (current_sl == 0 or candidate_sl < current_sl):
@@ -323,8 +304,19 @@ class DynamicTradeManager:
                                 "msg": f"🔒 Trade #{trade_id} moved to Breakeven @ ${candidate_sl:.5f}"
                             }
 
-                    # Trailing
-                    if trade_state in ["BE_LOCKED", "TRAILING"] and unrealized_profit >= (risk_dist * self.trail_rr_trigger):
+                    # 2. 1.0R Profit-Securing Lock Trigger (~1.0R gain)
+                    if trade_state in ["OPEN", "BE_LOCKED"] and unrealized_profit >= (risk_dist * self.profit_lock_rr_trigger):
+                        candidate_sl = entry_price - (risk_dist * self.profit_lock_buffer)
+                        if current_sl == 0 or candidate_sl < current_sl:
+                            return {
+                                "action": "UPDATE_SL",
+                                "new_sl": candidate_sl,
+                                "new_state": "PROFIT_LOCKED",
+                                "msg": f"💰 Trade #{trade_id} crossed 1.0R gain! Locked in profit @ ${candidate_sl:.5f}"
+                            }
+
+                    # 3. Trailing Stop Trigger
+                    if trade_state in ["BE_LOCKED", "PROFIT_LOCKED", "TRAILING"] and unrealized_profit >= (risk_dist * self.trail_rr_trigger):
                         candidate_sl = close_price + (atr * self.trailing_mult)
                         if candidate_sl < entry_price and (current_sl == 0 or candidate_sl < current_sl):
                             return {
@@ -334,7 +326,7 @@ class DynamicTradeManager:
                                 "msg": f"📉 Scalp Trail activated for #{trade_id} → SL @ ${candidate_sl:.5f}"
                             }
 
-                    # Tightening
+                    # 4. Tightening Trigger
                     if trade_state == "TRAILING" and unrealized_profit >= (risk_dist * self.tighten_rr_trigger):
                         candidate_sl = close_price + (atr * self.tighten_mult)
                         if candidate_sl < entry_price and (current_sl == 0 or candidate_sl < current_sl):

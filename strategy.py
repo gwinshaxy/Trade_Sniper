@@ -13,24 +13,9 @@ logger = logging.getLogger("scalp_strategy_engine")
 # ---------------------------------------------------------------------------
 # GLOBAL SCALPING TIMEFRAME & DEFAULT PARAMETERS
 # ---------------------------------------------------------------------------
-EXECUTION_TIMEFRAME = "15m"      # 15m default execution
-DEMA_FAST_PERIOD = 9
-EMA_MEDIUM_PERIOD = 50
-EMA_TREND_PERIOD = 200
-VOLUME_SMA_PERIOD = 20
-RSI_PERIOD = 14
-ADX_PERIOD = 14
-MIN_ADX_THRESHOLD = 22.0         # Existing ADX threshold
-CHOP_PERIOD = 14                 # Choppiness Index lookback period
-MAX_CHOP_THRESHOLD = 61.8        # Upper limit: filters out choppy/sideways markets if CHOP > 58
-TARGET_PROFIT_PCT = 0.025        # Fixed 2.5% target profit
-ATR_SL_MULTIPLIER = 2.0          # Dynamic ATR multiplier for initial stop loss
-ROUND_TRIP_FEE_PCT = 0.0010      # 0.10% covers taker entry + exit fees
-
-
-# ---------------------------------------------------------------------------
-# 1. ASSET-SPECIFIC OVERRIDES & CONFIG HELPERS
-# ---------------------------------------------------------------------------
+EXECUTION_TIMEFRAME = "15m"      
+TARGET_RR_RATIO = 1.8            
+ATR_SL_MULTIPLIER = 2.0          # Optimal baseline for 15m scalping
 
 def get_symbol_overrides(symbol: str) -> dict:
     clean_sym = symbol.split(':')[0].upper()
@@ -38,20 +23,19 @@ def get_symbol_overrides(symbol: str) -> dict:
         clean_sym = f"{clean_sym}/USDT"
 
     config = {
-        "target_profit_pct": TARGET_PROFIT_PCT,
+        "target_risk_reward_ratio": TARGET_RR_RATIO,
         "atr_multiplier": ATR_SL_MULTIPLIER
     }
 
     overrides_table = {
-        "HYPE/USDT": {"target_profit_pct": 0.020, "atr_multiplier": 2.0},
-        "LINK/USDT": {"target_profit_pct": 0.030, "atr_multiplier": 1.5},
-        "CRCL/USDT": {"target_profit_pct": 0.025, "atr_multiplier": 1.5},
-        "DOGE/USDT":  {"target_profit_pct": 0.025, "atr_multiplier": 1.5},
-        "ETH/USDT":  {"target_profit_pct": 0.025, "atr_multiplier": 1.5},
-        "SKHYNIX/USDT": {"target_profit_pct": 0.025, "atr_multiplier": 2.0},
-        "SNXX/USDT": {"target_profit_pct": 0.025, "atr_multiplier": 1.5},
-        "MU/USDT":  {"target_profit_pct": 0.025, "atr_multiplier": 1.5},
-        "NEAR/USDT": {"target_profit_pct": 0.025, "atr_multiplier": 2.0},
+        "HYPE/USDT":    {"target_risk_reward_ratio": 1.8, "atr_multiplier": 1.8},
+        "LINK/USDT":    {"target_risk_reward_ratio": 2.0, "atr_multiplier": 1.8},
+        "CRCL/USDT":    {"target_risk_reward_ratio": 1.8, "atr_multiplier": 1.8},
+        "DOGE/USDT":    {"target_risk_reward_ratio": 1.8, "atr_multiplier": 1.8},
+        "ETH/USDT":     {"target_risk_reward_ratio": 1.8, "atr_multiplier": 2.0},
+        "SKHYNIX/USDT": {"target_risk_reward_ratio": 2.0, "atr_multiplier": 2.2},
+        "MU/USDT":      {"target_risk_reward_ratio": 1.8, "atr_multiplier": 2.0},
+        "NEAR/USDT":    {"target_risk_reward_ratio": 1.8, "atr_multiplier": 2.0},
     }
 
     if clean_sym in overrides_table:
@@ -170,10 +154,6 @@ def calculate_adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
 
 
 def calculate_choppiness_index(df: pd.DataFrame, period: int = 14) -> pd.Series:
-    """
-    Calculates the Choppiness Index (CHOP).
-    CHOP = 100 * LOG10( SUM(ATR, n) / (MAX_HIGH(n) - MIN_LOW(n)) ) / LOG10(n)
-    """
     if df.empty or len(df) < period:
         return pd.Series(50.0, index=df.index)
     
@@ -181,29 +161,24 @@ def calculate_choppiness_index(df: pd.DataFrame, period: int = 14) -> pd.Series:
     low = df['low']
     close = df['close']
     
-    # 1. True Range for each bar
     tr1 = high - low
     tr2 = (high - close.shift(1)).abs()
     tr3 = (low - close.shift(1)).abs()
     tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
     
-    # 2. Sum of ATR over period
     sum_atr = tr.rolling(window=period).sum()
-    
-    # 3. Highest High and Lowest Low over period
     highest_high = high.rolling(window=period).max()
     lowest_low = low.rolling(window=period).min()
     
-    # 4. CHOP Formula
     range_hl = highest_high - lowest_low
-    range_hl = range_hl.replace(0, np.nan)  # avoid division by zero
+    range_hl = range_hl.replace(0, np.nan)
     
     chop = 100.0 * np.log10(sum_atr / range_hl) / np.log10(period)
     return chop.fillna(50.0)
 
 
 # ---------------------------------------------------------------------------
-# 3. SCALPING SIGNAL EVALUATION ENGINE (With CHOP Filter)
+# 3. SCALPING SIGNAL EVALUATION ENGINE (Approach A Dynamic ATR Scaling)
 # ---------------------------------------------------------------------------
 
 def evaluate_scalp_signals(
@@ -222,11 +197,11 @@ def evaluate_scalp_signals(
     }
 
     if df.empty or len(df) < 200:
-        no_signal["reason"] = "Insufficient kline data for 200 EMA calculation"
+        no_signal["reason"] = "Insufficient kline data for indicators"
         return no_signal
 
     asset_cfg = get_symbol_overrides(symbol)
-    target_profit_pct = asset_cfg["target_profit_pct"]
+    target_rr = asset_cfg["target_risk_reward_ratio"]
     atr_mult = asset_cfg["atr_multiplier"]
 
     df = df.copy()
@@ -263,20 +238,18 @@ def evaluate_scalp_signals(
         no_signal["reason"] = f"Trend Filter: ADX ({current_adx:.1f}) below threshold {MIN_ADX_THRESHOLD}"
         return no_signal
 
-    # Filter 2: Choppiness Index Filter (CHOP > MAX_CHOP_THRESHOLD indicates choppy range)
+    # Filter 2: Choppiness Index Filter
     if use_chop_filter and current_chop > MAX_CHOP_THRESHOLD:
         no_signal["reason"] = f"Choppiness Filter: CHOP ({current_chop:.1f}) above limit {MAX_CHOP_THRESHOLD}"
         return no_signal
 
-    # 1. Base Crossover Detection
+    # Crossover Detection & Volume Spikes
     bullish_crossover = (prev_dema <= prev_ema50) and (dema_9 > ema_50)
     bearish_crossover = (prev_dema >= prev_ema50) and (dema_9 < ema_50)
 
-    # 2. Strict Directional Volume Spikes on the EXACT Crossover Bar
     is_bullish_volume_spike = (last_row["close"] > last_row["open"]) and (current_volume >= vol_sma20 * 1.5)
     is_bearish_volume_spike = (last_row["close"] < last_row["open"]) and (current_volume >= vol_sma20 * 1.5)
 
-    # 3. Combined Entry Gate: Crossover AND Volume Spike MUST co-occur on the current bar
     valid_long_trigger = bullish_crossover and is_bullish_volume_spike
     valid_short_trigger = bearish_crossover and is_bearish_volume_spike
 
@@ -285,25 +258,31 @@ def evaluate_scalp_signals(
     # -----------------------------------------------------------------------
     trend_condition_long = (not use_ema_200_filter) or (current_price > ema_200)
 
-    if valid_long_trigger and trend_condition_long and (55.0 < current_rsi < 70.0):
+    if valid_long_trigger and trend_condition_long and (52.0 < current_rsi < 68.0):
         entry_price = current_price
-        stop_loss = entry_price - (current_atr * atr_mult)
-        take_profit = entry_price * (1.0 + target_profit_pct)
         
+        # Strict Directional Safeguard: SL strictly below entry
+        stop_loss = entry_price - (current_atr * atr_mult)
+        if stop_loss >= entry_price:
+            stop_loss = entry_price * 0.99
+
         sl_distance = entry_price - stop_loss
+        
+        # Approach A: Dynamic Take Profit scaling proportional to risk distance
+        take_profit = entry_price + (sl_distance * target_rr)
+
         risk_amt = float(account_balance) * (risk_pct / 100.0)
         position_size = round(risk_amt / sl_distance, 6) if sl_distance > 0 else 0.0
-        computed_rr = (take_profit - entry_price) / sl_distance if sl_distance > 0 else 0.0
 
         return {
             "action": "BUY", "order_type": "MARKET", "symbol": symbol, "direction": "LONG",
-            "regime": "DEMA_EMA_STRICT_CROSS_VOL_CHOP",
+            "regime": "DEMA_EMA_DYNAMIC_RR_SCALP",
             "entry_price": format_price(entry_price),
             "stop_loss": format_price(stop_loss),
             "take_profit": format_price(take_profit),
-            "rr_ratio": float(round(computed_rr, 2)),
+            "rr_ratio": float(target_rr),
             "position_size": float(position_size),
-            "reason": f"Simultaneous Bullish Cross + Vol + RSI ({current_rsi:.1f}) + CHOP ({current_chop:.1f})"
+            "reason": f"Dynamic Long Cross + Vol + ATR SL + {target_rr}R TP"
         }
 
     # -----------------------------------------------------------------------
@@ -311,32 +290,38 @@ def evaluate_scalp_signals(
     # -----------------------------------------------------------------------
     trend_condition_short = (not use_ema_200_filter) or (current_price < ema_200)
 
-    if valid_short_trigger and trend_condition_short and (25.0 < current_rsi < 50.0):
+    if valid_short_trigger and trend_condition_short and (32.0 < current_rsi < 48.0):
         entry_price = current_price
-        stop_loss = entry_price + (current_atr * atr_mult)
-        take_profit = entry_price * (1.0 - target_profit_pct)
         
+        # Strict Directional Safeguard: SL strictly above entry
+        stop_loss = entry_price + (current_atr * atr_mult)
+        if stop_loss <= entry_price:
+            stop_loss = entry_price * 1.01
+
         sl_distance = stop_loss - entry_price
+        
+        # Approach A: Dynamic Take Profit scaling proportional to risk distance
+        take_profit = entry_price - (sl_distance * target_rr)
+
         risk_amt = float(account_balance) * (risk_pct / 100.0)
         position_size = round(risk_amt / sl_distance, 6) if sl_distance > 0 else 0.0
-        computed_rr = (entry_price - take_profit) / sl_distance if sl_distance > 0 else 0.0
 
         return {
             "action": "SELL", "order_type": "MARKET", "symbol": symbol, "direction": "SHORT",
-            "regime": "DEMA_EMA_STRICT_CROSS_VOL_CHOP",
+            "regime": "DEMA_EMA_DYNAMIC_RR_SCALP",
             "entry_price": format_price(entry_price),
             "stop_loss": format_price(stop_loss),
             "take_profit": format_price(take_profit),
-            "rr_ratio": float(round(computed_rr, 2)),
+            "rr_ratio": float(target_rr),
             "position_size": float(position_size),
-            "reason": f"Simultaneous Bearish Cross + Vol + RSI ({current_rsi:.1f}) + CHOP ({current_chop:.1f})"
+            "reason": f"Dynamic Short Cross + Vol + ATR SL + {target_rr}R TP"
         }
 
-    no_signal["reason"] = "No valid simultaneous crossover and volume spike matching filter conditions"
+    no_signal["reason"] = "No valid crossover matching dynamic rules"
     return no_signal
 
+
 def load_symbol_config(symbol: str) -> dict:
-    """Alias for get_symbol_overrides to support legacy main.py imports."""
     return get_symbol_overrides(symbol)
 
 evaluate_signals = evaluate_scalp_signals
