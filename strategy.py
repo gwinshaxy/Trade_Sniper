@@ -11,29 +11,20 @@ from typing import Dict, Any, Optional, List
 logger = logging.getLogger("scalp_strategy_engine")
 
 # ---------------------------------------------------------------------------
-# GLOBAL SCALPING TIMEFRAME & DEFAULT PARAMETERS
+# GLOBAL TIMEFRAME & DEFAULT PARAMETERS (Optimized for 15m / 30m / 1hr)
 # ---------------------------------------------------------------------------
-EXECUTION_TIMEFRAME = "15m"      # 15m default execution
-DEMA_FAST_PERIOD = 9
-EMA_MEDIUM_PERIOD = 50
-EMA_TREND_PERIOD = 200
+EXECUTION_TIMEFRAME = "15m"      
+AA_VWAP_PERIOD = 48             # Increased lookback for stable intraday structure (12 hrs on 15m)
 VOLUME_SMA_PERIOD = 20
 RSI_PERIOD = 14
 ADX_PERIOD = 14
-MIN_ADX_THRESHOLD = 22.0         # ADX threshold
-CHOP_PERIOD = 14                 # Choppiness Index lookback period
-MAX_CHOP_THRESHOLD = 58.0        # Upper limit: filters out choppy/sideways markets
-TARGET_RR_RATIO = 1.8            # Approach A: Default 1.8x Risk-Reward Dynamic Target
-ATR_SL_MULTIPLIER = 2.0          # Tighter 1.5x ATR initial stop loss to prevent noise clipping
-ROUND_TRIP_FEE_PCT = 0.0010      # 0.10% covers taker entry + exit fees
+MIN_ADX_THRESHOLD = 22.0         # Stricter trend filter
+CHOP_PERIOD = 14                 
+MAX_CHOP_THRESHOLD = 58.0        # Choppiness filter
+TARGET_RR_RATIO = 2.2            # Optimized Risk-Reward ratio
+ATR_SL_MULTIPLIER = 1.8          
+ROUND_TRIP_FEE_PCT = 0.0010      
 
-
-# ---------------------------------------------------------------------------
-# GLOBAL SCALPING TIMEFRAME & DEFAULT PARAMETERS
-# ---------------------------------------------------------------------------
-EXECUTION_TIMEFRAME = "15m"      
-TARGET_RR_RATIO = 1.8            
-ATR_SL_MULTIPLIER = 2.0          # Optimal baseline for 15m scalping
 
 def get_symbol_overrides(symbol: str) -> dict:
     clean_sym = symbol.split(':')[0].upper()
@@ -46,14 +37,10 @@ def get_symbol_overrides(symbol: str) -> dict:
     }
 
     overrides_table = {
-        "HYPE/USDT":    {"target_risk_reward_ratio": 1.8, "atr_multiplier": 1.8},
-        "LINK/USDT":    {"target_risk_reward_ratio": 2.0, "atr_multiplier": 1.8},
-        "CRCL/USDT":    {"target_risk_reward_ratio": 1.8, "atr_multiplier": 1.8},
-        "DOGE/USDT":    {"target_risk_reward_ratio": 1.8, "atr_multiplier": 1.8},
-        "ETH/USDT":     {"target_risk_reward_ratio": 1.8, "atr_multiplier": 2.0},
-        "SKHYNIX/USDT": {"target_risk_reward_ratio": 2.0, "atr_multiplier": 2.2},
-        "MU/USDT":      {"target_risk_reward_ratio": 1.8, "atr_multiplier": 2.0},
-        "NEAR/USDT":    {"target_risk_reward_ratio": 1.8, "atr_multiplier": 2.0},
+        "HYPE/USDT":    {"target_risk_reward_ratio": 2.2, "atr_multiplier": 1.8},
+        "SOL/USDT":     {"target_risk_reward_ratio": 2.2, "atr_multiplier": 2.0},
+        "BTC/USDT":     {"target_risk_reward_ratio": 2.0, "atr_multiplier": 1.6},
+        "ETH/USDT":     {"target_risk_reward_ratio": 2.2, "atr_multiplier": 1.8},
     }
 
     if clean_sym in overrides_table:
@@ -93,14 +80,13 @@ def fetch_top_volume_symbols(limit: int = 10) -> List[str]:
                 
         usdt_futures.sort(key=lambda x: x[1], reverse=True)
         top_symbols = [item[0] for item in usdt_futures[:limit]]
-        logger.info(f"Successfully fetched top {len(top_symbols)} volume symbols.")
         return top_symbols
     except Exception as e:
         logger.error(f"Failed to scan top volume symbols: {e}")
-        return ["BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT", "DOGE/USDT", "ADA/USDT", "AVAX/USDT", "LINK/USDT"]
+        return ["BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT"]
 
 
-def fetch_klines(symbol: str, interval: str = "15m", limit: int = 600) -> pd.DataFrame:
+def fetch_klines(symbol: str, interval: str = EXECUTION_TIMEFRAME, limit: int = 600) -> pd.DataFrame:
     try:
         exchange = ccxt.binanceusdm({'enableRateLimit': True})
         clean_symbol = symbol.split(':')[0]
@@ -121,17 +107,11 @@ def fetch_klines(symbol: str, interval: str = "15m", limit: int = 600) -> pd.Dat
 
 
 # ---------------------------------------------------------------------------
-# 2. TECHNICAL INDICATORS
+# TECHNICAL INDICATORS & STRUCTURAL CALCULATIONS
 # ---------------------------------------------------------------------------
 
 def calculate_ema(series: pd.Series, period: int) -> pd.Series:
     return series.ewm(span=period, adjust=False).mean()
-
-
-def calculate_dema(series: pd.Series, period: int = 9) -> pd.Series:
-    e1 = calculate_ema(series, period)
-    e2 = calculate_ema(e1, period)
-    return 2 * e1 - e2
 
 
 def calculate_rsi(series: pd.Series, period: int = 14) -> pd.Series:
@@ -154,7 +134,6 @@ def calculate_adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
     high, low, close = df['high'], df['low'], df['close']
     plus_dm = high.diff()
     minus_dm = low.diff()
-    
     plus_dm = np.where((plus_dm > minus_dm) & (plus_dm > 0), plus_dm, 0.0)
     minus_dm = np.where((minus_dm > plus_dm) & (minus_dm > 0), minus_dm, 0.0)
     
@@ -166,7 +145,6 @@ def calculate_adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
     atr = tr.rolling(period).mean()
     plus_di = 100 * pd.Series(plus_dm).rolling(period).mean() / atr
     minus_di = 100 * pd.Series(minus_dm).rolling(period).mean() / atr
-    
     dx = (100 * (plus_di - minus_di).abs() / (plus_di + minus_di)).fillna(0)
     return dx.rolling(period).mean().fillna(0)
 
@@ -174,29 +152,100 @@ def calculate_adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
 def calculate_choppiness_index(df: pd.DataFrame, period: int = 14) -> pd.Series:
     if df.empty or len(df) < period:
         return pd.Series(50.0, index=df.index)
-    
-    high = df['high']
-    low = df['low']
-    close = df['close']
-    
+    high, low, close = df['high'], df['low'], df['close']
     tr1 = high - low
     tr2 = (high - close.shift(1)).abs()
     tr3 = (low - close.shift(1)).abs()
     tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-    
     sum_atr = tr.rolling(window=period).sum()
     highest_high = high.rolling(window=period).max()
     lowest_low = low.rolling(window=period).min()
-    
-    range_hl = highest_high - lowest_low
-    range_hl = range_hl.replace(0, np.nan)
-    
+    range_hl = (highest_high - lowest_low).replace(0, np.nan)
     chop = 100.0 * np.log10(sum_atr / range_hl) / np.log10(period)
     return chop.fillna(50.0)
 
 
+def calculate_auto_anchored_vwap(df: pd.DataFrame, period: int = AA_VWAP_PERIOD, num_stds: list = [1, 2, 3]) -> pd.DataFrame:
+    df = df.copy()
+    hlc3 = (df['high'] + df['low'] + df['close']) / 3.0
+    vol = df['volume']
+    
+    cum_pv = (hlc3 * vol).rolling(window=period, min_periods=1).sum()
+    cum_v = vol.rolling(window=period, min_periods=1).sum().replace(0, np.nan)
+    vwap = cum_pv / cum_v
+    
+    variance_numerator = (vol * (hlc3 - vwap)**2).rolling(window=period, min_periods=1).sum()
+    variance = variance_numerator / cum_v
+    stdev = np.sqrt(variance.fillna(0))
+    
+    df['aa_vwap'] = vwap
+    for std in num_stds:
+        df[f'upper_band_{std}'] = vwap + (stdev * std)
+        df[f'lower_band_{std}'] = vwap - (stdev * std)
+    return df
+
+
+def calculate_volume_profile_levels(df: pd.DataFrame, lookback: int = 100) -> Dict[str, float]:
+    sub_df = df.tail(lookback)
+    if sub_df.empty:
+        return {"poc": 0.0, "vah": 0.0, "val": 0.0, "hvn": 0.0}
+    
+    min_p, max_p = sub_df['low'].min(), sub_df['high'].max()
+    if min_p == max_p:
+        return {"poc": min_p, "vah": max_p, "val": min_p, "hvn": min_p}
+        
+    bins = 50
+    hist, bin_edges = np.histogram(sub_df['close'], bins=bins, weights=sub_df['volume'])
+    poc_idx = np.argmax(hist)
+    poc = (bin_edges[poc_idx] + bin_edges[poc_idx+1]) / 2.0
+    
+    total_vol = hist.sum()
+    if total_vol == 0:
+        return {"poc": poc, "vah": max_p, "val": min_p, "hvn": poc}
+        
+    target_vol = total_vol * 0.68
+    current_vol = hist[poc_idx]
+    lower_idx, upper_idx = poc_idx, poc_idx
+    
+    while current_vol < target_vol and (lower_idx > 0 or upper_idx < bins - 1):
+        added = False
+        if upper_idx < bins - 1:
+            upper_idx += 1
+            current_vol += hist[upper_idx]
+            added = True
+        if lower_idx > 0:
+            lower_idx -= 1
+            current_vol += hist[lower_idx]
+            added = True
+        if not added:
+            break
+            
+    val = bin_edges[lower_idx]
+    vah = bin_edges[upper_idx + 1]
+    hvn = poc
+    return {"poc": float(poc), "vah": float(vah), "val": float(val), "hvn": float(hvn)}
+
+
+def detect_candlestick_patterns(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    body = (df['close'] - df['open']).abs()
+    upper_shadow = df['high'] - df[['open', 'close']].max(axis=1)
+    lower_shadow = df[['open', 'close']].min(axis=1) - df['low']
+    
+    # Strict Rejection Patterns
+    df['is_hammer'] = (lower_shadow >= 1.8 * body) & (upper_shadow <= body * 0.6) & (body > 0) & (df['close'] > df['open'])
+    prev_close = df['close'].shift(1)
+    prev_open = df['open'].shift(1)
+    df['is_bullish_engulfing'] = (prev_close < prev_open) & (df['close'] > df['open']) & (df['close'] >= prev_open) & (df['open'] <= prev_close)
+    
+    df['is_shooting_star'] = (upper_shadow >= 1.8 * body) & (lower_shadow <= body * 0.6) & (body > 0) & (df['close'] < df['open'])
+    df['is_bearish_engulfing'] = (prev_close > prev_open) & (df['close'] < df['open']) & (df['close'] <= prev_open) & (df['open'] >= prev_close)
+    
+    return df
+
+
 # ---------------------------------------------------------------------------
-# 3. SCALPING SIGNAL EVALUATION ENGINE (Approach A Dynamic ATR Scaling)
+# SIGNAL EVALUATION ENGINE (Corrected Confluence & Decoupled Rejection Rules)
 # ---------------------------------------------------------------------------
 
 def evaluate_scalp_signals(
@@ -214,79 +263,83 @@ def evaluate_scalp_signals(
         "reason": "No condition met"
     }
 
-    if df.empty or len(df) < 200:
-        no_signal["reason"] = "Insufficient kline data for indicators"
+    if df.empty or len(df) < 120:
+        no_signal["reason"] = "Insufficient kline data"
         return no_signal
 
     asset_cfg = get_symbol_overrides(symbol)
     target_rr = asset_cfg["target_risk_reward_ratio"]
     atr_mult = asset_cfg["atr_multiplier"]
 
-    df = df.copy()
-    df["dema_9"] = calculate_dema(df["close"], DEMA_FAST_PERIOD)
-    df["ema_50"] = calculate_ema(df["close"], EMA_MEDIUM_PERIOD)
-    df["ema_200"] = calculate_ema(df["close"], EMA_TREND_PERIOD)
+    df = calculate_auto_anchored_vwap(df, period=AA_VWAP_PERIOD)
+    df = detect_candlestick_patterns(df)
     df["vol_sma20"] = df["volume"].rolling(VOLUME_SMA_PERIOD).mean()
-    df["rsi"] = calculate_rsi(df["close"], RSI_PERIOD)
+    df["ema_200"] = calculate_ema(df["close"], 200)
     df["adx"] = calculate_adx(df, ADX_PERIOD)
     df["chop"] = calculate_choppiness_index(df, CHOP_PERIOD)
-    df["atr"] = calculate_atr(df, period=14)
+    df["atr"] = calculate_atr(df, 14)
+
+    vp_levels = calculate_volume_profile_levels(df, lookback=100)
 
     last_row = df.iloc[-1]
     prev_row = df.iloc[-2]
     
     current_price = float(last_row["close"])
-    dema_9 = float(last_row["dema_9"])
-    ema_50 = float(last_row["ema_50"])
-    ema_200 = float(last_row["ema_200"])
-    
-    prev_dema = float(prev_row["dema_9"])
-    prev_ema50 = float(prev_row["ema_50"])
-    
     current_volume = float(last_row["volume"])
-    vol_sma20 = float(last_row["vol_sma20"])
-    
-    current_rsi = float(last_row["rsi"])
+    vol_sma = float(last_row["vol_sma20"])
     current_adx = float(last_row["adx"])
     current_chop = float(last_row["chop"])
     current_atr = float(last_row["atr"])
+    ema_200 = float(last_row["ema_200"])
 
-    # Filter 1: ADX Trend Filter
+    aa_vwap = float(last_row["aa_vwap"])
+    lower_1 = float(last_row["lower_band_1"])
+    lower_2 = float(last_row["lower_band_2"])
+    upper_1 = float(last_row["upper_band_1"])
+    upper_2 = float(last_row["upper_band_2"])
+
+    # Filters
     if current_adx < MIN_ADX_THRESHOLD:
-        no_signal["reason"] = f"Trend Filter: ADX ({current_adx:.1f}) below threshold {MIN_ADX_THRESHOLD}"
+        no_signal["reason"] = f"ADX Filter: ({current_adx:.1f}) < {MIN_ADX_THRESHOLD}"
         return no_signal
 
-    # Filter 2: Choppiness Index Filter
     if use_chop_filter and current_chop > MAX_CHOP_THRESHOLD:
-        no_signal["reason"] = f"Choppiness Filter: CHOP ({current_chop:.1f}) above limit {MAX_CHOP_THRESHOLD}"
+        no_signal["reason"] = f"CHOP Filter: ({current_chop:.1f}) > {MAX_CHOP_THRESHOLD}"
         return no_signal
 
-    # Crossover Detection & Volume Spikes
-    bullish_crossover = (prev_dema <= prev_ema50) and (dema_9 > ema_50)
-    bearish_crossover = (prev_dema >= prev_ema50) and (dema_9 < ema_50)
+    # Volume Validation Gate (Rule Set D): Require 1.5x volume spike on trigger candle & dry-up on pullback
+    is_volume_spike = current_volume >= (vol_sma * 1.5)
+    is_pullback_contracting = prev_row["volume"] < vol_sma
 
-    is_bullish_volume_spike = (last_row["close"] > last_row["open"]) and (current_volume >= vol_sma20 * 1.5)
-    is_bearish_volume_spike = (last_row["close"] < last_row["open"]) and (current_volume >= vol_sma20 * 1.5)
-
-    valid_long_trigger = bullish_crossover and is_bullish_volume_spike
-    valid_short_trigger = bearish_crossover and is_bearish_volume_spike
+    if not (is_volume_spike and is_pullback_contracting):
+        no_signal["reason"] = "Volume Validation Gate: Insufficient volume spike or lack of pullback contraction"
+        return no_signal
 
     # -----------------------------------------------------------------------
-    # LONG SCALP SETUP
+    # RULE SET A: LONG ENTRY (Strict Confluence: Support + Hammer/Engulfing/Spring)
     # -----------------------------------------------------------------------
-    trend_condition_long = (not use_ema_200_filter) or (current_price > ema_200)
+    trend_ok_long = (not use_ema_200_filter) or (current_price > ema_200)
+    
+    structural_long_support = (
+        (abs(current_price - lower_1) / lower_1 < 0.006) or
+        (abs(current_price - lower_2) / lower_2 < 0.006) or
+        (abs(current_price - aa_vwap) / aa_vwap < 0.004) or
+        (abs(current_price - vp_levels["val"]) / vp_levels["val"] < 0.006) or
+        (current_price < lower_1 and last_row["close"] > lower_1) # Spring / False breakdown reclaim
+    )
 
-    if valid_long_trigger and trend_condition_long and (52.0 < current_rsi < 68.0):
+    # Candlestick pattern must explicitly confirm rejection
+    bullish_candle_confirmation = bool(last_row["is_hammer"] or last_row["is_bullish_engulfing"] or (current_price < lower_1 and last_row["close"] > lower_1))
+
+    if structural_long_support and trend_ok_long and bullish_candle_confirmation:
         entry_price = current_price
         
-        # Strict Directional Safeguard: SL strictly below entry
-        stop_loss = entry_price - (current_atr * atr_mult)
+        local_swing_low = float(df['low'].tail(5).min())
+        stop_loss = min(local_swing_low - (current_atr * 0.5), lower_2 if not math.isnan(lower_2) else entry_price * 0.98)
         if stop_loss >= entry_price:
-            stop_loss = entry_price * 0.99
+            stop_loss = entry_price - (current_atr * atr_mult)
 
         sl_distance = entry_price - stop_loss
-        
-        # Approach A: Dynamic Take Profit scaling proportional to risk distance
         take_profit = entry_price + (sl_distance * target_rr)
 
         risk_amt = float(account_balance) * (risk_pct / 100.0)
@@ -294,31 +347,39 @@ def evaluate_scalp_signals(
 
         return {
             "action": "BUY", "order_type": "MARKET", "symbol": symbol, "direction": "LONG",
-            "regime": "DEMA_EMA_DYNAMIC_RR_SCALP",
+            "regime": "AA_VWAP_VP_STRICT_LONG",
             "entry_price": format_price(entry_price),
             "stop_loss": format_price(stop_loss),
             "take_profit": format_price(take_profit),
             "rr_ratio": float(target_rr),
             "position_size": float(position_size),
-            "reason": f"Dynamic Long Cross + Vol + ATR SL + {target_rr}R TP"
+            "reason": "AA-VWAP Support + Volume Contraction/Spike + Strict Bullish Rejection"
         }
 
     # -----------------------------------------------------------------------
-    # SHORT SCALP SETUP
+    # RULE SET B: SHORT ENTRY (Strict Confluence: Resistance + Shooting Star/Engulfing)
     # -----------------------------------------------------------------------
-    trend_condition_short = (not use_ema_200_filter) or (current_price < ema_200)
+    trend_ok_short = (not use_ema_200_filter) or (current_price < ema_200)
 
-    if valid_short_trigger and trend_condition_short and (32.0 < current_rsi < 48.0):
+    structural_short_resistance = (
+        (abs(current_price - upper_1) / upper_1 < 0.006) or
+        (abs(current_price - upper_2) / upper_2 < 0.006) or
+        (abs(current_price - aa_vwap) / aa_vwap < 0.004) or
+        (abs(current_price - vp_levels["poc"]) / vp_levels["poc"] < 0.006) or
+        (current_price > upper_1 and last_row["close"] < upper_1) # Failed upthrust / sweep
+    )
+
+    bearish_candle_confirmation = bool(last_row["is_shooting_star"] or last_row["is_bearish_engulfing"] or (current_price > upper_1 and last_row["close"] < upper_1))
+
+    if structural_short_resistance and trend_ok_short and bearish_candle_confirmation:
         entry_price = current_price
         
-        # Strict Directional Safeguard: SL strictly above entry
-        stop_loss = entry_price + (current_atr * atr_mult)
+        local_swing_high = float(df['high'].tail(5).max())
+        stop_loss = max(local_swing_high + (current_atr * 0.5), upper_2 if not math.isnan(upper_2) else entry_price * 1.02)
         if stop_loss <= entry_price:
-            stop_loss = entry_price * 1.01
+            stop_loss = entry_price + (current_atr * atr_mult)
 
         sl_distance = stop_loss - entry_price
-        
-        # Approach A: Dynamic Take Profit scaling proportional to risk distance
         take_profit = entry_price - (sl_distance * target_rr)
 
         risk_amt = float(account_balance) * (risk_pct / 100.0)
@@ -326,16 +387,16 @@ def evaluate_scalp_signals(
 
         return {
             "action": "SELL", "order_type": "MARKET", "symbol": symbol, "direction": "SHORT",
-            "regime": "DEMA_EMA_DYNAMIC_RR_SCALP",
+            "regime": "AA_VWAP_VP_STRICT_SHORT",
             "entry_price": format_price(entry_price),
             "stop_loss": format_price(stop_loss),
             "take_profit": format_price(take_profit),
             "rr_ratio": float(target_rr),
             "position_size": float(position_size),
-            "reason": f"Dynamic Short Cross + Vol + ATR SL + {target_rr}R TP"
+            "reason": "AA-VWAP Resistance + Volume Contraction/Spike + Strict Bearish Rejection"
         }
 
-    no_signal["reason"] = "No valid crossover matching dynamic rules"
+    no_signal["reason"] = "No valid strict confluence setup"
     return no_signal
 
 
