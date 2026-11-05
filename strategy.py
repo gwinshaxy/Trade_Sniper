@@ -13,27 +13,19 @@ logger = logging.getLogger("scalp_strategy_engine")
 # ---------------------------------------------------------------------------
 # GLOBAL SCALPING TIMEFRAME & DEFAULT PARAMETERS
 # ---------------------------------------------------------------------------
-EXECUTION_TIMEFRAME = "15m"      # 15m default execution
+EXECUTION_TIMEFRAME = "15m"      
 DEMA_FAST_PERIOD = 9
 EMA_MEDIUM_PERIOD = 50
 EMA_TREND_PERIOD = 200
 VOLUME_SMA_PERIOD = 20
 RSI_PERIOD = 14
 ADX_PERIOD = 14
-MIN_ADX_THRESHOLD = 22.0         # ADX threshold
-CHOP_PERIOD = 14                 # Choppiness Index lookback period
-MAX_CHOP_THRESHOLD = 58.0        # Upper limit: filters out choppy/sideways markets
-TARGET_RR_RATIO = 1.8            # Approach A: Default 1.8x Risk-Reward Dynamic Target
-ATR_SL_MULTIPLIER = 2.0          # Tighter 1.5x ATR initial stop loss to prevent noise clipping
-ROUND_TRIP_FEE_PCT = 0.0010      # 0.10% covers taker entry + exit fees
-
-
-# ---------------------------------------------------------------------------
-# GLOBAL SCALPING TIMEFRAME & DEFAULT PARAMETERS
-# ---------------------------------------------------------------------------
-EXECUTION_TIMEFRAME = "15m"      
+MIN_ADX_THRESHOLD = 20.0         
+CHOP_PERIOD = 14                 
+MAX_CHOP_THRESHOLD = 61.8       
 TARGET_RR_RATIO = 1.8            
-ATR_SL_MULTIPLIER = 2.0          # Optimal baseline for 15m scalping
+ATR_SL_MULTIPLIER = 2.0          
+ROUND_TRIP_FEE_PCT = 0.0010      
 
 def get_symbol_overrides(symbol: str) -> dict:
     clean_sym = symbol.split(':')[0].upper()
@@ -46,12 +38,12 @@ def get_symbol_overrides(symbol: str) -> dict:
     }
 
     overrides_table = {
-        "HYPE/USDT":    {"target_risk_reward_ratio": 1.8, "atr_multiplier": 1.8},
-        "LINK/USDT":    {"target_risk_reward_ratio": 2.0, "atr_multiplier": 1.8},
-        "CRCL/USDT":    {"target_risk_reward_ratio": 1.8, "atr_multiplier": 1.8},
-        "DOGE/USDT":    {"target_risk_reward_ratio": 1.8, "atr_multiplier": 1.8},
+        "HYPE/USDT":    {"target_risk_reward_ratio": 1.8, "atr_multiplier": 2.0},
+        "LINK/USDT":    {"target_risk_reward_ratio": 1.8, "atr_multiplier": 2.0},
+        "CRCL/USDT":    {"target_risk_reward_ratio": 1.8, "atr_multiplier": 2.0},
+        "DOGE/USDT":    {"target_risk_reward_ratio": 1.8, "atr_multiplier": 2.0},
         "ETH/USDT":     {"target_risk_reward_ratio": 1.8, "atr_multiplier": 2.0},
-        "SKHYNIX/USDT": {"target_risk_reward_ratio": 2.0, "atr_multiplier": 2.2},
+        "SKHYNIX/USDT": {"target_risk_reward_ratio": 1.8, "atr_multiplier": 2.2},
         "MU/USDT":      {"target_risk_reward_ratio": 1.8, "atr_multiplier": 2.0},
         "NEAR/USDT":    {"target_risk_reward_ratio": 1.8, "atr_multiplier": 2.0},
     }
@@ -121,7 +113,7 @@ def fetch_klines(symbol: str, interval: str = "15m", limit: int = 600) -> pd.Dat
 
 
 # ---------------------------------------------------------------------------
-# 2. TECHNICAL INDICATORS
+# 2. TECHNICAL INDICATORS & MULTI-TIMEFRAME HELPERS
 # ---------------------------------------------------------------------------
 
 def calculate_ema(series: pd.Series, period: int) -> pd.Series:
@@ -195,8 +187,44 @@ def calculate_choppiness_index(df: pd.DataFrame, period: int = 14) -> pd.Series:
     return chop.fillna(50.0)
 
 
+def compute_1h_dema_200(df_15m: pd.DataFrame, df_1h: Optional[pd.DataFrame] = None) -> pd.Series:
+    """
+    Computes 200 DEMA on 1h data and merges it forward onto the 15m index.
+    If df_1h is not provided, falls back to computing 200 DEMA directly from 15m or resampling 15m to 1h.
+    """
+    if df_1h is None or df_1h.empty:
+        # Resample 15m to 1h programmatically if separate 1h dataframe isn't passed
+        df_temp = df_15m.copy()
+        df_temp["timestamp"] = pd.to_datetime(df_temp["timestamp"])
+        df_1h = df_temp.set_index("timestamp").resample("1h").agg({
+            "open": "first",
+            "high": "max",
+            "low": "min",
+            "close": "last",
+            "volume": "sum"
+        }).dropna().reset_index()
+
+    # Calculate 200 DEMA on 1h series
+    e1 = calculate_ema(df_1h["close"], 200)
+    e2 = calculate_ema(e1, 200)
+    df_1h["dema_200_1h"] = 2 * e1 - e2
+
+    # Map back to 15m bars safely using merge_asof (prevents look-ahead bias)
+    df_15m_indexed = df_15m.copy()
+    df_15m_indexed["timestamp"] = pd.to_datetime(df_15m_indexed["timestamp"])
+    df_1h_indexed = df_1h.set_index("timestamp")
+
+    merged = pd.merge_asof(
+        df_15m_indexed.sort_values("timestamp"),
+        df_1h_indexed[["dema_200_1h"]].sort_index(),
+        on="timestamp",
+        direction="backward"
+    )
+    return merged["dema_200_1h"].bfill()
+
+
 # ---------------------------------------------------------------------------
-# 3. SCALPING SIGNAL EVALUATION ENGINE (Approach A Dynamic ATR Scaling)
+# 3. SCALPING SIGNAL EVALUATION ENGINE (Multi-Timeframe Macro Filter)
 # ---------------------------------------------------------------------------
 
 def evaluate_scalp_signals(
@@ -204,8 +232,9 @@ def evaluate_scalp_signals(
     symbol: str,
     account_balance: float = 100.0,
     risk_pct: float = 1.0,
-    use_ema_200_filter: bool = False,
+    use_ema_200_filter: bool = True,
     use_chop_filter: bool = True,
+    df_1h: Optional[pd.DataFrame] = None,
     **kwargs
 ) -> Dict[str, Any]:
     no_signal = {
@@ -225,7 +254,10 @@ def evaluate_scalp_signals(
     df = df.copy()
     df["dema_9"] = calculate_dema(df["close"], DEMA_FAST_PERIOD)
     df["ema_50"] = calculate_ema(df["close"], EMA_MEDIUM_PERIOD)
-    df["ema_200"] = calculate_ema(df["close"], EMA_TREND_PERIOD)
+    
+    # Macro Filter: 200 DEMA on 1-Hour Timeframe
+    df["macro_trend_filter"] = compute_1h_dema_200(df, df_1h)
+
     df["vol_sma20"] = df["volume"].rolling(VOLUME_SMA_PERIOD).mean()
     df["rsi"] = calculate_rsi(df["close"], RSI_PERIOD)
     df["adx"] = calculate_adx(df, ADX_PERIOD)
@@ -238,13 +270,15 @@ def evaluate_scalp_signals(
     current_price = float(last_row["close"])
     dema_9 = float(last_row["dema_9"])
     ema_50 = float(last_row["ema_50"])
-    ema_200 = float(last_row["ema_200"])
+    macro_200_dema_1h = float(last_row["macro_trend_filter"])
     
     prev_dema = float(prev_row["dema_9"])
     prev_ema50 = float(prev_row["ema_50"])
     
     current_volume = float(last_row["volume"])
     vol_sma20 = float(last_row["vol_sma20"])
+    prev_volume = float(prev_row["volume"])
+    prev_vol_sma20 = float(prev_row["vol_sma20"]) if not np.isnan(prev_row["vol_sma20"]) else vol_sma20
     
     current_rsi = float(last_row["rsi"])
     current_adx = float(last_row["adx"])
@@ -261,32 +295,33 @@ def evaluate_scalp_signals(
         no_signal["reason"] = f"Choppiness Filter: CHOP ({current_chop:.1f}) above limit {MAX_CHOP_THRESHOLD}"
         return no_signal
 
-    # Crossover Detection & Volume Spikes
+    # Crossover Detection & Flexible Volume Spikes
     bullish_crossover = (prev_dema <= prev_ema50) and (dema_9 > ema_50)
     bearish_crossover = (prev_dema >= prev_ema50) and (dema_9 < ema_50)
 
-    is_bullish_volume_spike = (last_row["close"] > last_row["open"]) and (current_volume >= vol_sma20 * 1.5)
-    is_bearish_volume_spike = (last_row["close"] < last_row["open"]) and (current_volume >= vol_sma20 * 1.5)
+    is_bullish_volume_spike = (last_row["close"] > last_row["open"]) and (
+        current_volume >= vol_sma20 * 1.05 or prev_volume >= prev_vol_sma20 * 1.05
+    )
+    is_bearish_volume_spike = (last_row["close"] < last_row["open"]) and (
+        current_volume >= vol_sma20 * 1.05 or prev_volume >= prev_vol_sma20 * 1.05
+    )
 
     valid_long_trigger = bullish_crossover and is_bullish_volume_spike
     valid_short_trigger = bearish_crossover and is_bearish_volume_spike
 
     # -----------------------------------------------------------------------
-    # LONG SCALP SETUP
+    # LONG SCALP SETUP (Relaxed RSI Threshold: RSI > 50)
     # -----------------------------------------------------------------------
-    trend_condition_long = (not use_ema_200_filter) or (current_price > ema_200)
+    trend_condition_long = (not use_ema_200_filter) or (current_price > macro_200_dema_1h)
 
-    if valid_long_trigger and trend_condition_long and (52.0 < current_rsi < 68.0):
+    if valid_long_trigger and trend_condition_long and (current_rsi > 50.0):
         entry_price = current_price
         
-        # Strict Directional Safeguard: SL strictly below entry
         stop_loss = entry_price - (current_atr * atr_mult)
         if stop_loss >= entry_price:
             stop_loss = entry_price * 0.99
 
         sl_distance = entry_price - stop_loss
-        
-        # Approach A: Dynamic Take Profit scaling proportional to risk distance
         take_profit = entry_price + (sl_distance * target_rr)
 
         risk_amt = float(account_balance) * (risk_pct / 100.0)
@@ -294,31 +329,28 @@ def evaluate_scalp_signals(
 
         return {
             "action": "BUY", "order_type": "MARKET", "symbol": symbol, "direction": "LONG",
-            "regime": "DEMA_EMA_DYNAMIC_RR_SCALP",
+            "regime": "DEMA_1H_MACRO_SCALP",
             "entry_price": format_price(entry_price),
             "stop_loss": format_price(stop_loss),
             "take_profit": format_price(take_profit),
             "rr_ratio": float(target_rr),
             "position_size": float(position_size),
-            "reason": f"Dynamic Long Cross + Vol + ATR SL + {target_rr}R TP"
+            "reason": f"1H Macro Long + Cross + Vol + {target_rr}R TP"
         }
 
     # -----------------------------------------------------------------------
-    # SHORT SCALP SETUP
+    # SHORT SCALP SETUP (Relaxed RSI Threshold: RSI < 50)
     # -----------------------------------------------------------------------
-    trend_condition_short = (not use_ema_200_filter) or (current_price < ema_200)
+    trend_condition_short = (not use_ema_200_filter) or (current_price < macro_200_dema_1h)
 
-    if valid_short_trigger and trend_condition_short and (32.0 < current_rsi < 48.0):
+    if valid_short_trigger and trend_condition_short and (current_rsi < 50.0):
         entry_price = current_price
         
-        # Strict Directional Safeguard: SL strictly above entry
         stop_loss = entry_price + (current_atr * atr_mult)
         if stop_loss <= entry_price:
             stop_loss = entry_price * 1.01
 
         sl_distance = stop_loss - entry_price
-        
-        # Approach A: Dynamic Take Profit scaling proportional to risk distance
         take_profit = entry_price - (sl_distance * target_rr)
 
         risk_amt = float(account_balance) * (risk_pct / 100.0)
@@ -326,16 +358,16 @@ def evaluate_scalp_signals(
 
         return {
             "action": "SELL", "order_type": "MARKET", "symbol": symbol, "direction": "SHORT",
-            "regime": "DEMA_EMA_DYNAMIC_RR_SCALP",
+            "regime": "DEMA_1H_MACRO_SCALP",
             "entry_price": format_price(entry_price),
             "stop_loss": format_price(stop_loss),
             "take_profit": format_price(take_profit),
             "rr_ratio": float(target_rr),
             "position_size": float(position_size),
-            "reason": f"Dynamic Short Cross + Vol + ATR SL + {target_rr}R TP"
+            "reason": f"1H Macro Short + Cross + Vol + {target_rr}R TP"
         }
 
-    no_signal["reason"] = "No valid crossover matching dynamic rules"
+    no_signal["reason"] = "No valid crossover matching 1H macro rules"
     return no_signal
 
 
