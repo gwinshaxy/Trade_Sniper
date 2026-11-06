@@ -34,18 +34,37 @@ def get_symbol_overrides(symbol: str) -> dict:
 
     config = {
         "target_risk_reward_ratio": TARGET_RR_RATIO,
-        "atr_multiplier": ATR_SL_MULTIPLIER
+        "atr_multiplier": ATR_SL_MULTIPLIER,
+        "use_ema_200_filter": True  # Default global macro filter state
     }
 
     overrides_table = {
-        "HYPE/USDT":    {"target_risk_reward_ratio": 1.8, "atr_multiplier": 2.0},
-        "LINK/USDT":    {"target_risk_reward_ratio": 1.8, "atr_multiplier": 2.0},
-        "CRCL/USDT":    {"target_risk_reward_ratio": 1.8, "atr_multiplier": 2.0},
-        "DOGE/USDT":    {"target_risk_reward_ratio": 1.8, "atr_multiplier": 2.0},
-        "ETH/USDT":     {"target_risk_reward_ratio": 1.8, "atr_multiplier": 2.0},
-        "SKHYNIX/USDT": {"target_risk_reward_ratio": 1.8, "atr_multiplier": 2.2},
-        "MU/USDT":      {"target_risk_reward_ratio": 1.8, "atr_multiplier": 2.0},
-        "NEAR/USDT":    {"target_risk_reward_ratio": 1.8, "atr_multiplier": 2.0},
+        # Assets performing better with 1H 200 DEMA Filter = FALSE
+        "MAGMA/USDT":   {"target_risk_reward_ratio": 1.8, "atr_multiplier": 2.0, "use_ema_200_filter": False},
+        "JCT/USDT":     {"target_risk_reward_ratio": 1.8, "atr_multiplier": 2.0, "use_ema_200_filter": False},
+        "SNXX/USDT":    {"target_risk_reward_ratio": 1.8, "atr_multiplier": 2.0, "use_ema_200_filter": False},
+        "MU/USDT":      {"target_risk_reward_ratio": 1.8, "atr_multiplier": 2.0, "use_ema_200_filter": False},
+        "SOXL/USDT":    {"target_risk_reward_ratio": 1.8, "atr_multiplier": 2.0, "use_ema_200_filter": False},
+        "BZ/USDT":      {"target_risk_reward_ratio": 1.8, "atr_multiplier": 2.0, "use_ema_200_filter": False},
+        "AMD/USDT":     {"target_risk_reward_ratio": 1.8, "atr_multiplier": 2.0, "use_ema_200_filter": False},
+        "1000PEPE/USDT":{"target_risk_reward_ratio": 1.8, "atr_multiplier": 2.0, "use_ema_200_filter": False},
+        "SAMSUNG/USDT": {"target_risk_reward_ratio": 1.8, "atr_multiplier": 2.0, "use_ema_200_filter": False},
+        "ADA/USDT":     {"target_risk_reward_ratio": 1.8, "atr_multiplier": 2.0, "use_ema_200_filter": False},
+
+        # Assets performing well with 1H 200 DEMA Filter = TRUE (or remaining default)
+        "HYPE/USDT":    {"target_risk_reward_ratio": 1.8, "atr_multiplier": 2.0, "use_ema_200_filter": True},
+        "LINK/USDT":    {"target_risk_reward_ratio": 1.8, "atr_multiplier": 2.0, "use_ema_200_filter": True},
+        "DOGE/USDT":    {"target_risk_reward_ratio": 1.8, "atr_multiplier": 2.0, "use_ema_200_filter": True},
+        "ETH/USDT":     {"target_risk_reward_ratio": 1.8, "atr_multiplier": 2.0, "use_ema_200_filter": True},
+        "SKHYNIX/USDT": {"target_risk_reward_ratio": 1.8, "atr_multiplier": 2.2, "use_ema_200_filter": True},
+        "AGT/USDT":     {"target_risk_reward_ratio": 1.8, "atr_multiplier": 2.0, "use_ema_200_filter": True},
+        "BNB/USDT":     {"target_risk_reward_ratio": 1.8, "atr_multiplier": 2.0, "use_ema_200_filter": True},
+        "BMT/USDT":     {"target_risk_reward_ratio": 1.8, "atr_multiplier": 2.0, "use_ema_200_filter": True},
+        "ENA/USDT":     {"target_risk_reward_ratio": 1.8, "atr_multiplier": 2.0, "use_ema_200_filter": True},
+        "CAKE/USDT":    {"target_risk_reward_ratio": 1.8, "atr_multiplier": 2.0, "use_ema_200_filter": True},
+        "SNDK/USDT":    {"target_risk_reward_ratio": 1.8, "atr_multiplier": 2.0, "use_ema_200_filter": True},
+        "CL/USDT":      {"target_risk_reward_ratio": 1.8, "atr_multiplier": 2.0, "use_ema_200_filter": True},
+        "SOXS/USDT":    {"target_risk_reward_ratio": 1.8, "atr_multiplier": 2.0, "use_ema_200_filter": True},
     }
 
     if clean_sym in overrides_table:
@@ -190,10 +209,9 @@ def calculate_choppiness_index(df: pd.DataFrame, period: int = 14) -> pd.Series:
 def compute_1h_dema_200(df_15m: pd.DataFrame, df_1h: Optional[pd.DataFrame] = None) -> pd.Series:
     """
     Computes 200 DEMA on 1h data and merges it forward onto the 15m index.
-    If df_1h is not provided, falls back to computing 200 DEMA directly from 15m or resampling 15m to 1h.
+    If df_1h is not provided, falls back to resampling 15m to 1h.
     """
     if df_1h is None or df_1h.empty:
-        # Resample 15m to 1h programmatically if separate 1h dataframe isn't passed
         df_temp = df_15m.copy()
         df_temp["timestamp"] = pd.to_datetime(df_temp["timestamp"])
         df_1h = df_temp.set_index("timestamp").resample("1h").agg({
@@ -204,12 +222,10 @@ def compute_1h_dema_200(df_15m: pd.DataFrame, df_1h: Optional[pd.DataFrame] = No
             "volume": "sum"
         }).dropna().reset_index()
 
-    # Calculate 200 DEMA on 1h series
     e1 = calculate_ema(df_1h["close"], 200)
     e2 = calculate_ema(e1, 200)
     df_1h["dema_200_1h"] = 2 * e1 - e2
 
-    # Map back to 15m bars safely using merge_asof (prevents look-ahead bias)
     df_15m_indexed = df_15m.copy()
     df_15m_indexed["timestamp"] = pd.to_datetime(df_15m_indexed["timestamp"])
     df_1h_indexed = df_1h.set_index("timestamp")
@@ -250,6 +266,9 @@ def evaluate_scalp_signals(
     asset_cfg = get_symbol_overrides(symbol)
     target_rr = asset_cfg["target_risk_reward_ratio"]
     atr_mult = asset_cfg["atr_multiplier"]
+    
+    # Respect symbol override for 1H 200 DEMA Filter
+    active_use_ema_200 = asset_cfg.get("use_ema_200_filter", use_ema_200_filter)
 
     df = df.copy()
     df["dema_9"] = calculate_dema(df["close"], DEMA_FAST_PERIOD)
@@ -312,7 +331,7 @@ def evaluate_scalp_signals(
     # -----------------------------------------------------------------------
     # LONG SCALP SETUP (Relaxed RSI Threshold: RSI > 50)
     # -----------------------------------------------------------------------
-    trend_condition_long = (not use_ema_200_filter) or (current_price > macro_200_dema_1h)
+    trend_condition_long = (not active_use_ema_200) or (current_price > macro_200_dema_1h)
 
     if valid_long_trigger and trend_condition_long and (current_rsi > 50.0):
         entry_price = current_price
@@ -341,7 +360,7 @@ def evaluate_scalp_signals(
     # -----------------------------------------------------------------------
     # SHORT SCALP SETUP (Relaxed RSI Threshold: RSI < 50)
     # -----------------------------------------------------------------------
-    trend_condition_short = (not use_ema_200_filter) or (current_price < macro_200_dema_1h)
+    trend_condition_short = (not active_use_ema_200) or (current_price < macro_200_dema_1h)
 
     if valid_short_trigger and trend_condition_short and (current_rsi < 50.0):
         entry_price = current_price
