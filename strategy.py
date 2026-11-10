@@ -20,11 +20,11 @@ EMA_TREND_PERIOD = 200
 VOLUME_SMA_PERIOD = 20
 RSI_PERIOD = 14
 ADX_PERIOD = 14
-MIN_ADX_THRESHOLD = 20.0         
+MIN_ADX_THRESHOLD = 22.0         
 CHOP_PERIOD = 14                 
 MAX_CHOP_THRESHOLD = 61.8       
-TARGET_RR_RATIO = 1.8            
-ATR_SL_MULTIPLIER = 2.0          
+TARGET_RR_RATIO = 1.6            
+ATR_SL_MULTIPLIER = 1.8          
 ROUND_TRIP_FEE_PCT = 0.0010      
 
 def get_symbol_overrides(symbol: str) -> dict:
@@ -52,19 +52,19 @@ def get_symbol_overrides(symbol: str) -> dict:
         "ADA/USDT":     {"target_risk_reward_ratio": 1.8, "atr_multiplier": 2.0, "use_ema_200_filter": False},
 
         # Assets performing well with 1H 200 DEMA Filter = TRUE (or remaining default)
-        "HYPE/USDT":    {"target_risk_reward_ratio": 1.8, "atr_multiplier": 2.0, "use_ema_200_filter": True},
-        "LINK/USDT":    {"target_risk_reward_ratio": 1.8, "atr_multiplier": 2.0, "use_ema_200_filter": True},
-        "DOGE/USDT":    {"target_risk_reward_ratio": 1.8, "atr_multiplier": 2.0, "use_ema_200_filter": True},
-        "ETH/USDT":     {"target_risk_reward_ratio": 1.8, "atr_multiplier": 2.0, "use_ema_200_filter": True},
-        "SKHYNIX/USDT": {"target_risk_reward_ratio": 1.8, "atr_multiplier": 2.2, "use_ema_200_filter": True},
-        "AGT/USDT":     {"target_risk_reward_ratio": 1.8, "atr_multiplier": 2.0, "use_ema_200_filter": True},
-        "BNB/USDT":     {"target_risk_reward_ratio": 1.8, "atr_multiplier": 2.0, "use_ema_200_filter": True},
-        "BMT/USDT":     {"target_risk_reward_ratio": 1.8, "atr_multiplier": 2.0, "use_ema_200_filter": True},
-        "ENA/USDT":     {"target_risk_reward_ratio": 1.8, "atr_multiplier": 2.0, "use_ema_200_filter": True},
-        "CAKE/USDT":    {"target_risk_reward_ratio": 1.8, "atr_multiplier": 2.0, "use_ema_200_filter": True},
-        "SNDK/USDT":    {"target_risk_reward_ratio": 1.8, "atr_multiplier": 2.0, "use_ema_200_filter": True},
-        "CL/USDT":      {"target_risk_reward_ratio": 1.8, "atr_multiplier": 2.0, "use_ema_200_filter": True},
-        "SOXS/USDT":    {"target_risk_reward_ratio": 1.8, "atr_multiplier": 2.0, "use_ema_200_filter": True},
+        "HYPE/USDT":    {"target_risk_reward_ratio": 1.6, "atr_multiplier": 1.8, "use_ema_200_filter": True},
+        "LINK/USDT":    {"target_risk_reward_ratio": 1.6, "atr_multiplier": 1.8, "use_ema_200_filter": True},
+        "DOGE/USDT":    {"target_risk_reward_ratio": 1.6, "atr_multiplier": 1.8, "use_ema_200_filter": True},
+        "ETH/USDT":     {"target_risk_reward_ratio": 1.6, "atr_multiplier": 1.8, "use_ema_200_filter": True},
+        "SKHYNIX/USDT": {"target_risk_reward_ratio": 1.6, "atr_multiplier": 2.0, "use_ema_200_filter": True},
+        "AGT/USDT":     {"target_risk_reward_ratio": 1.6, "atr_multiplier": 2.0, "use_ema_200_filter": True},
+        "BNB/USDT":     {"target_risk_reward_ratio": 1.6, "atr_multiplier": 1.8, "use_ema_200_filter": True},
+        "BMT/USDT":     {"target_risk_reward_ratio": 1.6, "atr_multiplier": 2.0, "use_ema_200_filter": True},
+        "ENA/USDT":     {"target_risk_reward_ratio": 1.6, "atr_multiplier": 1.8, "use_ema_200_filter": True},
+        "CAKE/USDT":    {"target_risk_reward_ratio": 1.6, "atr_multiplier": 1.8, "use_ema_200_filter": True},
+        "SNDK/USDT":    {"target_risk_reward_ratio": 1.6, "atr_multiplier": 2.0, "use_ema_200_filter": True},
+        "CL/USDT":      {"target_risk_reward_ratio": 1.6, "atr_multiplier": 2.0, "use_ema_200_filter": True},
+        "SOXS/USDT":    {"target_risk_reward_ratio": 1.6, "atr_multiplier": 2.0, "use_ema_200_filter": True},
     }
 
     if clean_sym in overrides_table:
