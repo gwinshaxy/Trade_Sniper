@@ -20,15 +20,15 @@ class DynamicTradeManager:
     def __init__(
         self,
         trailing_mult: float = 1.8,
-        be_rr_trigger: float = 0.85,
+        be_rr_trigger: float = 1.4,
         profit_lock_rr_trigger: float = 1.1,
         profit_lock_buffer: float = 0.4,
         trail_rr_trigger: float = 1.65,
-        initial_trail_lock_rr: float = 1.2,
+        initial_trail_lock_rr: float = 1.5,
         tighten_rr_trigger: float = 1.8,
         tighten_mult: float = 1.2,
         fee_buffer_pct: float = 0.0012,
-        enabled: bool = False,  # Solution 1: Default to False to prevent accidental activation
+        enabled: bool = True,
         executor: BybitFuturesLiveExecutor = None,
     ):
         self.trailing_mult = trailing_mult
@@ -60,7 +60,7 @@ class DynamicTradeManager:
         latest_candle: Dict[str, Any],
         live_pos_info: Dict[str, Any] = None,
     ) -> Dict[str, Any]:
-        # Solution 2: Absolute hard guard at the top of process_trade
+        # Absolute hard guard at the top of process_trade
         if not self.enabled:
             return {"action": "HOLD"}
 
@@ -85,14 +85,18 @@ class DynamicTradeManager:
             is_long = direction in ["BUY", "LONG"]
             from config import BYBIT_TESTNET
             
-            # Solution 3: Strict separation of Paper Mode vs. Live/Testnet Execution
-            # In live or Bybit testnet execution, rely on exchange-managed stop-losses rather than virtual candle closes.
-            is_paper_mode = os.getenv("ENABLE_PAPER_TRADING", "false").lower() == "true"
+            # Robust Paper Mode Detection (env flag, missing API keys, or Testnet)
+            is_paper_mode = (
+                os.getenv("ENABLE_PAPER_TRADING", "false").lower() == "true" 
+                or not os.getenv("BYBIT_API_KEY") 
+                or BYBIT_TESTNET
+            )
 
             # ---- 1. Intra-candle SL/TP Breach Check (Paper Trading Only) ----
-            if is_paper_mode and current_sl > 0:
-                hit_sl = close_price <= current_sl if is_long else close_price >= current_sl
-                hit_tp = close_price >= current_tp if (is_long and current_tp > 0) else (close_price <= current_tp if (not is_long and current_tp > 0) else False)
+            # Enforce if EITHER stop_loss or take_profit is active
+            if is_paper_mode and (current_sl > 0 or current_tp > 0):
+                hit_sl = (current_sl > 0) and (close_price <= current_sl if is_long else close_price >= current_sl)
+                hit_tp = (current_tp > 0) and (close_price >= current_tp if is_long else close_price <= current_tp)
 
                 if hit_sl or hit_tp:
                     exit_price = current_sl if hit_sl else current_tp
@@ -117,7 +121,7 @@ class DynamicTradeManager:
                     )
                     return {
                         "action": "FINALIZED_CLOSED_TRADE",
-                        "msg": f"✅ Virtual Trade #{trade_id} closed @ ${exit_price:.5f}"
+                        "msg": f"✅ Virtual Trade #{trade_id} closed @ ${exit_price:.5f} ({'TP' if hit_tp else 'SL'})"
                     }
 
             # ---- 2. Dynamic Trailing & Fee-Aware Breakeven Logic ----
