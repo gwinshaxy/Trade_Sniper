@@ -20,15 +20,15 @@ class DynamicTradeManager:
     def __init__(
         self,
         trailing_mult: float = 1.8,
-        be_rr_trigger: float = 1.4,
-        profit_lock_rr_trigger: float = 1.1,
+        be_rr_trigger: float = 1.6,
+        profit_lock_rr_trigger: float = 1.6,
         profit_lock_buffer: float = 0.4,
-        trail_rr_trigger: float = 1.65,
-        initial_trail_lock_rr: float = 1.5,
+        trail_rr_trigger: float = 1.66,
+        initial_trail_lock_rr: float = 1.6,
         tighten_rr_trigger: float = 1.8,
         tighten_mult: float = 1.2,
         fee_buffer_pct: float = 0.0012,
-        enabled: bool = True,
+        enabled: bool = False,
         executor: BybitFuturesLiveExecutor = None,
     ):
         self.trailing_mult = trailing_mult
