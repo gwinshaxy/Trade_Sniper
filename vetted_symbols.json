@@ -2,16 +2,20 @@
     "timestamp": 1793051600.624667,
     "vetted_count": 10,
     "vetted_symbols": [
-         "BTC/USDT",
 		"ETH/USDT",
 		"SOL/USDT",
+		"ZEC/USDT",
 		"XRP/USDT",
+		"1000PEPE/USDT",
+		"ARIA/USDT",
+		"ENA/USDT",
 		"ADA/USDT",
 		"DOGE/USDT",
-		"BNB/USDT",
-		"LINK/USDT",
-		"NEAR/USDT",
-		"HYPE/USDT"
+		"AKE/USDT",
+		"UNI/USDT",
+		"AVAX/USDT",
+		"CAKE/USDT",
+		"ARB/USDT"
     ],
     "details": [
         {
