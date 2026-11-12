@@ -33,7 +33,7 @@ MAX_ALLOWED_SPREAD_PCT = 0.003
 ENTRY_TOLERANCE_PCT_LIVE = 0.003
 ENTRY_TOLERANCE_PCT_TESTNET = 0.03
 
-USE_MAKER_ORDERS = os.getenv("USE_MAKER_ORDERS", "true").lower() == "true"
+USE_MAKER_ORDERS = os.getenv("USE_MAKER_ORDERS", "false").lower() == "true"
 
 SL_VERIFY_MAX_ATTEMPTS_LIVE = 8
 SL_VERIFY_MAX_ATTEMPTS_TESTNET = 20
@@ -458,10 +458,17 @@ class BybitFuturesLiveExecutor:
         position_idx: Optional[int] = None,
         direction: str = "",
     ) -> bool:
-        # Paper mode bypass
+        # Paper mode bypass + sync PAPER_OCO_REGISTRY stop_loss
         is_paper_mode = os.getenv("ENABLE_PAPER_TRADING", "false").lower() == "true"
         if is_paper_mode:
-            logger.info(f"[{symbol}] Paper mode active: Simulating trading stop attachment.")
+            clean_key = symbol.split(":")[0]
+            if not clean_key.endswith("USDT") and "/" not in clean_key:
+                clean_key = f"{clean_key}/USDT"
+            no_slash_key = clean_key.replace("/", "").upper()
+            for reg_key in (symbol, clean_key, no_slash_key):
+                if reg_key in PAPER_OCO_REGISTRY and stop_loss is not None and stop_loss > 0:
+                    PAPER_OCO_REGISTRY[reg_key]["stop_loss"] = float(stop_loss)
+            logger.info(f"[{symbol}] Paper mode active: Synced Chandelier SL to ${stop_loss}.")
             return True
 
         try:

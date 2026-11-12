@@ -11,7 +11,7 @@ try:
 except ImportError:
     STRATEGY_CONFIG = {}
 
-DEFAULT_COOLDOWN_HOURS = STRATEGY_CONFIG.get("alert_cooldown_hours", 1)
+DEFAULT_COOLDOWN_HOURS = STRATEGY_CONFIG.get("alert_cooldown_hours", 4)
 
 base_dir = os.path.dirname(os.path.abspath(__file__))
 env_path = os.path.join(base_dir, ".env")
@@ -123,12 +123,7 @@ def release_db_connection(conn):
 
 
 def finalize_trade_in_db(trade_id: int, exit_price: float, pnl_usd: float, pnl_pct: float, outcome: str, fee_usd: float = 0.0):
-    """
-    Centralized database update wrapper to record trade state upon closure.
-
-    FIX #5: This is now the ONLY place that sets asset cooldown, eliminating
-    duplicate cooldown log spam from multiple callers.
-    """
+    """Centralized database update wrapper to record trade state upon closure."""
     conn = get_db_connection()
     if not conn:
         return
@@ -156,7 +151,6 @@ def finalize_trade_in_db(trade_id: int, exit_price: float, pnl_usd: float, pnl_p
             conn.commit()
             logger.info(f"Database Record #{trade_id} successfully finalized with state CLOSED (PnL: ${pnl_usd:.2f}, Fees: ${fee_usd:.2f}).")
 
-        # Only set cooldown for ACTUAL settled exchange trades
         if pair and outcome in ['WIN', 'LOSS', 'BREAKEVEN']:
             set_asset_cooldown(pair, hours=DEFAULT_COOLDOWN_HOURS)
         else:
@@ -218,9 +212,7 @@ def set_asset_cooldown(symbol: str, hours: int = DEFAULT_COOLDOWN_HOURS):
 
 
 def clear_asset_cooldown(symbol: str):
-    """Clears the cooldown entry for a specific asset pair."""
     clean_symbol = normalize_symbol(symbol)
-
     if hasattr(sys.modules[__name__], 'COOLDOWN_CACHE'):
         getattr(sys.modules[__name__], 'COOLDOWN_CACHE').pop(clean_symbol, None)
 
@@ -242,7 +234,6 @@ def clear_asset_cooldown(symbol: str):
 
 
 def clear_all_asset_cooldowns():
-    """Clears all active cooldown timers across all assets."""
     if hasattr(sys.modules[__name__], 'COOLDOWN_CACHE'):
         getattr(sys.modules[__name__], 'COOLDOWN_CACHE').clear()
 
@@ -279,6 +270,7 @@ def verify_base_schema():
                 direction VARCHAR(10) NOT NULL,
                 entry_price NUMERIC(18, 8) NOT NULL,
                 stop_loss NUMERIC(18, 8),
+                initial_stop_loss NUMERIC(18, 8),
                 take_profit NUMERIC(18, 8),
                 risk_reward_ratio NUMERIC(18, 2),
                 account_balance NUMERIC(18, 8),
@@ -292,6 +284,7 @@ def verify_base_schema():
                 fee_usd NUMERIC(18, 8) DEFAULT 0.0,
                 outcome VARCHAR(20),
                 highest_price NUMERIC(18, 8),
+                lowest_price NUMERIC(18, 8),
                 trailing_stop_price NUMERIC(18, 8),
                 created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
@@ -299,21 +292,9 @@ def verify_base_schema():
             );
         """)
 
-        cursor.execute("ALTER TABLE trade_setups ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP;")
-
-        cursor.execute("""
-            SELECT 1 FROM pg_indexes
-            WHERE indexname = 'idx_trade_setups_open_pair'
-              AND indexdef LIKE '%EXECUTED%';
-        """)
-        if not cursor.fetchone():
-            logger.warning(
-                "Index idx_trade_setups_open_pair missing or stale. "
-                "Run the migration manually in Supabase SQL editor."
-            )
-
         trade_columns = [
             "stop_loss NUMERIC(18, 8)",
+            "initial_stop_loss NUMERIC(18, 8)",
             "take_profit NUMERIC(18, 8)",
             "risk_reward_ratio NUMERIC(18, 2)",
             "risk_pct NUMERIC(18, 2) DEFAULT 1.0",
@@ -324,12 +305,20 @@ def verify_base_schema():
             "fee_usd NUMERIC(18, 8) DEFAULT 0.0",
             "outcome VARCHAR(20)",
             "highest_price NUMERIC(18, 8)",
+            "lowest_price NUMERIC(18, 8)",
             "trailing_stop_price NUMERIC(18, 8)",
             "updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP",
             "closed_at TIMESTAMP WITH TIME ZONE"
         ]
         for col in trade_columns:
             cursor.execute(f"ALTER TABLE trade_setups ADD COLUMN IF NOT EXISTS {col};")
+
+        # Backfill initial_stop_loss for any existing open trades where it is NULL
+        cursor.execute("""
+            UPDATE trade_setups 
+            SET initial_stop_loss = stop_loss 
+            WHERE initial_stop_loss IS NULL AND stop_loss IS NOT NULL;
+        """)
 
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS strategy_parameters (
@@ -339,7 +328,7 @@ def verify_base_schema():
                 rsi_period INT NOT NULL DEFAULT 14,
                 rsi_thresh FLOAT DEFAULT 42.0,
                 adx_period INT DEFAULT 14,
-                adx_threshold FLOAT DEFAULT 25.0,
+                adx_threshold FLOAT DEFAULT 18.0,
                 use_adx_filter BOOLEAN DEFAULT TRUE,
                 max_sl_pct FLOAT DEFAULT 0.02,
                 zone_tolerance NUMERIC NOT NULL DEFAULT 0.0075,
@@ -361,7 +350,7 @@ def verify_base_schema():
 
         param_columns = [
             "adx_period INT DEFAULT 14",
-            "adx_threshold FLOAT DEFAULT 25.0",
+            "adx_threshold FLOAT DEFAULT 18.0",
             "use_adx_filter BOOLEAN DEFAULT TRUE",
             "max_sl_pct FLOAT DEFAULT 0.02",
             "zone_tolerance NUMERIC DEFAULT 0.0075",
@@ -391,7 +380,6 @@ def verify_base_schema():
 
 def calculate_pnl(direction: str, entry_price: float, current_price: float, quantity: float, account_balance: float = 100.0, total_fees: float = 0.0, exchange_closed_pnl: float = None) -> tuple:
     dir_clean = str(direction).strip().upper()
-    
     if exchange_closed_pnl is not None:
         gross_pnl = float(exchange_closed_pnl)
     else:
@@ -402,34 +390,25 @@ def calculate_pnl(direction: str, entry_price: float, current_price: float, quan
         else:
             gross_pnl = 0.0
 
-    # Subtract exact taker/maker exchange fees (defaulting to 0.055% taker exit if fee not specified)
     exit_fee = current_price * quantity * 0.00055
     net_fees = abs(total_fees) + exit_fee
-    
     pnl_usd = gross_pnl - net_fees
     pnl_pct = (pnl_usd / account_balance) * 100.0 if account_balance > 0 else 0.0
     outcome = "WIN" if pnl_usd > 0 else ("LOSS" if pnl_usd < 0 else "BREAKEVEN")
-
     return round(pnl_usd, 4), round(pnl_pct, 4), outcome
 
 
 def send_telegram_notification(message: str) -> bool:
     bot_token = TELEGRAM_BOT_TOKEN or os.getenv("TELEGRAM_BOT_TOKEN")
     chat_id = TELEGRAM_CHAT_ID or os.getenv("TELEGRAM_CHAT_ID")
-
     if not bot_token or not chat_id:
         return False
-
     url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
     payload = {"chat_id": chat_id, "text": message, "parse_mode": "HTML"}
     try:
         resp = requests.post(url, json=payload, timeout=10)
         return resp.status_code == 200
-    except requests.exceptions.Timeout:
-        logger.debug("Telegram alert timed out (suppressed).")
-        return False
-    except Exception as e:
-        logger.debug(f"Failed to send Telegram notification: {e}")
+    except Exception:
         return False
 
 
@@ -446,25 +425,21 @@ def close_trade_manually(trade_id: int, exit_price: float, reason: str = "MANUAL
         row = cursor.fetchone()
         if not row:
             cursor.close()
-            release_db_connection(conn)
             return False
-
         direction, entry_price, position_size, account_balance, pair = row
         cursor.close()
 
         pnl_usd, pnl_pct, outcome = calculate_pnl(
             direction, float(entry_price), float(exit_price), float(position_size), float(account_balance or 100.0)
         )
-
         finalize_trade_in_db(trade_id, exit_price, pnl_usd, pnl_pct, outcome)
-
         emoji = "🔴" if pnl_usd < 0 else "🟢"
         send_telegram_notification(
-            f"<b>{emoji} MANUAL TRADE CLOSED ({reason})</b>\n\n"
-            f"<b>Trade ID:</b> <code>#{trade_id}</code>\n"
-            f"<b>Pair:</b> <code>{pair}</code>\n"
-            f"<b>Exit Price:</b> ${exit_price:.5f}\n"
-            f"<b>PnL:</b> ${pnl_usd:,.2f} ({pnl_pct:.2f}%)"
+            f"{emoji} MANUAL TRADE CLOSED ({reason})\n\n"
+            f"Trade ID: #{trade_id}\n"
+            f"Pair: {pair}\n"
+            f"Exit Price: ${exit_price:.5f}\n"
+            f"PnL: ${pnl_usd:,.2f} ({pnl_pct:.2f}%)"
         )
         return True
     except Exception as e:
@@ -483,17 +458,15 @@ def check_daily_circuit_breaker(max_loss_pct: float = 3.0, account_balance: floa
     try:
         cursor = conn.cursor()
         cursor.execute("""
-            SELECT SUM(pnl_usd) FROM trade_setups
+            SELECT SUM(pnl_usd) FROM trade_setups 
             WHERE status = 'CLOSED' 
-              AND closed_at >= CURRENT_DATE
+              AND closed_at >= CURRENT_DATE 
               AND outcome IN ('WIN', 'LOSS', 'BREAKEVEN');
         """)
         row = cursor.fetchone()
         cursor.close()
-
         daily_pnl = float(row[0]) if row and row[0] is not None else 0.0
         max_loss_usd = -1 * abs(account_balance * (max_loss_pct / 100.0))
-
         if daily_pnl <= max_loss_usd:
             logger.warning(f"⚠️ Daily Circuit Breaker Active! Verified Daily PnL (${daily_pnl:.2f}) <= Max Loss (${max_loss_usd:.2f})")
             return True
@@ -506,7 +479,7 @@ def check_daily_circuit_breaker(max_loss_pct: float = 3.0, account_balance: floa
 
 
 def ensure_schema_updated():
-    """Ensures database tables have required high-water mark and trailing stop tracking columns."""
+    """Ensures database tables have high-water/low-water mark and initial stop-loss tracking columns."""
     verify_base_schema()
     conn = get_db_connection()
     if not conn:
@@ -514,12 +487,14 @@ def ensure_schema_updated():
     try:
         with conn.cursor() as cur:
             cur.execute("""
-                ALTER TABLE trade_setups 
+                ALTER TABLE trade_setups
+                ADD COLUMN IF NOT EXISTS initial_stop_loss NUMERIC(18, 8),
                 ADD COLUMN IF NOT EXISTS highest_price NUMERIC(18, 8),
+                ADD COLUMN IF NOT EXISTS lowest_price NUMERIC(18, 8),
                 ADD COLUMN IF NOT EXISTS trailing_stop_price NUMERIC(18, 8);
             """)
             conn.commit()
-            logger.info("Schema verification: 'highest_price' and 'trailing_stop_price' columns ready.")
+            logger.info("Schema verification: 'initial_stop_loss', 'highest_price', 'lowest_price', and 'trailing_stop_price' columns ready.")
     except Exception as e:
         logger.error(f"Error ensuring schema column updates: {e}")
     finally:

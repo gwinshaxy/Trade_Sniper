@@ -543,7 +543,7 @@ class PositionReconciler:
                             attached = self.executor.set_position_trading_stop(
                                 symbol=pair,
                                 stop_loss=db_sl,
-                                take_profit=db_tp if db_tp > 0 else None,
+                                take_profit=None,
                                 position_idx=ex_pos.get("position_idx", 0),
                                 direction=direction
                             )

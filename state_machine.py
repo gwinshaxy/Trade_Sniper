@@ -53,14 +53,12 @@ class StateMachineEngine:
     async def _handle_trade_signal(self, payload: dict):
         symbol = payload["symbol"]
         
-        # 1. Acquire lock FIRST before running DB or API pre-checks
         acquired = await event_bus.guard.try_acquire_trade_lock(symbol)
         if not acquired:
             logger.warning(f"[{symbol}] Active execution in-flight. Blocking duplicate order.")
             return
 
         try:
-            # DB active trade count check
             conn_check = get_db_connection()
             if conn_check:
                 try:
@@ -78,10 +76,10 @@ class StateMachineEngine:
             direction = payload["direction"].upper()
             entry_price = safe_float(payload.get("entry_price"), 0.0)
             stop_loss = safe_float(payload.get("stop_loss"), 0.0)
-            take_profit = safe_float(payload.get("take_profit"), 0.0)
+            take_profit = 0.0
             amount_usd = safe_float(payload.get("amount_usd"), 25.0)
             account_balance = safe_float(payload.get("account_balance"), 100.0)
-            leverage = int(safe_float(payload.get("leverage"), 10))
+            leverage = int(safe_float(payload.get("leverage"), 5))
 
             default_risk = safe_float(STRATEGY_CONFIG.get("risk_pct"), 1.0) if isinstance(STRATEGY_CONFIG, dict) else 1.0
             risk_pct_value = safe_float(payload.get("risk_pct"), default=default_risk)
@@ -95,8 +93,8 @@ class StateMachineEngine:
                             WHERE status = 'EXECUTED' AND trade_state != 'CLOSED';
                         """)
                         active_positions_count = cur.fetchone()[0]
-                        if active_positions_count >= 4:
-                            logger.warning(f"[{symbol}] Execution Blocked: Max open positions cap (4) reached.")
+                        if active_positions_count >= 5:
+                            logger.warning(f"[{symbol}] Execution Blocked: Max open positions cap (5) reached.")
                             return
                 finally:
                     release_db_connection(conn)
@@ -113,10 +111,9 @@ class StateMachineEngine:
 
             logger.info(
                 f"[{symbol}] Processing {direction} trade signal via State Machine "
-                f"(Ref Entry Price: ${entry_price:.5f} | Risk: {risk_pct_value}%)..."
+                f"(Ref Entry Price: ${entry_price:.5f} | Initial SL: ${stop_loss:.5f} | Risk: {risk_pct_value}%)..."
             )
 
-            # Register symbol in grace-period cache BEFORE order execution to prevent WebSocket race condition
             try:
                 from reconciler import mark_symbol_recently_opened
                 mark_symbol_recently_opened(symbol)
@@ -149,20 +146,28 @@ class StateMachineEngine:
                         with conn_db.cursor() as cur:
                             cur.execute("""
                                 INSERT INTO trade_setups 
-                                (pair, direction, entry_price, stop_loss, take_profit, position_size, account_balance, risk_pct, status, trade_state, updated_at)
-                                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'EXECUTED', 'OPEN', NOW())
+                                (pair, direction, entry_price, stop_loss, initial_stop_loss, take_profit,
+                                 highest_price, lowest_price, position_size, account_balance, risk_pct,
+                                 status, trade_state, updated_at)
+                                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'EXECUTED', 'OPEN', NOW())
                                 ON CONFLICT (pair) WHERE trade_state IN ('OPEN', 'EXECUTED', 'BE_LOCKED', 'TRAILING')
                                 DO UPDATE SET
                                     direction = EXCLUDED.direction,
                                     entry_price = EXCLUDED.entry_price,
                                     stop_loss = COALESCE(NULLIF(EXCLUDED.stop_loss, 0.0), trade_setups.stop_loss),
-                                    take_profit = COALESCE(NULLIF(EXCLUDED.take_profit, 0.0), trade_setups.take_profit),
+                                    initial_stop_loss = COALESCE(NULLIF(EXCLUDED.initial_stop_loss, 0.0), trade_setups.initial_stop_loss),
+                                    take_profit = 0.0,
+                                    highest_price = EXCLUDED.highest_price,
+                                    lowest_price = EXCLUDED.lowest_price,
                                     position_size = EXCLUDED.position_size,
                                     account_balance = EXCLUDED.account_balance,
                                     risk_pct = EXCLUDED.risk_pct,
                                     updated_at = NOW()
                                 RETURNING id;
-                            """, (symbol, direction, fill_price, stop_loss, take_profit, executed_qty, account_balance, risk_pct_value))
+                            """, (
+                                symbol, direction, fill_price, stop_loss, stop_loss, 0.0,
+                                fill_price, fill_price, executed_qty, account_balance, risk_pct_value
+                            ))
                             row = cur.fetchone()
                             trade_id = row[0] if row else None
                             conn_db.commit()
@@ -184,7 +189,8 @@ class StateMachineEngine:
                                 f"<b>Entry:</b> ${fill_price:.5f}\n"
                                 f"<b>Qty:</b> {executed_qty}\n"
                                 f"<b>Risk %:</b> {risk_pct_value}%\n"
-                                f"<b>SL:</b> ${stop_loss:.5f} ({sl_status}) | <b>TP:</b> ${take_profit:.5f}"
+                                f"<b>Initial SL:</b> ${stop_loss:.5f} ({sl_status})\n"
+                                f"<b>Exit Mode:</b> 3.0x ATR Chandelier Trail (@ +1.5R)"
                             )
                         else:
                             logger.error(f"[{symbol}] Upsert returned no trade_id — DB state may be inconsistent.")
@@ -197,27 +203,22 @@ class StateMachineEngine:
                 )
             else:
                 logger.error(f"[{symbol}] Futures Trade Execution failed: {exec_result.get('error')}")
-
         finally:
             await event_bus.guard.release_trade_lock(symbol)
 
     async def _handle_ticker_update(self, payload: dict):
         symbol = payload["symbol"]
         price = payload["price"]
-        clean_symbol = symbol.replace("/", "").replace("_", "").upper()
-
+        clean_symbol = symbol.replace("/", "").replace(":", "").upper()
         if clean_symbol in event_bus.active_local_sl_guards:
             guard = event_bus.active_local_sl_guards[clean_symbol]
             direction = guard["direction"]
             sl_price = guard["stop_loss"]
-
             triggered = (direction in ["BUY", "LONG"] and price <= sl_price) or \
                         (direction in ["SELL", "SHORT"] and price >= sl_price)
-
             if triggered:
                 logger.critical(f"[{clean_symbol}] EMERGENCY LOCAL SL TRIGGERED ({direction}) @ ${price:.5f}")
                 event_bus.disarm_local_sl_guard(clean_symbol)
-
                 loop = asyncio.get_running_loop()
                 await loop.run_in_executor(
                     None,
@@ -229,9 +230,8 @@ class StateMachineEngine:
                 )
 
     async def _handle_execution_report(self, report: dict):
-        symbol = report.get("symbol", "").replace("_", "")
+        symbol = report.get("symbol", "").replace(":", "")
         order_status = report.get("orderStatus")
         price = safe_float(report.get("avgPrice"), 0.0)
-
         if order_status in ["Filled", "Cancelled"]:
             logger.info(f"[{symbol}] Bybit execution report event received: Status={order_status}, Price={price}")

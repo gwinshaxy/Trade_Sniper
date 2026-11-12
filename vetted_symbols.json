@@ -2,23 +2,16 @@
     "timestamp": 1793051600.624667,
     "vetted_count": 10,
     "vetted_symbols": [
-        "ADA/USDT",
+         "BTC/USDT",
+		"ETH/USDT",
+		"SOL/USDT",
+		"XRP/USDT",
+		"ADA/USDT",
 		"DOGE/USDT",
-		"JCT/USDT",
-		"BMT/USDT",
-		"SKHYNIX/USDT",
-		"SNXX/USDT",
-		"MU/USDT",
-		"CAKE/USDT",
-		"SOXL/USDT",
 		"BNB/USDT",
-		"CL/USDT",
-		"SOXS/USDT",
-		"AMD/USDT",
-		"ENA/USDT",
-		"SNDK/USDT",
-		"MAGMA/USDT",
-		"AGT/USDT"
+		"LINK/USDT",
+		"NEAR/USDT",
+		"HYPE/USDT"
     ],
     "details": [
         {
