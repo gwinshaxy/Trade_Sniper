@@ -15,6 +15,10 @@ logger = logging.getLogger("ws_engine")
 
 
 class UnifiedWebSocketEngine:
+    """
+    Connects to Bybit's official V5 public linear stream and private stream 
+    to receive real-time execution reports, position updates, and order fills.
+    """
     def __init__(self, symbols: List[str], is_testnet: bool = False, api_key: str = None, api_secret: str = None):
         self.symbols = [
             s.split(":")[0].replace("/", "").replace("_", "").upper()
@@ -26,7 +30,6 @@ class UnifiedWebSocketEngine:
         self.api_key = api_key
         self.api_secret = api_secret
 
-        # Pointing to Bybit Mainnet WebSocket Endpoints
         ws_base_domain = "stream-testnet.bybit.com" if is_testnet else "stream.bybit.com"
 
         self.ws_endpoints = [f"wss://{ws_base_domain}/v5/public/linear"]
@@ -40,10 +43,6 @@ class UnifiedWebSocketEngine:
         self.current_ep_idx = (self.current_ep_idx + 1) % len(self.ws_endpoints)
 
     async def _ping_loop(self, ws):
-        """
-        Mainnet/Testnet WS keepalive ping loop.
-        Set to 15s to prevent connection dropouts.
-        """
         try:
             while True:
                 await asyncio.sleep(15)
@@ -53,7 +52,6 @@ class UnifiedWebSocketEngine:
             pass
 
     async def _authenticate_private_ws(self, ws) -> bool:
-        """Loop-reads frames until auth response arrives, ignoring pings/subscriptions."""
         if not self.api_key or not self.api_secret:
             logger.warning("Private WebSocket credentials not provided. Skipping private stream authentication.")
             return False
@@ -87,18 +85,13 @@ class UnifiedWebSocketEngine:
             except Exception:
                 continue
 
-            op = data.get("op")
-            if op == "auth":
+            if data.get("op") == "auth":
                 if data.get("success") is True:
                     logger.info("Bybit Private WebSocket Authenticated Successfully.")
                     return True
                 logger.error(f"Bybit Private WebSocket Authentication Failed: {data.get('ret_msg')}")
                 return False
 
-            if data.get("ret_msg") == "pong" or data.get("op") == "pong":
-                continue
-
-        logger.error("WebSocket auth response timed out.")
         return False
 
     async def _handle_private_execution(self, execution_data: dict):
@@ -112,8 +105,8 @@ class UnifiedWebSocketEngine:
             symbol = execution_data.get("symbol")
             exec_price = float(execution_data.get("execPrice", 0) or 0)
             closed_pnl = float(execution_data.get("closedPnl", 0) or 0)
-
             closed_size = float(execution_data.get("closedSize", 0) or 0)
+
             if exec_type == "Trade" and closed_size <= 0:
                 await event_bus.publish("EXECUTION_EVENT", {
                     "symbol": symbol,
@@ -148,7 +141,7 @@ class UnifiedWebSocketEngine:
                                 trade_id=trade_id, exit_price=exec_price,
                                 pnl_usd=pnl_usd, pnl_pct=pnl_pct, outcome=outcome
                             )
-                            logger.info(f"[Private WS Execution] Trade #{trade_id} ({symbol}) finalized via execution stream. PnL: ${pnl_usd:.2f}")
+                            logger.info(f"[Private WS Execution] Trade #{trade_id} ({symbol}) finalized via execution stream.")
                 except Exception as db_err:
                     logger.error(f"Error handling private WS execution data for DB sync: {db_err}")
                 finally:
@@ -207,11 +200,11 @@ class UnifiedWebSocketEngine:
 
         while True:
             endpoint = self._get_active_endpoint()
-            logger.info(f"Connecting to Bybit Mainnet WebSocket: {endpoint}...")
+            logger.info(f"Connecting to Bybit WebSocket Feed: {endpoint}...")
 
             try:
                 async with websockets.connect(endpoint, ssl=ssl_context, open_timeout=20, close_timeout=5) as ws:
-                    logger.info(f"Connected to Bybit Mainnet Feed: {endpoint}")
+                    logger.info(f"Connected to Bybit Public Feed: {endpoint}")
                     retry_delay = 3
 
                     asyncio.create_task(self._ping_loop(ws))
@@ -235,10 +228,6 @@ class UnifiedWebSocketEngine:
                             if last_price > 0:
                                 self.last_prices[symbol] = last_price
                                 
-                                # ---- FIX 2 & 3 Integration: Instant Paper OCO & Tick Dispatch ----
-                                from live_executor import evaluate_paper_oco_tick
-                                evaluate_paper_oco_tick(symbol, last_price)
-
                                 await event_bus.publish("TICKER_UPDATE", {
                                     "symbol": symbol,
                                     "price": last_price
