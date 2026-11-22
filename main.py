@@ -319,7 +319,8 @@ async def strategy_evaluation_loop():
                     account_balance=active_usdt_balance,
                     risk_pct=cfg.get("risk_pct", ACCOUNT_RISK_PCT),
                     use_ema_200_filter=cfg.get("use_ema_200_filter", True),
-                    custom_atr_mult=cfg.get("atr_sl_multiplier", 2.5)
+                    custom_atr_mult=cfg.get("atr_sl_multiplier", 2.5),
+                    leverage=cfg.get("leverage", 5)
                 )
                 action = signal.get("action", "HOLD")
                 reason = signal.get("reason", "No reason provided")

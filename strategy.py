@@ -21,6 +21,9 @@ ATR_TRAIL_MULTIPLIER = 3.0       # Dynamic Chandelier trailing stop distance
 TRAIL_ACTIVATION_R = 1.5         # Activate Chandelier trail once trade reaches +1.5R
 ROUND_TRIP_FEE_PCT = 0.0010      
 MIN_DAILY_QUOTE_VOLUME = 20_000_000.0  # $20 Million minimum daily quote volume filter[cite: 22]
+MAX_ATR_PCT_OF_PRICE = 0.06      # Reject if 4H ATR exceeds 6.0% of current price
+MAX_SL_TO_LIQ_RATIO = 0.70       # Max SL distance as a fraction of (1 / leverage), e.g., 14% at 5x
+DEFAULT_LEVERAGE = 5.0
 
 
 def get_symbol_overrides(symbol: str) -> dict:
@@ -237,11 +240,33 @@ def evaluate_breakout_signals(
         no_signal["reason"] = "Volume Gate: Breakout volume below 20-SMA"
         return no_signal
 
+    leverage = float(kwargs.get("leverage", DEFAULT_LEVERAGE) or DEFAULT_LEVERAGE)
+    atr_pct = (current_atr / current_price) if current_price > 0 else 0.0
+    if atr_pct > MAX_ATR_PCT_OF_PRICE:
+        no_signal["reason"] = (
+            f"Volatility Gate: ATR/Price ({atr_pct * 100:.2f}%) > {MAX_ATR_PCT_OF_PRICE * 100:.1f}%"
+        )
+        return no_signal
+
+    def _sl_exceeds_liq_safe_zone(entry_px: float, sl_px: float, lev: float) -> tuple[bool, float, float]:
+        if entry_px <= 0 or sl_px <= 0 or lev <= 0:
+            return True, 0.0, 0.0
+        sl_dist_pct = abs(entry_px - sl_px) / entry_px
+        max_safe_sl_pct = MAX_SL_TO_LIQ_RATIO / lev
+        return (sl_dist_pct > max_safe_sl_pct), sl_dist_pct, max_safe_sl_pct
+
     # LONG BREAKOUT SETUP (Dynamic Chandelier ATR Trail — no static TP ceiling)
     trend_long_ok = (not use_ema_200_filter) or (current_price > ema_200)
     if bool(last_row["bull_breakout"]) and trend_long_ok:
         entry_price = current_price
         stop_loss = entry_price - (current_atr * atr_mult)
+        too_wide, sl_pct, max_safe_pct = _sl_exceeds_liq_safe_zone(entry_price, stop_loss, leverage)
+        if too_wide:
+            no_signal["reason"] = (
+                f"Liquidation Guard: Long SL distance ({sl_pct * 100:.1f}%) exceeds "
+                f"safe {leverage:.0f}x cap ({max_safe_pct * 100:.1f}%)"
+            )
+            return no_signal
         sl_distance = entry_price - stop_loss
         risk_amt = float(account_balance) * (risk_pct / 100.0)
         position_size = round(risk_amt / sl_distance, 6) if sl_distance > 0 else 0.0
@@ -263,6 +288,13 @@ def evaluate_breakout_signals(
     if bool(last_row["bear_breakout"]) and trend_short_ok:
         entry_price = current_price
         stop_loss = entry_price + (current_atr * atr_mult)
+        too_wide, sl_pct, max_safe_pct = _sl_exceeds_liq_safe_zone(entry_price, stop_loss, leverage)
+        if too_wide:
+            no_signal["reason"] = (
+                f"Liquidation Guard: Short SL distance ({sl_pct * 100:.1f}%) exceeds "
+                f"safe {leverage:.0f}x cap ({max_safe_pct * 100:.1f}%)"
+            )
+            return no_signal
         sl_distance = stop_loss - entry_price
         risk_amt = float(account_balance) * (risk_pct / 100.0)
         position_size = round(risk_amt / sl_distance, 6) if sl_distance > 0 else 0.0

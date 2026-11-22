@@ -38,6 +38,7 @@ USE_MAKER_ORDERS = os.getenv("USE_MAKER_ORDERS", "false").lower() == "true"
 SL_VERIFY_MAX_ATTEMPTS_LIVE = 8
 SL_VERIFY_MAX_ATTEMPTS_TESTNET = 20
 SL_API_MAX_RETRIES = 3
+MAX_SL_TO_LIQ_RATIO = 0.70
 
 
 def safe_float(val: Any, default: float = 0.0) -> float:
@@ -313,6 +314,39 @@ class BybitFuturesLiveExecutor:
     def format_ccxt_futures_symbol(self, symbol: str) -> str:
         """Instance wrapper directing to resolve_symbol for unified market verification."""
         return self.resolve_symbol(symbol)
+
+    def validate_sl_vs_liquidation_distance(
+        self,
+        symbol: str,
+        is_long: bool,
+        ref_price: float,
+        stop_loss: float,
+        leverage: float,
+    ) -> Tuple[bool, str]:
+        """
+        Ensures Stop Loss is tight enough to trigger well before isolated-margin liquidation.
+        """
+        if stop_loss <= 0 or ref_price <= 0:
+            return True, "No positive stop-loss to validate against liquidation distance."
+
+        lev = max(safe_float(leverage, 5.0), 1.0)
+        sl_distance_pct = abs(ref_price - stop_loss) / ref_price
+        max_safe_sl_pct = MAX_SL_TO_LIQ_RATIO / lev
+
+        if is_long and stop_loss >= ref_price:
+            return False, f"Invalid LONG SL (${stop_loss:.6f}) >= ref price (${ref_price:.6f})"
+        if (not is_long) and stop_loss <= ref_price:
+            return False, f"Invalid SHORT SL (${stop_loss:.6f}) <= ref price (${ref_price:.6f})"
+
+        if sl_distance_pct > max_safe_sl_pct:
+            msg = (
+                f"[{symbol}] Order Rejected: SL distance ({sl_distance_pct * 100:.2f}%) exceeds "
+                f"safe {lev:.0f}x isolated liquidation cap ({max_safe_sl_pct * 100:.2f}%)."
+            )
+            logger.error(msg)
+            return False, msg
+
+        return True, "SL distance within safe pre-liquidation threshold."
 
     def _get_position_idx(self, ccxt_symbol: str, direction: str) -> int:
         """Returns 0 for One-Way (MergedSingle) mode, 1 for Hedge-Buy, 2 for Hedge-Sell."""
@@ -827,6 +861,16 @@ class BybitFuturesLiveExecutor:
         is_valid_entry, dev_reason = self.validate_entry_price_deviation(symbol, entry_price, ticker_data)
         if not is_valid_entry:
             return {"status": "FAILED", "error": dev_reason}
+
+        is_sl_safe, sl_liq_reason = self.validate_sl_vs_liquidation_distance(
+            symbol=symbol,
+            is_long=is_long,
+            ref_price=ref_price,
+            stop_loss=stop_loss,
+            leverage=leverage,
+        )
+        if not is_sl_safe:
+            return {"status": "FAILED", "error": sl_liq_reason}
 
         if spread_pct > MAX_ALLOWED_SPREAD_PCT and not BYBIT_TESTNET:
             logger.warning(f"[{symbol}] Order Rejected: High Spread detected ({spread_pct * 100:.3f}%).")
